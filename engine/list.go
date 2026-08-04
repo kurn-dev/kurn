@@ -1,0 +1,866 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/kurn-dev/kurn/engine/analyzer"
+	"github.com/kurn-dev/kurn/engine/exact"
+	"github.com/kurn-dev/kurn/engine/ngram"
+)
+
+// QueryOpts are per-query overrides of the list's query-time defaults.
+// Zero values mean "use the list default"; NEGATIVE values are the
+// documented sentinel for "explicitly zero" — Threshold < 0 queries with no
+// score floor, TopK < 0 returns every candidate. (Zero itself can't carry
+// that meaning without breaking the zero-value-is-default convention.)
+type QueryOpts struct {
+	Threshold float64
+	TopK      int
+}
+
+// segment is an immutable ordinal-aligned block of entries plus its index.
+type segment struct {
+	entries []Entry
+	byID    map[string]uint32
+	ng      *ngram.Index // nil in exact mode
+	ex      *exact.Index // nil in ngram mode
+
+	// Build-time loss counters (see List.BuildStats): keys the analyzer
+	// collapsed to "" (dropped from the index), and entries whose keys ALL
+	// collapsed — those still occupy an ordinal and count in Stats() entries
+	// while being unfindable, so without these numbers the loss is invisible.
+	droppedKeys    int
+	keylessEntries int
+
+	// totalKeys counts the RAW keys of every entry in the segment (pre-
+	// analysis, dropped ones included) — the basis for List.KeyCount and
+	// the max_total_keys quota, which meters what the caller stores, not
+	// what survives analysis.
+	totalKeys int
+}
+
+// snapshot is the immutable state a query sees. Tombstones mask base entries
+// (deleted, or superseded by an overlay upsert).
+//
+// Invariants that mutation code (Replace/Upsert/Delete/Compact) must uphold:
+//   - tombstones ⊆ base.byID: never tombstone an ID absent from base;
+//   - a live ID is never in both overlay and base un-tombstoned: an overlay
+//     upsert of a base ID must tombstone the base copy;
+//   - tombstones never apply to overlay entries.
+type snapshot struct {
+	base       *segment
+	overlay    *segment
+	tombstones map[string]struct{}
+	version    string
+}
+
+// List is one named lookup list. All mutations swap a new snapshot; the query
+// path is lock-free.
+type List struct {
+	name string
+	cfg  ListConfig
+	an   analyzer.Analyzer
+	snap atomic.Pointer[snapshot]
+	mu   sync.Mutex // serializes mutations (Replace/Upsert/Delete/Compact)
+	gen  uint64     // snapshot generation; incremented under mu on every store
+
+	// baseID is the base content's identity for version stamps (guarded by
+	// mu). The Store sets it to a content hash of base.jsonl (or "empty"),
+	// making versions restart-stable and content-addressed:
+	// "<hash>@<entries>+j<journalBytes>" — same disk state ⇒ same version.
+	// Library-managed lists leave it "" and keep the process-local gen
+	// format (documented in Version).
+	baseID string
+
+	overlaySrc map[string]Entry // source entries for overlay rebuilds
+}
+
+// NewList validates config and returns an empty list.
+func NewList(name string, cfg ListConfig) (*List, error) {
+	an, err := ResolveAnalyzer(cfg.Analyzer)
+	if err != nil {
+		return nil, err
+	}
+	switch cfg.Match.Mode {
+	case "ngram":
+		if len(cfg.Match.Grams) == 0 {
+			cfg.Match.Grams = []int{2, 3}
+		}
+		// Validate here so config-driven callers get an error; ngram.NewBuilder
+		// panics on the same condition (construction-time programming error).
+		// Same bounds as ngram.Restore, so an accepted config can never build
+		// an artifact the loader refuses.
+		for _, g := range cfg.Match.Grams {
+			if g < 1 || g > ngram.MaxGramSize {
+				return nil, fmt.Errorf("list %s: gram size %d out of range [1, %d]", name, g, ngram.MaxGramSize)
+			}
+		}
+		if cfg.Match.Threshold == 0 {
+			cfg.Match.Threshold = 0.6
+		}
+		if cfg.Match.TopK == 0 {
+			cfg.Match.TopK = 100
+		}
+	case "exact":
+	default:
+		return nil, fmt.Errorf("list %s: unknown match mode %q", name, cfg.Match.Mode)
+	}
+	switch cfg.Match.Fallback {
+	case "":
+	case "parent_domain":
+		if cfg.Match.Mode != "exact" {
+			return nil, fmt.Errorf("list %s: match fallback %q requires mode \"exact\", have %q", name, cfg.Match.Fallback, cfg.Match.Mode)
+		}
+	default:
+		return nil, fmt.Errorf("list %s: unknown match fallback %q (valid: \"parent_domain\")", name, cfg.Match.Fallback)
+	}
+	if cfg.OverlayAutoCompact < 0 {
+		return nil, fmt.Errorf("list %s: overlay_auto_compact %d is negative (0 disables)", name, cfg.OverlayAutoCompact)
+	}
+	for i, p := range cfg.Golden {
+		switch {
+		case p.Q == "":
+			return nil, fmt.Errorf("list %s: golden[%d]: q must be non-empty", name, i)
+		case p.ExpectID != "" && p.Absent:
+			return nil, fmt.Errorf("list %s: golden[%d]: expect_id and absent are mutually exclusive", name, i)
+		case p.ExpectID == "" && !p.Absent:
+			return nil, fmt.Errorf("list %s: golden[%d]: one of expect_id or absent is required", name, i)
+		case p.Absent && p.MinScore != 0:
+			return nil, fmt.Errorf("list %s: golden[%d]: min_score requires expect_id", name, i)
+		case p.MinScore < 0 || p.MinScore > 100:
+			return nil, fmt.Errorf("list %s: golden[%d]: min_score %v out of range [0, 100]", name, i, p.MinScore)
+		}
+	}
+	l := &List{name: name, cfg: cfg, an: an, overlaySrc: map[string]Entry{}}
+	l.snap.Store(&snapshot{tombstones: map[string]struct{}{}, version: "empty@0"})
+	return l, nil
+}
+
+// ResolveAnalyzer turns an AnalyzerConfig (preset or steps) into an Analyzer.
+func ResolveAnalyzer(cfg AnalyzerConfig) (analyzer.Analyzer, error) {
+	if cfg.Preset != "" {
+		return analyzer.Preset(cfg.Preset)
+	}
+	return analyzer.New(cfg.Steps)
+}
+
+func (l *List) Name() string       { return l.name }
+func (l *List) Config() ListConfig { return l.cfg }
+
+// buildSegment analyzes and indexes entries (ordinal = slice position).
+func (l *List) buildSegment(entries []Entry) (*segment, error) {
+	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries))}
+	var ngb *ngram.Builder
+	var exb *exact.Builder
+	if l.cfg.Match.Mode == "ngram" {
+		ngb = ngram.NewBuilder(ngram.Config{Grams: l.cfg.Match.Grams, StripSpaces: l.cfg.Match.StripSpaces})
+	} else {
+		exb = exact.NewBuilder()
+	}
+	for i := range entries {
+		ord := uint32(i)
+		seg.byID[entries[i].ID] = ord
+		keys := make([]string, 0, len(entries[i].Keys))
+		for _, k := range entries[i].Keys {
+			if a := l.an.Normalize(k); a != "" {
+				keys = append(keys, a)
+			} else {
+				seg.droppedKeys++
+			}
+		}
+		if len(keys) == 0 && len(entries[i].Keys) > 0 {
+			seg.keylessEntries++ // occupies an ordinal but can never match
+		}
+		seg.totalKeys += len(entries[i].Keys)
+		if ngb != nil {
+			ngb.Add(ord, keys)
+		} else {
+			exb.Add(ord, keys)
+		}
+	}
+	if ngb != nil {
+		seg.ng = ngb.Finish()
+	} else {
+		ex, err := exb.Finish()
+		if err != nil {
+			return nil, fmt.Errorf("list %s: %w", l.name, err)
+		}
+		seg.ex = ex
+	}
+	return seg, nil
+}
+
+// Replace atomically replaces the whole list content (new base, no overlay).
+// Duplicate IDs within the batch are deduped: later duplicates win, matching
+// upsert semantics. Replace takes ownership of the entries slice; the caller
+// must not mutate it afterwards. A build-time data error (e.g. an exact-mode
+// key held by more entries than the index encodes) is returned before
+// anything is installed — the list is left untouched.
+func (l *List) Replace(entries []Entry) error {
+	_, seg, err := l.prepareBase(entries)
+	if err != nil {
+		return err
+	}
+	l.installBase(seg)
+	return nil
+}
+
+// prepareBase dedupes entries (last-wins) and builds their base segment — the
+// expensive half of Replace, done ONCE. Pure with respect to list state
+// (buildSegment reads only the immutable cfg/analyzer), so it needs no lock.
+// Package-internal fast path: Store uses the returned deduped entries for
+// base.jsonl and the segment's index for base.idx, so disk and memory are
+// built from the same slice with no second dedupe or discarded byID map.
+func (l *List) prepareBase(entries []Entry) ([]Entry, *segment, error) {
+	entries = dedupeLastWins(entries)
+	seg, err := l.buildSegment(entries)
+	if err != nil {
+		return nil, nil, err
+	}
+	return entries, seg, nil
+}
+
+// installBase stores seg as the entire list content: no overlay, no
+// tombstones — the cheap tail half of Replace for a segment produced by
+// prepareBase (or assembled around a prebuilt index by ReplaceWithIndex).
+func (l *List) installBase(seg *segment) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.overlaySrc = map[string]Entry{}
+	l.gen++
+	l.snap.Store(&snapshot{
+		base:       seg,
+		tombstones: map[string]struct{}{},
+		version:    l.baseStampLocked(len(seg.entries)),
+	})
+}
+
+// baseStampLocked is the version for a fresh base with an empty journal.
+// Caller holds l.mu.
+func (l *List) baseStampLocked(n int) string {
+	if l.baseID != "" {
+		return fmt.Sprintf("%s@%d+j0", l.baseID, n)
+	}
+	return fmt.Sprintf("gen%d-base@%d", l.gen, n)
+}
+
+// SetBaseID declares the identity of the base content about to be installed
+// (a content hash of base.jsonl, or "empty"): subsequent snapshot versions
+// use the content-addressed format instead of process-local gen counters.
+// Store-managed lists call this before installBase / journal replay; direct
+// library users normally never do.
+func (l *List) SetBaseID(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.baseID = id
+}
+
+// compactBuild is a prepared fold: the live entry set and its built segment,
+// not yet installed. Store.Compact prepares, persists the fold to disk, and
+// only then commits — a failed persist leaves the list untouched (no folded
+// scores served that disk doesn't have).
+type compactBuild struct {
+	live []Entry
+	seg  *segment
+}
+
+// PrepareCompact builds the folded base (base+overlay−tombstones) without
+// touching list state. A build error (exact-mode hot key in the fold) leaves
+// the list untouched.
+func (l *List) PrepareCompact() (*compactBuild, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	live := l.liveEntriesLocked()
+	seg, err := l.buildSegment(live)
+	if err != nil {
+		return nil, err
+	}
+	return &compactBuild{live: live, seg: seg}, nil
+}
+
+// CommitCompact installs a prepared fold as the entire list content with its
+// persisted base identity (the hash persistBase computed): fresh base, empty
+// overlay/tombstones, version "<id>@<n>+j0". Store-only counterpart of the
+// library's Compact; the Store's per-list mutation lock spans
+// prepare→persist→commit, so no mutation can interleave.
+func (l *List) CommitCompact(b *compactBuild, id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.gen++
+	l.baseID = id
+	l.snap.Store(&snapshot{
+		base:       b.seg,
+		tombstones: map[string]struct{}{},
+		version:    fmt.Sprintf("%s@%d+j0", id, len(b.live)),
+	})
+	l.overlaySrc = map[string]Entry{}
+}
+
+// ReplaceWithIndex is Replace with a prebuilt base index (e.g. loaded from an
+// artifact): it skips analysis/index building, rebuilds byID from entries, and
+// installs idx as the base segment's ngram index. Entries are deduped
+// last-wins first (matching Replace), THEN validated against the index:
+// artifacts are saved from already-deduped entries, so a post-dedupe length
+// shorter than idx.NumOrds() means the base.jsonl/base.idx pair is mismatched
+// and must be rejected here — index ordinals pointing past the entries slice
+// would otherwise panic later in Query. NumOrds < len(entries) is tolerated
+// (extra entries are simply unreachable via the index), which keeps a stale-
+// index crash window recoverable instead of fatal. Takes ownership of entries
+// like Replace.
+func (l *List) ReplaceWithIndex(entries []Entry, idx *ngram.Index) error {
+	if l.cfg.Match.Mode != "ngram" {
+		return fmt.Errorf("list %s: ReplaceWithIndex requires ngram mode, have %q", l.name, l.cfg.Match.Mode)
+	}
+	if idx == nil {
+		return fmt.Errorf("list %s: ReplaceWithIndex: nil index", l.name)
+	}
+	entries = dedupeLastWins(entries)
+	if n := idx.NumOrds(); int(n) > len(entries) {
+		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
+	}
+	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ng: idx}
+	for i := range entries {
+		seg.byID[entries[i].ID] = uint32(i)
+		seg.totalKeys += len(entries[i].Keys)
+	}
+	l.installBase(seg)
+	return nil
+}
+
+// ReplaceWithExactIndex is ReplaceWithIndex's exact-mode sibling: Replace
+// with a prebuilt exact index (e.g. loaded from an artifact), skipping
+// analysis/index building. Same dedupe-then-validate order and the same
+// stale-index rationale: NumOrds > len(entries) means the base.jsonl/base.idx
+// pair is mismatched (index ordinals would run past the entries slice and
+// panic later in Query), while NumOrds < len(entries) is tolerated. Takes
+// ownership of entries like Replace.
+func (l *List) ReplaceWithExactIndex(entries []Entry, idx *exact.Index) error {
+	if l.cfg.Match.Mode != "exact" {
+		return fmt.Errorf("list %s: ReplaceWithExactIndex requires exact mode, have %q", l.name, l.cfg.Match.Mode)
+	}
+	if idx == nil {
+		return fmt.Errorf("list %s: ReplaceWithExactIndex: nil index", l.name)
+	}
+	entries = dedupeLastWins(entries)
+	if n := idx.NumOrds(); int(n) > len(entries) {
+		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
+	}
+	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ex: idx}
+	for i := range entries {
+		seg.byID[entries[i].ID] = uint32(i)
+		seg.totalKeys += len(entries[i].Keys)
+	}
+	l.installBase(seg)
+	return nil
+}
+
+// BaseNgram returns the current base segment's ngram index — nil for exact
+// mode or when there is no base. Used to persist the base index (artifact
+// save) without rebuilding it.
+func (l *List) BaseNgram() *ngram.Index {
+	s := l.snap.Load()
+	if s.base == nil {
+		return nil
+	}
+	return s.base.ng
+}
+
+// BaseExact returns the current base segment's exact index — nil for ngram
+// mode or when there is no base. Same artifact-save role as BaseNgram.
+func (l *List) BaseExact() *exact.Index {
+	s := l.snap.Load()
+	if s.base == nil {
+		return nil
+	}
+	return s.base.ex
+}
+
+// LiveEntries returns the live entry set (base − tombstones + overlay),
+// ID-sorted. The slice is fresh but shares Entry key/payload slices with the
+// list; callers must treat them as read-only.
+func (l *List) LiveEntries() []Entry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.liveEntriesLocked()
+}
+
+// dedupeLastWins drops all but the last occurrence of each ID, preserving the
+// relative order of the surviving occurrences.
+func dedupeLastWins(entries []Entry) []Entry {
+	last := make(map[string]int, len(entries))
+	dup := false
+	for i := range entries {
+		if _, seen := last[entries[i].ID]; seen {
+			dup = true
+		}
+		last[entries[i].ID] = i
+	}
+	if !dup {
+		return entries
+	}
+	out := make([]Entry, 0, len(last))
+	for i := range entries {
+		if last[entries[i].ID] == i {
+			out = append(out, entries[i])
+		}
+	}
+	return out
+}
+
+// Upsert adds or replaces entries. Rebuilds the (small) overlay and swaps —
+// changes are visible to the next query. Duplicate IDs within the batch are
+// deduped last-wins, matching Replace semantics. Upsert retains the passed
+// Entry values (Keys/Payload slices) in overlaySrc and future snapshots; the
+// caller must not mutate them after the call (same convention as Replace).
+// A build-time data error (e.g. an exact-mode hot key over the encoding cap)
+// is returned BEFORE any state changes — the list is left exactly as it was.
+func (l *List) Upsert(entries []Entry) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, err := l.prepareUpsertLocked(entries)
+	if err != nil {
+		return err
+	}
+	l.commitOverlayLocked(b)
+	return nil
+}
+
+// Delete tombstones an entry (base) and/or removes it from the overlay.
+// Deleting an ID absent from both is a no-op (beyond a snapshot swap).
+// Like Upsert, a build error leaves the list untouched.
+func (l *List) Delete(id string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, err := l.prepareDeleteLocked(id)
+	if err != nil {
+		return err
+	}
+	l.commitOverlayLocked(b)
+	return nil
+}
+
+// overlayBuild is a fully prepared overlay mutation: the candidate overlay
+// source, tombstone set, and the already-built overlay segment. Splitting
+// prepare from commit lets Store run its fallible work FIRST and journal
+// only mutations known to be installable — an unbuildable overlay (exact-
+// mode hot key) is never persisted, so replay can never be poisoned by a
+// journaled-but-uninstallable batch.
+type overlayBuild struct {
+	src  map[string]Entry
+	tomb map[string]struct{}
+	seg  *segment
+}
+
+// prepareOverlayLocked computes the candidate overlay state after applying
+// mutate to CLONES of the current overlaySrc/tombstones, and builds the
+// overlay segment. Nothing reachable from the published snapshot (or from
+// l.overlaySrc) is mutated; on error the list is exactly as before.
+// Caller holds l.mu.
+func (l *List) prepareOverlayLocked(mutate func(src map[string]Entry, tomb map[string]struct{}, base *segment)) (*overlayBuild, error) {
+	s := l.snap.Load()
+	src := make(map[string]Entry, len(l.overlaySrc))
+	for k, v := range l.overlaySrc {
+		src[k] = v
+	}
+	tomb := cloneSet(s.tombstones)
+	mutate(src, tomb, s.base)
+	entries := make([]Entry, 0, len(src))
+	for _, e := range src {
+		entries = append(entries, e)
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].ID < entries[b].ID })
+	var ov *segment
+	if len(entries) > 0 {
+		var err error
+		ov, err = l.buildSegment(entries)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &overlayBuild{src: src, tomb: tomb, seg: ov}, nil
+}
+
+// commitOverlayLocked installs a prepared overlay build: overlaySrc and the
+// snapshot swap in one step. Never fails — the fallible work happened in
+// prepareOverlayLocked. Caller holds l.mu. Library path: process-local gen
+// stamp (jpos unknowable without a journal).
+func (l *List) commitOverlayLocked(b *overlayBuild) {
+	l.commitOverlayLockedAt(b, -1)
+}
+
+// commitOverlayLockedAt is commitOverlayLocked with a journal byte position
+// for the version stamp: the Store passes the journal size after the append
+// that persisted this mutation, yielding the restart-stable
+// "<baseID>@<baseN>+j<jpos>" form (replaying the journal to the same byte
+// position rebuilds the same overlay). jpos < 0 or an unset baseID falls
+// back to the gen format. Caller holds l.mu.
+func (l *List) commitOverlayLockedAt(b *overlayBuild, jpos int64) {
+	prev := l.snap.Load()
+	l.overlaySrc = b.src
+	baseN := 0
+	if prev.base != nil {
+		baseN = len(prev.base.entries)
+	}
+	l.gen++
+	version := fmt.Sprintf("gen%d-base@%d+ov%d-t%d", l.gen, baseN, len(b.src), len(b.tomb))
+	if l.baseID != "" && jpos >= 0 {
+		version = fmt.Sprintf("%s@%d+j%d", l.baseID, baseN, jpos)
+	}
+	l.snap.Store(&snapshot{
+		base:       prev.base,
+		overlay:    b.seg,
+		tombstones: b.tomb,
+		version:    version,
+	})
+}
+
+// prepareUpsertLocked / prepareDeleteLocked are the Store-facing halves of
+// Upsert/Delete: Store prepares (fallible), journals, then commits
+// (infallible), so a journal append never precedes an unbuildable mutation.
+// Direct List users get the same safety from Upsert/Delete's single lock
+// hold. Mixing Store-managed lists with direct List mutation was already
+// unsupported (direct mutations bypass the journal); with the split it can
+// additionally lose a direct mutation that lands between prepare and
+// commit — one more reason not to mix.
+//
+// Caller holds l.mu.
+func (l *List) prepareUpsertLocked(entries []Entry) (*overlayBuild, error) {
+	return l.prepareOverlayLocked(func(src map[string]Entry, tomb map[string]struct{}, base *segment) {
+		for _, e := range entries {
+			src[e.ID] = e // map assignment: later duplicates win
+			if base != nil {
+				if _, inBase := base.byID[e.ID]; inBase {
+					tomb[e.ID] = struct{}{} // superseded: mask the base version
+				}
+			}
+		}
+	})
+}
+
+// Caller holds l.mu.
+func (l *List) prepareDeleteLocked(id string) (*overlayBuild, error) {
+	return l.prepareOverlayLocked(func(src map[string]Entry, tomb map[string]struct{}, base *segment) {
+		delete(src, id)
+		if base != nil {
+			if _, inBase := base.byID[id]; inBase {
+				tomb[id] = struct{}{}
+			}
+		}
+	})
+}
+
+// Compact folds base+overlay−tombstones into a fresh base segment (empty
+// overlay, empty tombstones). The live-entry SET is unchanged, but ngram
+// scores may shift: IDF weights and the known-gram denominator are segment-
+// local and get recomputed over the folded corpus, so ranking and threshold
+// survival can differ from the pre-compact base+overlay split. The new base
+// is built BEFORE any state changes; a build error leaves the list untouched.
+func (l *List) Compact() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	live := l.liveEntriesLocked()
+	base, err := l.buildSegment(live)
+	if err != nil {
+		return err
+	}
+	l.gen++
+	// The fold invalidates any content-addressed base identity (the Store
+	// path uses PrepareCompact/CommitCompact and never comes through here).
+	// Drop to the gen format rather than serve a stale hash over new
+	// content.
+	l.baseID = ""
+	l.snap.Store(&snapshot{
+		base:       base,
+		tombstones: map[string]struct{}{},
+		version:    fmt.Sprintf("gen%d-base@%d", l.gen, len(live)),
+	})
+	l.overlaySrc = map[string]Entry{}
+	return nil
+}
+
+// liveEntriesLocked returns base−tombstones plus overlay, ID-sorted, overlay
+// winning on conflicts. Caller holds l.mu.
+func (l *List) liveEntriesLocked() []Entry {
+	s := l.snap.Load()
+	out := []Entry{}
+	if s.base != nil {
+		for _, e := range s.base.entries {
+			if _, dead := s.tombstones[e.ID]; dead {
+				continue
+			}
+			if _, shadowed := l.overlaySrc[e.ID]; shadowed {
+				continue
+			}
+			out = append(out, e)
+		}
+	}
+	for _, e := range l.overlaySrc {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
+	return out
+}
+
+func cloneSet(s map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(s))
+	for k := range s {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// ParentMatchScore is the score for exact-mode hits found via parent_domain
+// fallback (the full analyzed query missed; a parent suffix is listed).
+// Exact-level hits stay at 100 — callers can treat 100 as "block" and 90 as
+// "review", and Candidate.Key names the listed domain either way.
+const ParentMatchScore = 90
+
+// exactLevels returns the probe chain for an analyzed exact-mode query:
+// the string itself, then (with parent_domain fallback) each parent suffix
+// while at least two labels remain — bare TLDs are never probed.
+func exactLevels(aq string, parentFallback bool) []string {
+	levels := []string{aq}
+	if !parentFallback {
+		return levels
+	}
+	rest := aq
+	for {
+		i := strings.IndexByte(rest, '.')
+		if i < 0 {
+			break
+		}
+		rest = rest[i+1:]
+		if strings.IndexByte(rest, '.') < 0 {
+			break // one label left: a bare TLD, stop
+		}
+		levels = append(levels, rest)
+	}
+	return levels
+}
+
+// Query looks q up against base and overlay, masks tombstones, ranks, cuts to
+// top-K, and attributes the best-matching key per candidate.
+func (l *List) Query(q string, opts QueryOpts) []Candidate {
+	return l.QueryCtx(context.Background(), q, opts)
+}
+
+// QueryCtx is Query with cooperative cancellation: the ngram scan polls ctx
+// periodically (see ngram.LookupCtx) and the whole query returns nil when
+// canceled — ambiguous with "no match" by design; callers that care check
+// ctx.Err(). The exact path takes no checks: its work is bounded by the
+// probe-level count and the topK collection cap, microseconds at any scale.
+func (l *List) QueryCtx(ctx context.Context, q string, opts QueryOpts) []Candidate {
+	if ctx.Err() != nil {
+		return nil
+	}
+	s := l.snap.Load()
+	aq := l.an.Normalize(q)
+	if aq == "" {
+		return nil
+	}
+	thr := l.cfg.Match.Threshold
+	if opts.Threshold > 0 {
+		thr = opts.Threshold
+	} else if opts.Threshold < 0 {
+		thr = 0 // sentinel: explicit no-floor (see QueryOpts)
+	}
+	topK := l.cfg.Match.TopK
+	if opts.TopK > 0 {
+		topK = opts.TopK
+	} else if opts.TopK < 0 {
+		topK = 0 // sentinel: explicit unlimited (see QueryOpts)
+	}
+
+	var out []Candidate
+	var meta []candMeta // parallel to out: origin segment+ordinal for attribution
+	add := func(seg *segment, masked map[string]struct{}, ord uint32, score float64) {
+		e := seg.entries[ord]
+		if masked != nil {
+			if _, dead := masked[e.ID]; dead {
+				return
+			}
+		}
+		out = append(out, Candidate{EntryID: e.ID, Score: score, Payload: e.Payload})
+		meta = append(meta, candMeta{seg: seg, ord: ord})
+	}
+	// collectNgram gathers one ngram segment's hits; exact mode never calls it
+	// (the exact path is the per-level loop below).
+	collectNgram := func(seg *segment, masked map[string]struct{}) {
+		if seg == nil || seg.ng == nil {
+			return
+		}
+		// Per-segment cut at topK+len(masked) is safe: masking only
+		// removes hits, so the global post-mask top-K is contained in
+		// the segment's top-(K+masked). Tiebreak nuance: this cut breaks
+		// equal-score ties ord-asc while the final merge breaks them
+		// EntryID-asc, so which equal-scored candidates survive the cut
+		// is deterministic but not EntryID-ordered. Ord order itself
+		// depends on provenance: a Replace base keeps caller order while
+		// a compacted base is ID-sorted, so equal-score cut survivors
+		// can differ before vs after Compact.
+		segK := 0
+		if topK > 0 {
+			segK = topK + len(masked)
+		}
+		for _, h := range seg.ng.LookupCtx(ctx, aq, thr, segK) {
+			add(seg, masked, h.Ord, h.Score)
+		}
+	}
+	matchedKey := aq
+	if l.cfg.Match.Mode == "exact" {
+		// Probe base + overlay together per level; descend to the next parent
+		// suffix only when a level has NO post-tombstone survivors. `add`
+		// applies masking before appending, so `len(out) > 0` is the correct
+		// post-mask check — a fully tombstoned level must not stop descent.
+		for _, level := range exactLevels(aq, l.cfg.Match.Fallback == "parent_domain") {
+			score := 100.0
+			if level != aq {
+				score = ParentMatchScore
+			}
+			if score < thr*100 {
+				continue // below the query threshold: thr > 0.9 suppresses parent levels
+			}
+			// Collection is capped at topK post-mask survivors: every hit at
+			// one level shares the same score, so any K of them are a valid
+			// top-K — collecting a hot key's full run just to truncate would
+			// allocate and sort the whole hit set. Which ties survive follows
+			// collection order (base then overlay, ordinal-ascending) — the
+			// same documented stance as the ngram per-segment cut.
+			full := func() bool { return topK > 0 && len(out) >= topK }
+			if s.base != nil && s.base.ex != nil && !full() {
+				for _, ord := range s.base.ex.Lookup(level) {
+					add(s.base, s.tombstones, ord, score)
+					if full() {
+						break
+					}
+				}
+			}
+			if s.overlay != nil && s.overlay.ex != nil && !full() {
+				for _, ord := range s.overlay.ex.Lookup(level) {
+					add(s.overlay, nil, ord, score)
+					if full() {
+						break
+					}
+				}
+			}
+			if len(out) > 0 {
+				matchedKey = level
+				break // first level with post-mask hits wins
+			}
+		}
+	} else {
+		collectNgram(s.base, s.tombstones)
+		collectNgram(s.overlay, nil)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	// A scan canceled AFTER an earlier segment already contributed would
+	// otherwise return those partial results as if complete (LookupCtx
+	// returns nil for the canceled segment, indistinguishable from "that
+	// segment had no hits"). Honor the documented contract — the whole
+	// query returns nil once canceled.
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	sortCandidates(out, meta)
+	if topK > 0 && len(out) > topK {
+		out = out[:topK]
+		meta = meta[:topK]
+	}
+	l.attributeKeys(s, aq, matchedKey, out, meta)
+	return out
+}
+
+// Version returns the snapshot version stamp. Store-managed lists carry the
+// restart-stable content-addressed form "<baseID>@<baseEntries>+j<jbytes>"
+// (baseID = sha256 prefix of base.jsonl, or "empty"; jbytes = journal byte
+// position): the same disk state always yields the same version, and equal
+// versions imply equal answers. Library-managed lists (no Store) keep the
+// process-local "gen…" form — unique within a process, NOT restart-stable.
+func (l *List) Version() string { return l.snap.Load().version }
+
+// ScratchBytes estimates the per-query scratch memory an ngram lookup on
+// this list allocates (or pins in the pool) while in flight: 4 bytes ×
+// numOrds per segment index (the dense IDF accumulator), base + overlay.
+// Exact-mode lists cost 0. Admission control sizes a concurrency budget
+// against this. Note the cost model is MEMORY: scratch size is independent
+// of threshold/topk. CPU worst case is different — an explicit no-floor
+// query (threshold 0 over HTTP, negative in QueryOpts) makes every query
+// gram a candidate generator, the maximal scan — so the same admission
+// bound is also what caps the damage of concurrent no-floor queries.
+func (l *List) ScratchBytes() int64 {
+	s := l.snap.Load()
+	var b int64
+	if s.base != nil && s.base.ng != nil {
+		b += 4 * int64(s.base.ng.NumOrds())
+	}
+	if s.overlay != nil && s.overlay.ng != nil {
+		b += 4 * int64(s.overlay.ng.NumOrds())
+	}
+	return b
+}
+
+// KeyCount returns the live raw-key count: base keys minus tombstoned
+// entries' keys plus overlay keys. Raw (pre-analysis) keys — the quota
+// meters what the caller stores, not what survives analysis. O(tombstones).
+func (l *List) KeyCount() int64 {
+	s := l.snap.Load()
+	var n int64
+	if s.base != nil {
+		n += int64(s.base.totalKeys)
+		for id := range s.tombstones {
+			if ord, ok := s.base.byID[id]; ok {
+				n -= int64(len(s.base.entries[ord].Keys))
+			}
+		}
+	}
+	if s.overlay != nil {
+		n += int64(s.overlay.totalKeys)
+	}
+	return n
+}
+
+// BuildStats returns the current snapshot's build-time loss counters, summed
+// over base and overlay: keys the analyzer collapsed to "" (dropped — never
+// indexed), and entries whose keys ALL collapsed (they occupy an ordinal and
+// count in Stats() entries while being unfindable). For a caller loading a
+// real-world list, a large droppedKeys is the difference between "loaded
+// fine" and "half my list silently vanished".
+func (l *List) BuildStats() (droppedKeys, keylessEntries int) {
+	s := l.snap.Load()
+	for _, seg := range []*segment{s.base, s.overlay} {
+		if seg != nil {
+			droppedKeys += seg.droppedKeys
+			keylessEntries += seg.keylessEntries
+		}
+	}
+	return droppedKeys, keylessEntries
+}
+
+// Stats returns entry count (live), overlay size, and tombstone count. Only
+// tombstones actually present in base are counted — defensive; the snapshot
+// invariants make any others impossible.
+func (l *List) Stats() (entries, overlay, tombstones int) {
+	s := l.snap.Load()
+	if s.base != nil {
+		entries = len(s.base.entries)
+		for id := range s.tombstones {
+			if _, ok := s.base.byID[id]; ok {
+				tombstones++
+			}
+		}
+	}
+	entries -= tombstones
+	if s.overlay != nil {
+		overlay = len(s.overlay.entries)
+		entries += overlay
+	}
+	return entries, overlay, tombstones
+}

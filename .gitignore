@@ -1,0 +1,5 @@
+.DS_Store
+
+# stray local build artifacts
+/kurnd
+/kurn

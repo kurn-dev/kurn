@@ -1,0 +1,45 @@
+{
+  "format": "csv",
+  "delimiter": ";",
+  "where": {
+    "NameAlias_WholeName": "*"
+  },
+  "id_paths": [
+    "Entity_LogicalId",
+    "NameAlias_LogicalId"
+  ],
+  "keys": [
+    {
+      "path": "NameAlias_WholeName"
+    },
+    {
+      "paths": [
+        "NameAlias_FirstName",
+        "NameAlias_MiddleName",
+        "NameAlias_LastName"
+      ]
+    }
+  ],
+  "payload": {
+    "eu_reference": "Entity_EU_ReferenceNumber",
+    "subject_type": "Entity_SubjectType_ClassificationCode",
+    "programme": "Entity_Regulation_Programme",
+    "designated": "Entity_DesignationDate",
+    "regulation": "Entity_Regulation_PublicationUrl"
+  },
+  "list": {
+    "analyzer": {
+      "preset": "person-name"
+    },
+    "match": {
+      "mode": "ngram",
+      "grams": [
+        2,
+        3
+      ],
+      "strip_spaces": true,
+      "threshold": 0.6,
+      "topk": 100
+    }
+  }
+}

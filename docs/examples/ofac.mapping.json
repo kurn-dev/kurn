@@ -1,0 +1,18 @@
+{
+  "format": "xml",
+  "record": "sdnEntry",
+  "where": {"sdnType": "Individual"},
+  "id": "uid",
+  "keys": [
+    {"paths": ["firstName", "lastName"]},
+    {"paths": ["akaList.aka.firstName", "akaList.aka.lastName"],
+     "where": {"akaList.aka.type": "a.k.a.", "akaList.aka.category": "strong"}},
+    {"paths": ["akaList.aka.firstName", "akaList.aka.lastName"],
+     "where": {"akaList.aka.type": "f.k.a.", "akaList.aka.category": "strong"}}
+  ],
+  "payload": {"programs": "programList.program"},
+  "list": {
+    "analyzer": {"preset": "person-name"},
+    "match": {"mode": "ngram", "grams": [2, 3], "strip_spaces": true, "threshold": 0.6, "topk": 100}
+  }
+}

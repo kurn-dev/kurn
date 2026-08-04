@@ -1,0 +1,20 @@
+{
+  "format": "xml",
+  "record": "INDIVIDUAL",
+  "id_paths": ["DATAID"],
+  "keys": [
+    {"paths": ["FIRST_NAME", "SECOND_NAME", "THIRD_NAME", "FOURTH_NAME"]},
+    {"path": "INDIVIDUAL_ALIAS.ALIAS_NAME"},
+    {"path": "NAME_ORIGINAL_SCRIPT"}
+  ],
+  "payload": {
+    "list_type": "UN_LIST_TYPE",
+    "reference": "REFERENCE_NUMBER",
+    "listed_on": "LISTED_ON",
+    "nationality": "NATIONALITY.VALUE"
+  },
+  "list": {
+    "analyzer": {"preset": "person-name"},
+    "match": {"mode": "ngram", "grams": [2, 3], "strip_spaces": true, "threshold": 0.6, "topk": 100}
+  }
+}

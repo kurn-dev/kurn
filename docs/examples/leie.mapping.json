@@ -1,0 +1,23 @@
+{
+  "format": "csv",
+  "id_paths": ["LASTNAME", "FIRSTNAME", "MIDNAME", "BUSNAME", "GENERAL",
+               "SPECIALTY", "UPIN", "NPI", "DOB", "ADDRESS", "CITY",
+               "STATE", "ZIP", "EXCLTYPE", "EXCLDATE"],
+  "keys": [
+    {"paths": ["FIRSTNAME", "MIDNAME", "LASTNAME"]},
+    {"path": "BUSNAME"}
+  ],
+  "payload": {
+    "general": "GENERAL",
+    "specialty": "SPECIALTY",
+    "npi": "NPI",
+    "city": "CITY",
+    "state": "STATE",
+    "excl_type": "EXCLTYPE",
+    "excl_date": "EXCLDATE"
+  },
+  "list": {
+    "analyzer": {"preset": "person-name"},
+    "match": {"mode": "ngram", "grams": [2, 3], "strip_spaces": true, "threshold": 0.6, "topk": 100}
+  }
+}

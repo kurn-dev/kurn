@@ -1,0 +1,39 @@
+{
+  "format": "csv",
+  "id_paths": [
+    "_id",
+    "name",
+    "source"
+  ],
+  "keys": [
+    {
+      "path": "name"
+    },
+    {
+      "path": "alt_names",
+      "split": ";"
+    }
+  ],
+  "payload": {
+    "source": "source",
+    "type": "type",
+    "programs": "programs",
+    "start_date": "start_date",
+    "source_list_url": "source_list_url"
+  },
+  "list": {
+    "analyzer": {
+      "preset": "person-name"
+    },
+    "match": {
+      "mode": "ngram",
+      "grams": [
+        2,
+        3
+      ],
+      "strip_spaces": true,
+      "threshold": 0.6,
+      "topk": 100
+    }
+  }
+}

@@ -84,7 +84,7 @@ func TestAppendJournalPartialWriteRolledBack(t *testing.T) {
 // fails, the file may hold bytes this process never acknowledged — so the
 // version stamp's running journal hash can no longer be trusted to match the
 // file, and the torn fragment would glue onto the next append. Appends must
-// be refused with ErrJournalDamaged (reads keep serving), and an operation
+// be refused with ErrListDamaged (reads keep serving), and an operation
 // that rebuilds the journal wholesale (Replace) repairs.
 func TestJournalDamagedRefusesAppends(t *testing.T) {
 	dir := t.TempDir()
@@ -120,11 +120,11 @@ func TestJournalDamagedRefusesAppends(t *testing.T) {
 	// further appends must be refused, not stamped with a hash the file
 	// doesn't match.
 	err = st.Upsert("people", []Entry{{ID: "p3", Keys: []string{"Iris Bell"}}})
-	if !errors.Is(err, ErrJournalDamaged) {
-		t.Fatalf("append on a damaged journal: err=%v, want ErrJournalDamaged", err)
+	if !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("append on a damaged journal: err=%v, want ErrListDamaged", err)
 	}
-	if err := st.Delete("people", "p1"); !errors.Is(err, ErrJournalDamaged) {
-		t.Fatalf("delete on a damaged journal: err=%v, want ErrJournalDamaged", err)
+	if err := st.Delete("people", "p1"); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("delete on a damaged journal: err=%v, want ErrListDamaged", err)
 	}
 	// Reads keep working on the acknowledged state.
 	l, _ := st.List("people")
@@ -375,5 +375,120 @@ func TestCreateSyncsMarkerRemovalBeforeAck(t *testing.T) {
 	}
 	if _, ok := st.List("people"); !ok {
 		t.Fatal("create did not complete; the order check proved nothing")
+	}
+}
+
+// TestReplacePostPublicationFailureQuarantinesMutations: once Replace has
+// published the new base, a failure in a later step (here: syncing the
+// journal truncation) leaves disk on the NEW base while memory correctly
+// keeps serving the old acknowledged state. Without containment the list
+// stayed writable: a later Upsert was prepared against old memory but
+// journaled beside the new base, and restart replayed it over a
+// replacement nobody acknowledged. The list must refuse append-path
+// mutations until a destructive retry succeeds.
+func TestReplacePostPublicationFailureQuarantinesMutations(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	syncJournalTruncate = func(string) error { return errors.New("injected sync failure") }
+	defer func() { syncJournalTruncate = syncPath }()
+	if err := st.Replace("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); err == nil {
+		t.Fatal("replace with failed truncation sync reported success")
+	}
+	syncJournalTruncate = syncPath
+
+	// The old acknowledged state keeps serving...
+	l, _ := st.List("people")
+	if c := l.Query("marcus chen", QueryOpts{}); len(c) != 1 || c[0].EntryID != "p1" {
+		t.Fatalf("acknowledged state stopped serving: %+v", c)
+	}
+	// ...but the disk/memory split must refuse writes: this exact Upsert
+	// used to succeed and then REPLAY OVER THE UNACKNOWLEDGED new base on
+	// restart.
+	if err := st.Upsert("people", []Entry{{ID: "p3", Keys: []string{"Iris Bell"}}}); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("append after post-publication failure: err=%v, want ErrListDamaged", err)
+	}
+	if err := st.Delete("people", "p1"); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("delete after post-publication failure: err=%v, want ErrListDamaged", err)
+	}
+
+	// A destructive retry repairs, and the repaired list is fully usable.
+	if err := st.Replace("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); err != nil {
+		t.Fatalf("replace retry: %v", err)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p3", Keys: []string{"Iris Bell"}}}); err != nil {
+		t.Fatalf("append after repair: %v", err)
+	}
+	v := l.Version()
+
+	// Restart recovers exactly the acknowledged state, stamps included.
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, _ := st2.List("people")
+	if got := l2.Version(); got != v {
+		t.Fatalf("restart version %q, want acknowledged %q", got, v)
+	}
+	if c := l2.Query("dana kovak", QueryOpts{}); len(c) != 1 || c[0].EntryID != "p2" {
+		t.Fatalf("acknowledged replace lost: %+v", c)
+	}
+	if c := l2.Query("iris bell", QueryOpts{}); len(c) != 1 || c[0].EntryID != "p3" {
+		t.Fatalf("acknowledged append lost: %+v", c)
+	}
+}
+
+// The CreateList analogue: after the marker-bracketed wipe has begun, a
+// failure (here: the marker removal's directory sync) leaves the directory
+// belonging to the NEW declaration while old memory serves the old list.
+// Appends must be refused until the PUT is retried.
+func TestCreateListPostWipeFailureQuarantinesMutations(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	syncMarkerRemove = func(string) error { return errors.New("injected sync failure") }
+	defer func() { syncMarkerRemove = syncDir }()
+	if _, err := st.CreateList("people", internalPersonCfg()); err == nil {
+		t.Fatal("create with failed marker sync reported success")
+	}
+	syncMarkerRemove = syncDir
+
+	// Old memory still serves; appends are refused.
+	l, _ := st.List("people")
+	if c := l.Query("marcus chen", QueryOpts{}); len(c) != 1 {
+		t.Fatalf("old list stopped serving: %+v", c)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("append after failed create: err=%v, want ErrListDamaged", err)
+	}
+
+	// Retrying the PUT repairs.
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatalf("create retry: %v", err)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); err != nil {
+		t.Fatalf("append after repair: %v", err)
+	}
+	l2, _ := st.List("people")
+	if c := l2.Query("dana kovak", QueryOpts{}); len(c) != 1 || c[0].EntryID != "p2" {
+		t.Fatalf("repaired list broken: %+v", c)
 	}
 }

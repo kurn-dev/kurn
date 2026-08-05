@@ -163,7 +163,9 @@ func TestImpossibleBuildInfoIsRefused(t *testing.T) {
 		}
 	}
 
-	// Exact mode enforces the same relationship.
+	// Exact mode enforces the same relationship, and — symmetrically with
+	// the ngram half above — rejection must leave an existing snapshot
+	// untouched, not merely return an error from an empty list.
 	eb := exact.NewBuilder()
 	eb.Add(0, []string{"aa"})
 	eb.Add(1, []string{"bb"})
@@ -178,7 +180,24 @@ func TestImpossibleBuildInfoIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := el.Replace([]engine.Entry{{ID: "keep", Keys: []string{"zz"}}}); err != nil {
+		t.Fatal(err)
+	}
+	beforeE, beforeO, beforeT := el.Stats()
+	beforeD, beforeK := el.BuildStats()
+
 	if err := el.ReplaceWithExactIndexInfo(entries, eidx, &engine.IndexBuildInfo{Entries: 1}); err == nil {
-		t.Error("exact: accepted an index with ordinals past its claimed entry count")
+		t.Fatal("exact: accepted an index with ordinals past its claimed entry count")
+	}
+	if c := el.Query("zz", engine.QueryOpts{}); len(c) != 1 || c[0].EntryID != "keep" {
+		t.Errorf("exact: rejected install disturbed prior content: %+v", c)
+	}
+	if e, o, tb := el.Stats(); e != beforeE || o != beforeO || tb != beforeT {
+		t.Errorf("exact: rejected install changed Stats: (%d,%d,%d) -> (%d,%d,%d)",
+			beforeE, beforeO, beforeT, e, o, tb)
+	}
+	if d, k := el.BuildStats(); d != beforeD || k != beforeK || el.UnindexedEntries() != 0 {
+		t.Errorf("exact: rejected install changed loss metrics: dropped %d->%d keyless %d->%d unindexed %d",
+			beforeD, d, beforeK, k, el.UnindexedEntries())
 	}
 }

@@ -2,10 +2,10 @@
 // store — the SAME code path the server uses, so the bundle is exactly
 // what a node would have written itself — and emit the publishable
 // bundle: config.json + base.jsonl + base.idx + manifest.json (+
-// delta.jsonl against a previous bundle). The manifest's sha256 of
-// base.jsonl IS the node's content-addressed version identity: its
-// 12-hex prefix equals the version stamp a node reports after loading
-// the bundle, so publish-time and query-time identity are one number.
+// delta.jsonl against a previous bundle). The manifest's full sha256 of
+// base.jsonl is the BASE half of the node's version stamp. version_id is
+// its 12-hex display prefix; the complete semantic identity is the loaded
+// stamp, which also hashes the resolved configuration.
 package ingest
 
 import (
@@ -26,7 +26,7 @@ type Manifest struct {
 	V         int    `json:"v"` // manifest format version (1)
 	SHA256    string `json:"sha256"`
 	Collapsed int    `json:"collapsed,omitempty"` // byte-identical duplicate records collapsed
-	VersionID string `json:"version_id"`          // 12-hex prefix == node version stamp base
+	VersionID string `json:"version_id"`          // 12-hex display prefix of SHA256; never a semantic key
 	Analyzer  string `json:"analyzer"`            // analyzer spec digest (also inside base.idx)
 	Mode      string `json:"mode"`
 	Entries   int    `json:"entries"`

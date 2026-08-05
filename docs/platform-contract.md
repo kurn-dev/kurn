@@ -74,7 +74,8 @@ carries operational logging — the streams are separable by fd):
 
 ```json
 {"time":"...","level":"INFO","msg":"mutation","op":"replace",
- "list":"codes","n":18234,"version":"ca764d77fea0@18234+j0",
+ "list":"products","n":3,
+ "version":"fa502064497ce8ce1ed03db536d8c8746511432e5f3b5783ba5e196db9efd67c@3+j0+ce9dd5b03c98d113fee839e4457a98902f91df39765f16f5f4483fc8a7f147490",
  "tenant":"acme","partial":false}
 ```
 
@@ -127,17 +128,19 @@ bundle/
 
 `manifest.json` v1: `{"v":1, "sha256", "version_id" (12-hex prefix),
 "analyzer", "mode", "entries", "keys", "source", "created_at",
-"prev_sha256", "delta":{"adds","updates","deletes"}}`. The identity
-property the platform may build on: **`version_id` is a PREFIX of the
-version stamp the node reports after loading the bundle** (the stamp's
-base half is the manifest's full `sha256`; the whole stamp is
+"prev_sha256", "delta":{"adds","updates","deletes"}}`. The manifest's
+`version_id` is a 12-hex display prefix of `sha256`, not a semantic key.
+The identity the platform stores is **the complete version stamp reported
+after loading the bundle**. Its base half is the manifest's full `sha256`;
+the whole stamp is
 `<sha256>@<entries>+j<journalBytes>[.<journalHash>]+c<configHash>`, where
 the journal suffix is `+j0` right after a clean publish and gains a
 content hash of the journal's exact bytes once mutations land on top,
-and the config hash identifies the resolved list configuration) —
-publish-time and query-time identity share one number,
-so "which list version answered this query" joins directly against the
-registry of built bundles.
+and the config hash identifies the resolved list configuration. The
+platform validates the complete base hash and records that full,
+configuration-bearing stamp, so "which list version answered this query"
+joins directly against the registry of loaded bundles without collisions
+between byte-identical data built under different configurations.
 
 **Ship discipline** (per file: write temp name in the list dir, then
 rename): remove `base.idx` first, rename it into place last —
@@ -149,8 +152,9 @@ the engine's own persistence uses; a crash mid-ship leaves a state the
 reload validates rather than serves.
 
 **Publish**: `POST /v1/lists/{list}/reload` (keyed; tenant-scoped like
-every /v1 route). Success returns fresh stats — `version` carries the
-`version_id` — plus the list's golden-probe results inline: the gate
+every /v1 route). Success returns fresh stats — `version` is the complete
+loaded stamp and the manifest's `version_id` is only its short prefix —
+plus the list's golden-probe results inline: the gate
 outcome arrives in the publish response. Failure returns 409 and the
 PREVIOUS content keeps serving; fix the files and reload again.
 Delta production is build-time; delta CONSUMPTION (re-checking) is

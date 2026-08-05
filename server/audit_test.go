@@ -102,8 +102,8 @@ func TestAuditTrail(t *testing.T) {
 		}
 	}
 	// The compact line carries the fresh content-addressed stamp.
-	if v := lines[4]["version"].(string); !strings.Contains(v, "@2+j0") {
-		t.Errorf("compact version = %q, want content stamp @2+j0", v)
+	if v := lines[4]["version"].(string); !strings.Contains(v, "@2+j0+c") {
+		t.Errorf("compact version = %q, want content/config stamp @2+j0+c…", v)
 	}
 
 	// Queries emit nothing (hot-path discipline). Also failed mutations:

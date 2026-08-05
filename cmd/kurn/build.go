@@ -45,7 +45,7 @@ func cmdBuild(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bundle %s: %d entries, %d keys, version %s (mode %s)\n",
+	fmt.Printf("bundle %s: %d entries, %d keys, base %s (mode %s)\n",
 		*out, man.Entries, man.Keys, man.VersionID, man.Mode)
 	if man.Delta != nil {
 		fmt.Printf("delta vs %s: +%d ~%d -%d\n", man.PrevSHA256[:12], man.Delta.Adds, man.Delta.Updates, man.Delta.Deletes)

@@ -300,9 +300,11 @@ curl -s -X POST localhost:8080/v1/lists/sanctions/reload
 # -> fresh stats + golden-probe results; on failure the old content keeps serving
 ```
 
-The bundle manifest's `version_id` equals the version stamp the node
-serves — publish identity and query identity are one number. Ship order,
-manifest schema, and rollback are specified in
+The bundle manifest's full `sha256` is the base half of the version stamp
+the node serves. The manifest's 12-hex `version_id` remains a convenient
+display prefix; semantic publish/query identity is the complete
+configuration-bearing node stamp. Ship order, manifest schema, and rollback
+are specified in
 [docs/platform-contract.md](docs/platform-contract.md).
 
 ## Multi-tenancy

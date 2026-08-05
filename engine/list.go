@@ -96,7 +96,8 @@ type List struct {
 	// baseID is the base content's identity for version stamps (guarded by
 	// mu). The Store sets it to a content hash of base.jsonl (or "empty"),
 	// making versions restart-stable and content-addressed:
-	// "<hash>@<entries>+j<bytes>.<jhash>" — same disk state ⇒ same version.
+	// "<hash>@<entries>+j<bytes>.<jhash>+c<cfg>" — same disk state and
+	// resolved configuration ⇒ same version.
 	// Library-managed lists leave it "" and keep the process-local gen
 	// format (documented in Version).
 	baseID string
@@ -409,7 +410,7 @@ func (l *List) PrepareCompact() (*compactBuild, error) {
 
 // CommitCompact installs a prepared fold as the entire list content with its
 // persisted base identity (the hash persistBase computed): fresh base, empty
-// overlay/tombstones, version "<id>@<n>+j0". Store-only counterpart of the
+// overlay/tombstones, version "<id>@<n>+j0+c<cfg>". Store-only counterpart of the
 // library's Compact; the Store's per-list mutation lock spans
 // prepare→persist→commit, so no mutation can interleave.
 func (l *List) CommitCompact(b *compactBuild, id string) {
@@ -640,7 +641,7 @@ func (l *List) commitOverlayLocked(b *overlayBuild) {
 // commitOverlayLockedAt is commitOverlayLocked with a journal byte position
 // for the version stamp: the Store passes the journal size after the append
 // that persisted this mutation, yielding the restart-stable
-// "<baseID>@<baseN>+j<jpos>.<jhash>" form. The byte position is diagnostics
+// "<baseID>@<baseN>+j<jpos>.<jhash>+c<cfg>" form. The byte position is diagnostics
 // (how much journal to replay); the CONTENT hash is the identity — equal
 // positions with different journal bytes are different data and must never
 // share a version. jpos < 0, an unset baseID, or a missing journal hash

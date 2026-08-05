@@ -46,7 +46,7 @@ func TestStoreVersionsAreContentAddressedAndRestartStable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Replace: hash@N+j0.
+	// Replace: hash@N+j0+c<cfg>.
 	if err := st.Replace("codes", []engine.Entry{
 		{ID: "c1", Keys: []string{"AA-1"}}, {ID: "c2", Keys: []string{"BB-2"}},
 	}); err != nil {

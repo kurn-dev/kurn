@@ -204,8 +204,11 @@ func TestLEIERealFeed(t *testing.T) {
 	if !ok {
 		t.Fatal("bundle did not load as a list")
 	}
-	if !strings.HasPrefix(l.Version(), man.VersionID+"@") {
-		t.Fatalf("provenance: stamp %q vs manifest %s", l.Version(), man.VersionID)
+	if !strings.HasPrefix(l.Version(), man.SHA256+"@") {
+		t.Fatalf("provenance: stamp %q vs manifest sha256 %s", l.Version(), man.SHA256)
+	}
+	if !strings.HasPrefix(l.Version(), man.VersionID) {
+		t.Fatalf("display prefix: stamp %q vs manifest version_id %s", l.Version(), man.VersionID)
 	}
 }
 

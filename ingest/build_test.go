@@ -1,7 +1,7 @@
 package ingest_test
 
-// Bundle build — determinism, the version_id == node-stamp
-// identity, delta correctness, duplicate-ID rejection.
+// Bundle build — determinism, full-sha256 node-stamp provenance,
+// delta correctness, duplicate-ID rejection.
 
 import (
 	"bytes"

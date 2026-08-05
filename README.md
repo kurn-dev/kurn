@@ -48,8 +48,10 @@ curl -s -X POST localhost:8080/v1/lists/people/entries \
 
 curl -s -X POST localhost:8080/v1/query -d '{"q":"vasquez elna","lists":["people"]}'
 # {"candidates":[{"list":"people","entry_id":"p1","score":100,"key":"Elena Vasquez",
-#   "payload":{"listed":"2024-01-01"}}],"versions":{"people":"empty@0+j174.d2e39af703db"},
-#  "took_us":44}
+#   "payload":{"listed":"2024-01-01"}}],
+#  "versions":{"people":"empty@0+j174.d2e39af703dbcc62beb868feb274b716b34db53d
+#   e46eaf5474e4f619142499a1+c8062333a3e9ae6e80ff226e920b72403218d1e2e867bf30b
+#   2e82f8c3d8bc4563"},"took_us":44}
 ```
 
 Note: the minimal `{"mode":"ngram"}` above uses the defaults only. The
@@ -71,12 +73,14 @@ curl -s -X POST 'localhost:8080/v1/lists/people/entries?replace=true' \
 # {"dropped_keys":0,"keyless_entries":0,"replaced":3}
 
 curl -s -X POST localhost:8080/v1/lists/people/compact
-# {"name":"people","entries":3,"overlay":0,"tombstones":0,"version":"eeaf668a8628@3+j0",
+# {"name":"people","entries":3,"overlay":0,"tombstones":0,
+#  "version":"eeaf668a86283960cd42649855356395c1cc1808cbd12f7acd4c5c1845a2132c
+#   @3+j0+c8062333a3e9ae6e80ff226e920b72403218d1e2e867bf30b2e82f8c3d8bc4563",
 #  "mode":"ngram","dropped_keys":0,"keyless_entries":0}
 
 curl -s -X POST localhost:8080/v1/query -d '{"q":"astrom ingrid","lists":["people"]}'
 # {"candidates":[{"list":"people","entry_id":"p3","score":100,"key":"Ingrid Åström"}],
-#  "versions":{"people":"eeaf668a8628@3+j0"},"took_us":43}
+#  "versions":{"people":"eeaf668a8628…@3+j0+c8062333a3e9…"},"took_us":43}
 ```
 
 Domain blocklist (exact mode, parent-suffix fallback): listing a domain
@@ -413,8 +417,10 @@ LB on `/readyz`, alert on `/metrics`.
 - **Query admission is memory-based**: in-flight queries are bounded by a
   scratch-memory budget (`-query-mem-budget-mb`, default 1024). Each query
   is charged a conservative ceiling — ~8 bytes × list ordinals for the
-  scan accumulators plus a bounded per-hit term — with FIFO queuing and a
-  503 after `-query-queue-timeout`. The budget counts memory, not CPU — an
+  scan accumulators plus a bounded per-hit term, computed from the exact
+  snapshot the query then executes — with FIFO queuing and a 503 after
+  `-query-queue-timeout`; a single query needing more than the whole
+  budget is refused with a 503 naming the remedy. The budget counts memory, not CPU — an
   explicit no-floor query (`threshold: 0`) is the most CPU-expensive
   shape, and concurrency capping plus client-disconnect cancellation are
   what bound it.
@@ -422,13 +428,15 @@ LB on `/readyz`, alert on `/metrics`.
   so a candidate's score can shift slightly when compaction folds the
   overlay into the base. Ordering by score within one segment is stable.
 - **Version stamps are content-addressed for daemon/store-managed lists**:
-  `<hash>@<baseEntries>+j<journalBytes>.<journalHash>` where `<hash>` is a
-  sha256 prefix of `base.jsonl` (or `empty`) and `<journalHash>` — omitted
-  for an empty journal (`+j0`) — is a sha256 prefix of the journal's exact
-  byte content, with the byte count as replay depth. The same disk state
-  always yields the same version across restarts, and equal versions
-  identify equal data: two journals of equal length but different
-  mutations get different stamps. Only lists managed DIRECTLY through the
+  `<hash>@<baseEntries>+j<journalBytes>[.<journalHash>]+c<configHash>` —
+  full sha256 of `base.jsonl` (or `empty`); the journal's exact byte
+  content (omitted for an empty journal, byte count as replay depth); and
+  the RESOLVED list configuration, because byte-identical data queried
+  under a different mode, analyzer, or default answers differently. Full
+  hashes, not prefixes: the stamp is evidence, and truncated digests
+  invite deliberate collisions. The same disk state always yields the
+  same version across restarts, and equal versions identify equal data
+  under an equal configuration. Only lists managed DIRECTLY through the
   library (`engine.NewList`, no Store) still stamp process-local `gen…`
   counters, which do not survive restarts.
 - **`fold_diacritics` only strips combining marks**: foldables that don't

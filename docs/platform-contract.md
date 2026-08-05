@@ -128,11 +128,13 @@ bundle/
 `manifest.json` v1: `{"v":1, "sha256", "version_id" (12-hex prefix),
 "analyzer", "mode", "entries", "keys", "source", "created_at",
 "prev_sha256", "delta":{"adds","updates","deletes"}}`. The identity
-property the platform may build on: **`version_id` is the PREFIX of the
-version stamp the node reports after loading the bundle** (the full
-stamp is `<version_id>@<entries>+j<journalBytes>.<journalHash>`, where
+property the platform may build on: **`version_id` is a PREFIX of the
+version stamp the node reports after loading the bundle** (the stamp's
+base half is the manifest's full `sha256`; the whole stamp is
+`<sha256>@<entries>+j<journalBytes>[.<journalHash>]+c<configHash>`, where
 the journal suffix is `+j0` right after a clean publish and gains a
-content hash of the journal's exact bytes once mutations land on top) —
+content hash of the journal's exact bytes once mutations land on top,
+and the config hash identifies the resolved list configuration) —
 publish-time and query-time identity share one number,
 so "which list version answered this query" joins directly against the
 registry of built bundles.

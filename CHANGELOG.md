@@ -2,17 +2,27 @@
 
 ## Unreleased (v0.2.1)
 
-### Version stamps now identify journal content
+### Version stamps identify data, journal content, AND configuration
 
-A store-managed list's version was `<hash>@<entries>+j<journalBytes>` —
-and the byte position alone let two journals of equal encoded length but
-different mutations share a stamp while answering differently. Living
-lists now stamp `<hash>@<entries>+j<bytes>.<journalHash>`, a
-domain-separated sha256 prefix of the journal's exact byte content
-(omitted for an empty journal, so `+j0` stamps and bundle `version_id`
-prefixes are unchanged). Stamps recorded by earlier versions will not
-match the new format; that is deliberate — the old suffix was not
-evidence of content.
+A store-managed list's version was `<hash12>@<entries>+j<journalBytes>`.
+Two things made that stamp weaker evidence than it claimed: the journal
+byte position alone let equal-length journals with different mutations
+share a stamp, and nothing identified the configuration — an ngram list
+and an exact list over byte-identical bases shared a version while
+answering the same query differently. Living lists now stamp
+
+    <baseHash>@<entries>+j<bytes>[.<journalHash>]+c<configHash>
+
+with COMPLETE sha256 hashes (a 48-bit prefix falls to ~2^24 deliberate-
+collision work — incompatible with self-verifying evidence): the base
+content, the journal's exact bytes (omitted for an empty journal), and
+the resolved configuration — defaults applied, analyzer preset expanded.
+Bundle manifests keep their 12-hex `version_id` as a join/display key;
+it remains a prefix of the stamp's base half, whose full value equals
+the manifest's `sha256`. Stamps recorded by earlier versions will not
+match the new format; that is deliberate. Artifacts saved by earlier
+versions rebuild once on the next open (the recorded identities
+lengthened).
 
 ### Added
 
@@ -20,15 +30,26 @@ evidence of content.
   snapshot; `QueryCtx`/`Query` delegate to it. The server's query path
   and audit trail use it: a response or audit line can no longer pair
   one snapshot's answer with another snapshot's version.
+- `List.PrepareQuery` / `PreparedQuery.Cost` / `PreparedQuery.Execute` —
+  pin one snapshot together with its admission cost and run exactly that
+  snapshot. The server prepares, admits the summed prepared costs, then
+  executes the prepared snapshots: a mutation landing while a request
+  queues can no longer grow the executed work past what was charged.
 - `Store.UpsertVersioned`, `UpsertGenVersioned`, `DeleteVersioned`,
-  `ReplaceVersioned`, `CompactVersioned`, `CreateListVersioned`,
-  `ReloadListVersioned` — each mutation's committed version, captured
-  under the mutation lock. The unversioned methods are unchanged.
+  `ReplaceVersioned`, `CompactVersioned` (returning a `CompactResult`:
+  the list generation operated on, committed version, folded entry
+  count), `CreateListVersioned`, `ReloadListVersioned` — each mutation's
+  committed identity, captured under the mutation lock. The unversioned
+  methods are unchanged.
 - `List.ScratchBytesFor(topK)` — the admission charge for a query shape;
   `ScratchBytes()` remains as the unlimited worst case.
-- `engine.ErrJournalDamaged` — appends are refused (reads keep serving)
-  when a failed append cannot be rolled back; Replace/Compact/ReloadList
-  repair.
+- `engine.ErrListDamaged` — append-path mutations are refused (reads
+  keep serving the acknowledged snapshot) when the process can no longer
+  vouch for disk state: a failed append that could not be rolled back,
+  or a destructive operation (Replace/Compact/CreateList) that failed
+  AFTER publishing disk changes it cannot undo. A successful Replace,
+  Compact, or PUT re-create repairs; reload is not a repair (it refuses
+  non-empty journals by ship discipline).
 
 ### Fixed
 
@@ -37,7 +58,11 @@ evidence of content.
   are byte-identical (the final order is total). Admission control
   charges a conservative ceiling (~8 B/ordinal for the scan accumulators
   plus a bounded per-hit term) instead of the 4 B/ordinal that
-  undercharged flood shapes about sixfold.
+  undercharged flood shapes about sixfold; the touched-ordinal scratch
+  is preallocated at exactly its charged size (append growth retained
+  ~8-11% beyond the model); and a single query charged more than the
+  entire budget is refused with an actionable 503 instead of quietly
+  running past the ceiling.
 - **Journal truncation is fsynced** before Replace/Compact acknowledge,
   so power loss can no longer resurrect the pre-operation journal over
   an acknowledged new base. The `.creating` marker's removal is fsynced
@@ -56,7 +81,10 @@ evidence of content.
   preserved.
 - **Ingest bounds the CSV header and XML opening tag** — both were
   materialized outside the record bound; XML gains CSV's two-tier
-  contract (skippable to 1 MiB, fatal input ceiling at 16 MiB).
+  contract (skippable to 1 MiB, fatal input ceiling at 16 MiB). The
+  header bound counts consumed INPUT (delimiters and quoting included —
+  2 MiB of bare commas decoded to zero field bytes) and caps the column
+  count at 1024.
 - **NaN is rejected** in list threshold and golden min_score; a JSON
   body with a trailing token (a lone `}`/`]`) is rejected; the
   `kurn_list_entries` help text matches the exported value.

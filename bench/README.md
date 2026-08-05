@@ -84,10 +84,54 @@ p50 3.1 ms / p99 6.6 ms, QPS 310 single-threaded, OVERALL 0.935, index
 103.4 B/key. Latency grows with corpus size as postings lengthen
 (3.1 ms → 13.2 ms p50 from 3.2M to 10M). At sample 200 per category the
 recall table is noisier than the 10M runs (±1–2 pts). QPS here is
-single-threaded; Lookup is concurrency-safe and scales with cores — at
-real-list scale (148,837 entries, the five public sanctions/exclusion
-lists) the same engine measures p50 0.91 ms and 6,022 q/s with 8
-concurrent clients on a 4 vCPU server.
+single-threaded; Lookup is concurrency-safe and scales with cores.
+
+## Five-public-list release evaluation (2026-08-05)
+
+Deployment-shaped run over LEIE, OFAC SDN, UN, the US Consolidated Screening
+List, and EU financial sanctions, built from the publishers' files with the
+committed mappings: **148,837 entries / 191,166 keys**. One idle 4-vCPU server,
+loopback HTTP; latency is the median of three runs and moved about ±15% within
+the session.
+
+| list | entries | cumulative entries | cumulative p50 |
+|---|---:|---:|---:|
+| LEIE | 83,639 | 83,639 | 0.22 ms |
+| OFAC SDN + UN | 7,473 + 736 | 91,848 | 0.36 ms |
+| US CSL | 25,921 | 117,769 | 0.56 ms |
+| EU | 31,068 | 148,837 | 0.64 ms (p95 1.67 ms) |
+
+| recall perturbation (40 real entries/list) | found | median score |
+|---|---:|---:|
+| exact | 100% | 100 |
+| drop a letter | 99.5% | 90 |
+| swap two letters | 95.5% | 79 |
+| doubled letter | 100% | 90 |
+| dropped vowels | 94.0% | 84 |
+| reversed name order | 100% | 100 |
+| first + last only | 98.5% | 100 |
+| phonetic (`ph`→`f`, `ck`→`k`) | 98.5% | 100 |
+
+False-positive probe: 60 invented names queried against each list separately.
+
+| threshold | queries matching anything |
+|---|---:|
+| 0.60 | 5.7% average (1.7% EU … 11.7% CSL) |
+| 0.50 | 25.7% average |
+| 0.45 | 40.7% average |
+
+| all-five-list measurement | result |
+|---|---:|
+| p50 / p95 latency | 0.64 ms / 1.67 ms |
+| 1 client | 1,208 queries/s |
+| 8 clients | 5,034 queries/s |
+| resident memory | 128 MB |
+
+The source feeds are daily-changing external inputs, so this record names the
+publication-shaped corpus and session rather than pretending a later download
+is byte-identical evidence. The mappings and engine harness are committed; a
+release re-measurement must record its feed publication dates alongside its
+output.
 
 ## Memory decomposition
 

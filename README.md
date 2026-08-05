@@ -148,6 +148,12 @@ Presets are exactly these step lists:
 | `golden` | readiness | optional probe set: `[{"q","expect_id","min_score"} \| {"q","absent":true}]`. `/readyz` runs each through the normal query path — `expect_id` must appear among the candidates (with score ≥ `min_score` when set), `absent` must return none. A failing golden takes the node out of rotation with the reason in the body |
 | `overlay_auto_compact` | mutation-time | when > 0, the daemon folds the overlay into a new base in the background once it reaches this many entries (0 = disabled, the default). Append-mode mutations rebuild the whole overlay each time, so an ungoverned overlay is the first wall a write-heavy list hits. Caveat: compaction recomputes segment-local IDF over the folded corpus, so ngram scores can shift slightly at each trigger (see score semantics) |
 
+Version config digests intentionally hash the resolved configuration's literal
+representation. Semantically equivalent spelling can therefore produce a
+different `+c` value—for example, reordering words inside one
+`strip_words:mr,dr` step. This is safe, but callers should compare served
+version strings rather than attempting to canonicalize configuration JSON.
+
 **Score semantics** (`score` is 0–100): IDF-weighted coverage of the query's
 grams *that are known to the index* — grams absent from the indexed corpus
 are excluded from the denominator. This is the reference-faithful behavior:
@@ -171,7 +177,7 @@ quickstart query over a 2-entry list).
 | `DELETE /v1/lists/{list}/entries/{id}` | delete one entry | idempotent tombstone |
 | `POST /v1/lists/{list}/reload` | publish a shipped bundle: re-open the list from disk | atomic swap; failure keeps previous content serving (409); response = fresh stats + golden-probe results |
 | `POST /v1/lists/{list}/compact` | fold journal/overlay into a fresh base | run after large append sessions |
-| `POST /v1/query` | query one or more lists | `{"q","lists",["threshold"],["topk"]}`; `threshold` must be in `[0, 1]` and `topk` in `[1, 1000]` when present (400 otherwise) — an ABSENT field means "list default", while an explicit `"threshold": 0` queries with no score floor (the two are distinct); results from all named lists are merged (score desc), each candidate tagged with its `list`; global top-K after merge (100 when `topk` omitted); an empty `candidates` array is an explicit "no match", not an error; unknown list anywhere in the request is a 404 and nothing runs. Library note: `engine.QueryOpts` uses zero = list default and NEGATIVE = explicit zero (no floor / unlimited) |
+| `POST /v1/query` | query one or more lists | `{"q","lists",["threshold"],["topk"]}`; 1–100 list entries, `threshold` in `[0, 1]`, and `topk` in `[1, 1000]` when present (400 otherwise) — an ABSENT field means "list default", while an explicit `"threshold": 0` queries with no score floor (the two are distinct); results from all named lists are merged (score desc), each candidate tagged with its `list`; global top-K after merge (100 when `topk` omitted); an empty `candidates` array is an explicit "no match", not an error; unknown list anywhere in the request is a 404 and nothing runs. Library note: `engine.QueryOpts` uses zero = list default and NEGATIVE = explicit zero (no floor / unlimited) |
 | `POST /v1/batch-query` | run up to 100 query checks in one request | `{"checks":[{"q","lists",["threshold"],["topk"]},...]}` (1–100 checks); `results[i]` is either a full single-query envelope or `{"error":"..."}` for that check, order preserved |
 
 Batch checks share one round trip; per-check errors are inline, so one bad
@@ -245,9 +251,11 @@ func main() {
 
 ## Performance
 
-Every figure comes from `cmd/kurn bench`. Latency depends on corpus size, so
-each one names its corpus and its machine; full tables, methodology and the
-caveats that qualify them are in [bench/README.md](bench/README.md).
+Synthetic figures come from `cmd/kurn bench`; the five-public-list row is a
+deployment-shaped loopback HTTP session over bundles built with the committed
+mappings. Latency depends on corpus size, so each figure names its corpus and
+machine; full tables, methodology and caveats are in
+[bench/README.md](bench/README.md).
 
 **Fuzzy (ngram) lists**, person-name preset, grams 2+3, threshold 0.6:
 

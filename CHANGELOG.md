@@ -43,6 +43,8 @@ lengthened).
   methods are unchanged.
 - `List.ScratchBytesFor(topK)` — the admission charge for a query shape;
   `ScratchBytes()` remains as the unlimited worst case.
+- `List.Status` / `ListStatus` — entries, overlay, tombstones, version,
+  mode, build-loss counters, and build state from one atomic snapshot.
 - `engine.ErrListDamaged` — append-path mutations are refused (reads
   keep serving the acknowledged snapshot) when the process can no longer
   vouch for disk state: a failed append that could not be rolled back,

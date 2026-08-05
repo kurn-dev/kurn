@@ -80,6 +80,82 @@ func TestAppendJournalPartialWriteRolledBack(t *testing.T) {
 	}
 }
 
+// TestJournalDamagedRefusesAppends: when a failed append's rollback ALSO
+// fails, the file may hold bytes this process never acknowledged — so the
+// version stamp's running journal hash can no longer be trusted to match the
+// file, and the torn fragment would glue onto the next append. Appends must
+// be refused with ErrJournalDamaged (reads keep serving), and an operation
+// that rebuilds the journal wholesale (Replace) repairs.
+func TestJournalDamagedRefusesAppends(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	fileWrite = func(f *os.File, b []byte) (int, error) {
+		n, _ := f.Write(b[:len(b)/2]) // really write half, then fail
+		return n, errors.New("injected partial write")
+	}
+	fileTruncate = func(f *os.File, size int64) error {
+		return errors.New("injected rollback failure")
+	}
+	defer func() {
+		fileWrite = (*os.File).Write
+		fileTruncate = (*os.File).Truncate
+	}()
+	if err := st.Upsert("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); err == nil {
+		t.Fatal("append with failed write reported success")
+	}
+	fileWrite = (*os.File).Write
+	fileTruncate = (*os.File).Truncate
+
+	// The journal now holds a fragment this process cannot vouch for:
+	// further appends must be refused, not stamped with a hash the file
+	// doesn't match.
+	err = st.Upsert("people", []Entry{{ID: "p3", Keys: []string{"Iris Bell"}}})
+	if !errors.Is(err, ErrJournalDamaged) {
+		t.Fatalf("append on a damaged journal: err=%v, want ErrJournalDamaged", err)
+	}
+	if err := st.Delete("people", "p1"); !errors.Is(err, ErrJournalDamaged) {
+		t.Fatalf("delete on a damaged journal: err=%v, want ErrJournalDamaged", err)
+	}
+	// Reads keep working on the acknowledged state.
+	l, _ := st.List("people")
+	if c := l.Query("marcus chen", QueryOpts{}); len(c) != 1 || c[0].EntryID != "p1" {
+		t.Fatalf("damaged journal broke reads: %+v", c)
+	}
+
+	// Replace rebuilds the journal wholesale (new base, truncated journal):
+	// the damage is repaired and appends work again.
+	if err := st.Replace("people", []Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatalf("Replace on a damaged journal: %v", err)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p3", Keys: []string{"Iris Bell"}}}); err != nil {
+		t.Fatalf("append after repair: %v", err)
+	}
+	v := l.Version()
+
+	// The repaired stamps are honest: a restart reproduces them from disk.
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, _ := st2.List("people")
+	if got := l2.Version(); got != v {
+		t.Fatalf("post-repair version %q not reproduced across restart (got %q)", v, got)
+	}
+	if c := l2.Query("iris bell", QueryOpts{}); len(c) != 1 || c[0].EntryID != "p3" {
+		t.Fatalf("post-repair append lost across restart: %+v", c)
+	}
+}
+
 // TestSaveArtifactNonFatal: a failed base.idx save must not panic or fail the
 // operation (the artifact is a pure cache with a rebuild fallback); it is
 // reported through OnArtifactError.

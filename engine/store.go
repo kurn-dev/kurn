@@ -235,6 +235,15 @@ type listState struct {
 	// autoCompacting dedupes background auto-compaction: at most one
 	// in-flight fold per list (see maybeAutoCompact).
 	autoCompacting atomic.Bool
+
+	// journalDamaged is set when a failed append could not be rolled back
+	// (guarded by lock): the file may now hold bytes this process never
+	// acknowledged, so further appends would stamp versions whose content
+	// hash a restart could not reproduce — and the next append would glue
+	// onto a torn fragment and be silently dropped by torn-tail repair.
+	// Appends are refused until an operation that rebuilds the journal
+	// wholesale (Replace, Compact, CreateList, ReloadList) clears it.
+	journalDamaged bool
 }
 
 const (
@@ -396,13 +405,24 @@ func (st *Store) openList(name string) (*List, error) {
 			return nil, fmt.Errorf("%s: repairing torn tail: %w", journalFile, err)
 		}
 	}
-	if len(ops) > 0 {
-		// The version stamp's journal position: everything replayed — the
-		// intact prefix after any torn-tail truncate.
-		jpos := int64(0)
-		if fi, serr := os.Stat(jp); serr == nil {
-			jpos = fi.Size()
+	// Seed the running journal content hash from the intact prefix — the
+	// bytes replay actually consumes, post any torn-tail truncate. The byte
+	// count doubles as the version stamp's replay position, so hash and
+	// position are computed from one read and cannot disagree.
+	jh := newJournalHash()
+	jpos := int64(0)
+	if jf, jerr := os.Open(jp); jerr == nil {
+		n, cerr := io.Copy(jh, jf)
+		jf.Close()
+		if cerr != nil {
+			return nil, fmt.Errorf("%s: hashing replay prefix: %w", journalFile, cerr)
 		}
+		jpos = n
+	} else if !os.IsNotExist(jerr) {
+		return nil, jerr
+	}
+	l.setJournalHash(jh)
+	if len(ops) > 0 {
 		l.mu.Lock()
 		err := l.applyJournalLocked(ops, jpos)
 		l.mu.Unlock()
@@ -420,6 +440,10 @@ func (st *Store) openList(name string) (*List, error) {
 			if rerr := os.Rename(jp, q); rerr != nil {
 				return nil, fmt.Errorf("%s: unbuildable journal (%v) and quarantine rename failed: %w", journalFile, err, rerr)
 			}
+			// The journal file is gone: the list serves its base state and
+			// future appends start an empty journal, so the running hash
+			// must forget the quarantined bytes.
+			l.setJournalHash(newJournalHash())
 			st.mu.Lock() // openList runs at Open (single-threaded) AND ReloadList (concurrent)
 			st.Quarantined = append(st.Quarantined, JournalQuarantine{List: name, Path: q, Err: err})
 			st.mu.Unlock()
@@ -550,6 +574,8 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 		return nil, fmt.Errorf("store: clearing %s: %w", markerFile, err)
 	}
 	l.SetBaseID("empty") // store-managed: content-addressed stamps from the start
+	l.setJournalHash(newJournalHash())
+	ls.journalDamaged = false // the journal file was removed above: rebuilt wholesale
 	ls.l.Store(l)
 	return l, nil
 }
@@ -590,7 +616,7 @@ func (st *Store) upsertLocked(name string, ls *listState, l *List, entries []Ent
 	for i := range entries {
 		recs[i] = journalRec{Op: "upsert", Entry: &entries[i]}
 	}
-	jpos, err := st.appendJournal(filepath.Join(st.listPath(name), journalFile), recs)
+	jpos, err := st.appendJournal(ls, l, filepath.Join(st.listPath(name), journalFile), recs)
 	if err != nil {
 		return err
 	}
@@ -658,7 +684,7 @@ func (st *Store) Delete(name string, id string) error {
 	if err != nil {
 		return err
 	}
-	jpos, err := st.appendJournal(filepath.Join(st.listPath(name), journalFile), []journalRec{{Op: "delete", ID: id}})
+	jpos, err := st.appendJournal(ls, l, filepath.Join(st.listPath(name), journalFile), []journalRec{{Op: "delete", ID: id}})
 	if err != nil {
 		return err
 	}
@@ -704,6 +730,7 @@ func (st *Store) ReloadList(name string) (*List, error) {
 	if err != nil {
 		return nil, err
 	}
+	ls.journalDamaged = false // openList re-read/re-hashed whatever is on disk
 	ls.l.Store(l)
 	return l, nil
 }
@@ -797,6 +824,8 @@ func (st *Store) Compact(name string) error {
 	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil && !os.IsNotExist(err) {
 		return err // a missing journal is already empty
 	}
+	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
+	ls.journalDamaged = false
 	l.CommitCompact(b, id)
 	st.saveArtifact(l, lp, b.seg.ng, b.seg.ex)
 	return nil
@@ -852,6 +881,8 @@ func (st *Store) Replace(name string, entries []Entry) error {
 	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
+	ls.journalDamaged = false
 	l.SetBaseID(id) // before install: the base stamp carries the new hash
 	l.installBase(seg)
 	st.saveArtifact(l, lp, seg.ng, seg.ex)
@@ -1049,23 +1080,45 @@ func (st *Store) listPath(name string) string { return filepath.Join(st.dir, nam
 // restore it before returning (the existing torn-tail tests do both).
 var fileWrite = (*os.File).Write
 
+// fileTruncate is the same kind of seam for the rollback truncate: the
+// journal-damaged path only exists when a failed append ALSO fails to roll
+// back, which no real filesystem produces on demand.
+var fileTruncate = (*os.File).Truncate
+
+// ErrJournalDamaged reports that a failed journal append could not be rolled
+// back: the file may hold bytes this process never acknowledged, so its
+// content no longer verifiably matches the served state or the version
+// stamps' journal hash. Appends are refused (reads keep working) until the
+// journal is rebuilt wholesale — Replace, Compact, or ReloadList all repair.
+var ErrJournalDamaged = errors.New("store: journal left unverifiable by a failed append; replace, compact, or reload the list to repair")
+
 // appendJournal appends recs as JSON lines in a single write, then applies
 // the store's JournalFsync policy (none / fsync-now / group commit) before
-// the caller acknowledges. Caller holds the mutation lock.
+// the caller acknowledges. Caller holds ls.lock and l.mu.
 //
 // Every record is size-bounded BEFORE anything touches disk: readJournal
 // refuses lines over maxLine, and an acknowledged write must never brick the
 // next Open, so an oversize entry is rejected here (by ID) with nothing
 // persisted.
 //
-// If the write fails partway, the file is truncated back to its pre-append
-// size: a surviving fragment has no trailing newline, so the NEXT
-// acknowledged append would glue onto it and be dropped by the following
-// restart's torn-tail repair. If the truncate itself also fails, the next
-// Open repairs the tail (and this append was not acknowledged anyway).
-// It returns the journal byte position just past the appended records — the
-// journal-offset half of the content-addressed version stamp.
-func (st *Store) appendJournal(path string, recs []journalRec) (int64, error) {
+// The invariant on EVERY return is that the file's bytes equal the bytes
+// l.jhash has hashed: the running hash is the version stamp's journal
+// identity, so file and hash must never diverge. Success extends the hash
+// with exactly the appended bytes. Any failure after bytes may have reached
+// the file (partial write, fsync, group commit) rolls the file back to its
+// pre-append size — the record was never acknowledged, so removing it is
+// legal under at-least-once — which also keeps the tail newline-terminated
+// (a glued-on fragment would make torn-tail repair silently drop the NEXT
+// acknowledged append). If the rollback itself fails the invariant is
+// unrecoverable in place: the list is marked journalDamaged and further
+// appends are refused until Replace/Compact/ReloadList rebuild the file.
+//
+// Returns the journal byte position just past the appended records — the
+// replay-depth half of the version stamp.
+func (st *Store) appendJournal(ls *listState, l *List, path string, recs []journalRec) (int64, error) {
+	if ls.journalDamaged {
+		return 0, ErrJournalDamaged
+	}
 	var buf []byte
 	for i := range recs {
 		line, err := json.Marshal(&recs[i])
@@ -1091,26 +1144,38 @@ func (st *Store) appendJournal(path string, recs []journalRec) (int64, error) {
 		f.Close()
 		return 0, err
 	}
-	if _, werr := fileWrite(f, buf); werr != nil {
-		f.Truncate(start) // best-effort rollback of a partial write
+	rollback := func(werr error) (int64, error) {
+		if terr := fileTruncate(f, start); terr != nil {
+			ls.journalDamaged = true
+		}
 		f.Close()
 		return 0, werr
 	}
+	if _, werr := fileWrite(f, buf); werr != nil {
+		return rollback(werr)
+	}
 	if st.JournalFsync == FsyncEvery {
-		// Fsync failure: the record is written but NOT acknowledged — the
-		// next Open replays it, which the at-least-once contract permits.
-		if err := f.Sync(); err != nil {
-			f.Close()
-			return 0, err
+		if serr := f.Sync(); serr != nil {
+			return rollback(serr)
 		}
 	}
-	if err := f.Close(); err != nil {
-		return 0, err
+	if cerr := f.Close(); cerr != nil {
+		// The write may or may not have reached the file; reopen to roll back.
+		if terr := os.Truncate(path, start); terr != nil {
+			ls.journalDamaged = true
+		}
+		return 0, cerr
 	}
 	if st.JournalFsync == FsyncInterval {
-		if err := st.groupCommit(path); err != nil {
-			return 0, err
+		if gerr := st.groupCommit(path); gerr != nil {
+			if terr := os.Truncate(path, start); terr != nil {
+				ls.journalDamaged = true
+			}
+			return 0, gerr
 		}
+	}
+	if l.jhash != nil {
+		l.jhash.Write(buf)
 	}
 	return start + int64(len(buf)), nil
 }
@@ -1300,6 +1365,16 @@ func AnalyzerSpecDigest(a analyzer.Analyzer) string {
 // handful of list generations, short enough to read in logs.
 func baseIDFromHash(h hash.Hash) string {
 	return hex.EncodeToString(h.Sum(nil))[:12]
+}
+
+// newJournalHash starts the running hash of a journal's byte prefix (the
+// overlay half of the version stamp — see List.jhash). Domain-separated from
+// the base hash: base.jsonl and journal.jsonl with coincidentally equal
+// bytes must not produce equal identities in the two halves of one stamp.
+func newJournalHash() hash.Hash {
+	h := sha256.New()
+	h.Write([]byte("kurn journal v1\x00"))
+	return h
 }
 
 // writeFileAtomic writes data via temp+rename (config.json), fsyncing the

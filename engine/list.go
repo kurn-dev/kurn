@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"hash"
 	"sort"
 	"strings"
 	"sync"
@@ -81,10 +82,19 @@ type List struct {
 	// baseID is the base content's identity for version stamps (guarded by
 	// mu). The Store sets it to a content hash of base.jsonl (or "empty"),
 	// making versions restart-stable and content-addressed:
-	// "<hash>@<entries>+j<journalBytes>" — same disk state ⇒ same version.
+	// "<hash>@<entries>+j<bytes>.<jhash>" — same disk state ⇒ same version.
 	// Library-managed lists leave it "" and keep the process-local gen
 	// format (documented in Version).
 	baseID string
+
+	// jhash is the running content hash of the journal's exact byte prefix
+	// (guarded by mu; Store-managed lists only, nil otherwise). The byte
+	// POSITION alone cannot be the overlay identity: two journals of equal
+	// encoded length holding different mutations produce different answers,
+	// and a version must never equate them. The Store seeds it from the
+	// replayed prefix at open, extends it on every acknowledged append, and
+	// resets it whenever the journal is truncated (Replace/Compact/create).
+	jhash hash.Hash
 
 	overlaySrc map[string]Entry // source entries for overlay rebuilds
 }
@@ -284,6 +294,15 @@ func (l *List) SetBaseID(id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.baseID = id
+}
+
+// setJournalHash installs the running journal content hash (see the jhash
+// field). The Store hands over a hash already covering the journal's current
+// byte prefix; appendJournal extends it under l.mu as records land.
+func (l *List) setJournalHash(h hash.Hash) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.jhash = h
 }
 
 // BaseIDForArtifact returns the declared base content identity ("" for
@@ -551,9 +570,12 @@ func (l *List) commitOverlayLocked(b *overlayBuild) {
 // commitOverlayLockedAt is commitOverlayLocked with a journal byte position
 // for the version stamp: the Store passes the journal size after the append
 // that persisted this mutation, yielding the restart-stable
-// "<baseID>@<baseN>+j<jpos>" form (replaying the journal to the same byte
-// position rebuilds the same overlay). jpos < 0 or an unset baseID falls
-// back to the gen format. Caller holds l.mu.
+// "<baseID>@<baseN>+j<jpos>.<jhash>" form. The byte position is diagnostics
+// (how much journal to replay); the CONTENT hash is the identity — equal
+// positions with different journal bytes are different data and must never
+// share a version. jpos < 0, an unset baseID, or a missing journal hash
+// falls back to the gen format (never to a length-only stamp, which would
+// claim a content identity it doesn't have). Caller holds l.mu.
 func (l *List) commitOverlayLockedAt(b *overlayBuild, jpos int64) {
 	prev := l.snap.Load()
 	l.overlaySrc = b.src
@@ -563,8 +585,11 @@ func (l *List) commitOverlayLockedAt(b *overlayBuild, jpos int64) {
 	}
 	l.gen++
 	version := fmt.Sprintf("gen%d-base@%d+ov%d-t%d", l.gen, baseN, len(b.src), len(b.tomb))
-	if l.baseID != "" && jpos >= 0 {
+	if l.baseID != "" && jpos >= 0 && (jpos == 0 || l.jhash != nil) {
 		version = fmt.Sprintf("%s@%d+j%d", l.baseID, baseN, jpos)
+		if jpos > 0 {
+			version += "." + baseIDFromHash(l.jhash)
+		}
 	}
 	l.snap.Store(&snapshot{
 		base:       prev.base,
@@ -834,11 +859,14 @@ func (l *List) QueryCtx(ctx context.Context, q string, opts QueryOpts) []Candida
 }
 
 // Version returns the snapshot version stamp. Store-managed lists carry the
-// restart-stable content-addressed form "<baseID>@<baseEntries>+j<jbytes>"
-// (baseID = sha256 prefix of base.jsonl, or "empty"; jbytes = journal byte
-// position): the same disk state always yields the same version, and equal
-// versions imply equal answers. Library-managed lists (no Store) keep the
-// process-local "gen…" form — unique within a process, NOT restart-stable.
+// restart-stable content-addressed form
+// "<baseID>@<baseEntries>+j<jbytes>.<jhash>" (baseID = sha256 prefix of
+// base.jsonl, or "empty"; jbytes = journal byte position, replay depth;
+// jhash = sha256 prefix of the journal's exact byte content, omitted for an
+// empty journal): the same disk state always yields the same version, and
+// equal versions identify equal data. Library-managed lists (no Store) keep
+// the process-local "gen…" form — unique within a process, NOT
+// restart-stable.
 func (l *List) Version() string { return l.snap.Load().version }
 
 // ScratchBytes estimates the per-query scratch memory an ngram lookup on

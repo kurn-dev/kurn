@@ -1,8 +1,7 @@
-// Query admission control: each concurrent ngram lookup
-// allocates ~4 B × numOrds of scratch per list touched, so N concurrent
-// queries on a 50M-ordinal list would pin ~200 MB each — unbounded
-// concurrency is an OOM, not a slowdown. Admission charges each query its
-// scratch cost (engine List.ScratchBytes) against a configured budget:
+// Query admission control: lookups allocate dense ngram scan buffers, query-
+// gram scratch, and bounded hit materialization (including exact-mode hits).
+// Large-list concurrency can therefore become an OOM rather than a slowdown.
+// Admission charges each query's complete conservative cost against a budget:
 // within budget queries run immediately, over budget they queue (FIFO,
 // backpressure) until the request context or the queue timeout ends the
 // wait with a 503. Memory is the cost model; the same bound also caps how

@@ -4,12 +4,49 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/kurn-dev/kurn/engine"
 	"github.com/kurn-dev/kurn/engine/exact"
 	"github.com/kurn-dev/kurn/engine/ngram"
 )
+
+func TestAdmissionChargesExactHitsAndQueryScratch(t *testing.T) {
+	ex, err := engine.NewList("codes", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase"}},
+		Match:    engine.MatchConfig{Mode: "exact"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]engine.Entry, 10)
+	for i := range entries {
+		entries[i] = engine.Entry{ID: fmt.Sprintf("c%d", i), Keys: []string{"hot"}}
+	}
+	if err := ex.Replace(entries); err != nil {
+		t.Fatal(err)
+	}
+	if cost := ex.PrepareQuery("hot", engine.QueryOpts{TopK: 3}).Cost(); cost <= 0 {
+		t.Fatalf("exact query admission cost = %d, want positive hit materialization charge", cost)
+	}
+
+	ng, err := engine.NewList("people", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Preset: "person-name"},
+		Match:    engine.MatchConfig{Mode: "ngram"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ng.Replace([]engine.Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+	short := ng.PrepareQuery("marcus", engine.QueryOpts{TopK: 1}).Cost()
+	long := ng.PrepareQuery(strings.Repeat("a", 2048), engine.QueryOpts{TopK: 1}).Cost()
+	if short < ng.ScratchBytesFor(1) || long <= short {
+		t.Fatalf("query scratch charge did not cover/default-scale: generic=%d short=%d long=%d", ng.ScratchBytesFor(1), short, long)
+	}
+}
 
 func buildIdx(t *testing.T, keys ...string) *ngram.Index {
 	t.Helper()
@@ -321,7 +358,7 @@ func TestPreparedQueryExecutesTheSnapshotItCharged(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Validity guard: the mutation really did inflate the current cost.
-	if now := l.ScratchBytesFor(5); now <= 4*costBefore {
+	if now := l.ScratchBytesFor(5); now <= costBefore {
 		t.Fatalf("mutation did not inflate the cost (%d -> %d); the scenario shows nothing", costBefore, now)
 	}
 

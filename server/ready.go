@@ -17,7 +17,8 @@ import (
 
 // readyCacheTTL bounds how often a probe storm can re-run golden queries.
 // Correctness does not depend on it: the cache is also keyed by every
-// list's version, so any mutation invalidates it immediately — the TTL
+// list's complete version, so any data or resolved-config mutation
+// invalidates it immediately — the TTL
 // only coalesces identical checks between mutations.
 const readyCacheTTL = 5 * time.Second
 
@@ -34,9 +35,9 @@ type readyResult struct {
 }
 
 // readyKey identifies one list's state at evaluation time. The version
-// covers DATA identity (content-addressed), but not config: a PUT-replace
-// with different golden probes can reproduce an identical version, so the
-// *List pointer (fresh per CreateList) covers config identity. The damage
+// covers data AND the complete resolved query configuration, including
+// golden probes. The *List pointer additionally invalidates on re-create,
+// even if the replacement happens to reproduce the same version. The damage
 // repair string covers quarantine state: entering OR leaving damage must
 // invalidate the cache immediately, not after the TTL — a node with a
 // known disk/memory split must stop claiming ready as soon as it exists.
@@ -50,6 +51,25 @@ type readyCache struct {
 	keys    map[string]readyKey // list name -> identity at evaluation time
 	expires time.Time
 	result  readyResult
+}
+
+// addReadyKeys records both serving lists and damaged first-create
+// placeholders. The latter have no *List and are intentionally omitted by
+// Store.Lists, but they must still invalidate a cached green result.
+func addReadyKeys(keys map[string]readyKey, tenant string, lists []*engine.List, damaged []engine.DamagedList) {
+	dmg := make(map[string]string, len(damaged))
+	for _, d := range damaged {
+		dmg[d.List] = d.Repair
+	}
+	for _, l := range lists {
+		keys[tenant+"/"+l.Name()] = readyKey{l: l, version: l.Version(), damage: dmg[l.Name()]}
+	}
+	for name, repair := range dmg {
+		k := tenant + "/" + name
+		if _, ok := keys[k]; !ok {
+			keys[k] = readyKey{damage: repair}
+		}
+	}
 }
 
 func (s *srv) livez(w http.ResponseWriter, r *http.Request) {
@@ -95,13 +115,7 @@ func (s *srv) readyResult() readyResult {
 	units := s.tenantStores()
 	keys := make(map[string]readyKey)
 	for _, u := range units {
-		dmg := map[string]string{}
-		for _, d := range u.st.DamagedLists() {
-			dmg[d.List] = d.Repair
-		}
-		for _, l := range u.st.Lists() {
-			keys[u.name+"/"+l.Name()] = readyKey{l: l, version: l.Version(), damage: dmg[l.Name()]}
-		}
+		addReadyKeys(keys, u.name, u.st.Lists(), u.st.DamagedLists())
 	}
 	if c := s.ready.Load(); c != nil && time.Now().Before(c.expires) && keysMatch(c.keys, keys) {
 		return c.result

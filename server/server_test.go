@@ -453,6 +453,22 @@ func TestQueryDuplicateListNames(t *testing.T) {
 	}
 }
 
+func TestQueryListFanoutBound(t *testing.T) {
+	ts := newTS(t)
+	lists := make([]string, 101)
+	for i := range lists {
+		lists[i] = fmt.Sprintf("l%d", i)
+	}
+	raw, err := json.Marshal(map[string]any{"q": "x", "lists": lists})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body := do(t, "POST", ts.URL+"/v1/query", string(raw))
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "lists exceeds 100") {
+		t.Fatalf("fanout bound: %d %s, want 400", resp.StatusCode, body)
+	}
+}
+
 // Domain blocklist pattern end-to-end: domain preset + parent_domain fallback.
 // A subdomain query falls back to the listed parent (score 90, key names the
 // listed domain); fallback with ngram mode is rejected as a 400 at creation.
@@ -651,6 +667,14 @@ func TestReadinessSurfacesDamagedLists(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "people") || !strings.Contains(string(body), "unverifiable") {
 		t.Fatalf("503 does not name the damaged list and cause: %s", body)
+	}
+
+	// The same live damage must be a resource-state conflict at the HTTP
+	// mutation boundary, not an opaque 500.
+	resp, body = do(t, "POST", ts.URL+"/v1/lists/people/entries",
+		`[{"id":"p3","keys":["iris bell"]}]`)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("mutation on damaged list: %d %s, want 409", resp.StatusCode, body)
 	}
 
 	// The named repair (retry the replace) clears it — and readiness must

@@ -34,6 +34,7 @@ const (
 	maxBodyBytes  = 32 << 20 // whole-body bound for JSON bodies (NDJSON is per-line bounded instead)
 	defaultTopK   = 100      // global post-merge top-K when the request omits it
 	maxTopK       = 1000     // largest per-request topk; bounds per-list collection and the merge
+	maxQueryLists = 100      // bounds fanout before admission and per-list materialization
 
 	// maxNDJSONLine bounds each NDJSON line; matches the engine's maxLine
 	// (journal/base line limit), so a line the server accepts is one the
@@ -305,18 +306,20 @@ type statsResp struct {
 }
 
 func statsOf(l *engine.List) statsResp {
-	entries, overlay, tombstones := l.Stats()
-	dropped, keyless := l.BuildStats()
+	return statsFromStatus(l, l.Status())
+}
+
+func statsFromStatus(l *engine.List, s engine.ListStatus) statsResp {
 	return statsResp{
 		Name:             l.Name(),
-		Entries:          entries,
-		Overlay:          overlay,
-		Tombstones:       tombstones,
-		Version:          l.Version(),
+		Entries:          s.Entries,
+		Overlay:          s.Overlay,
+		Tombstones:       s.Tombstones,
+		Version:          s.Version,
 		Mode:             l.Config().Match.Mode,
-		DroppedKeys:      dropped,
-		KeylessEntries:   keyless,
-		UnindexedEntries: l.UnindexedEntries(),
+		DroppedKeys:      s.DroppedKeys,
+		KeylessEntries:   s.KeylessEntries,
+		UnindexedEntries: s.UnindexedEntries,
 	}
 }
 
@@ -330,10 +333,10 @@ func mutationResp(l *engine.List, verb string, n int) map[string]int {
 		// degrade to the bare count rather than panic on a wild race.
 		return map[string]int{verb: n}
 	}
-	dropped, keyless := l.BuildStats()
-	out := map[string]int{verb: n, "dropped_keys": dropped, "keyless_entries": keyless}
-	if u := l.UnindexedEntries(); u > 0 {
-		out["unindexed_entries"] = u
+	s := l.Status()
+	out := map[string]int{verb: n, "dropped_keys": s.DroppedKeys, "keyless_entries": s.KeylessEntries}
+	if s.UnindexedEntries > 0 {
+		out["unindexed_entries"] = s.UnindexedEntries
 	}
 	return out
 }
@@ -645,7 +648,8 @@ func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 	}
 	s.ready.Store(nil) // readiness must re-evaluate the swapped list
 	s.reg.replaces.Add(1)
-	s.auditMut(r.Context(), "reload", name, func() int { e, _, _ := l.Stats(); return e }(), rv, false)
+	status := l.Status()
+	s.auditMut(r.Context(), "reload", name, status.Entries, rv, false)
 
 	type goldenResult struct {
 		Q      string `json:"q"`
@@ -660,7 +664,7 @@ func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		statsResp
 		Golden []goldenResult `json:"golden,omitempty"`
-	}{statsOf(l), goldens})
+	}{statsFromStatus(l, status), goldens})
 }
 
 // ---- query ----
@@ -727,10 +731,8 @@ func (s *srv) query(w http.ResponseWriter, r *http.Request) {
 // containing unknown tokens (the unknown part simply doesn't count against
 // the match). This is the documented, reference-faithful behavior, not a bug.
 //
-// Deliberate deferral: there is no query-concurrency semaphore yet — each
-// concurrent ngram Lookup on a large list allocates ~4B×numOrds of scratch,
-// so N simultaneous queries cost N such buffers. Revisit (bounded worker pool
-// or scratch reuse) before sustained high-TPS production use.
+// The prepared-query admission gate below bounds the summed ngram scan,
+// query-buffer, and hit-materialization cost across every requested list.
 func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errStatus int, errMsg string) {
 	if req.Q == "" {
 		return queryResp{}, http.StatusBadRequest, "q must be non-empty"
@@ -740,6 +742,9 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 	}
 	if len(req.Lists) == 0 {
 		return queryResp{}, http.StatusBadRequest, "lists must be non-empty"
+	}
+	if len(req.Lists) > maxQueryLists {
+		return queryResp{}, http.StatusBadRequest, fmt.Sprintf("lists exceeds %d entries", maxQueryLists)
 	}
 	if req.Threshold != nil && (*req.Threshold < 0 || *req.Threshold > 1) {
 		return queryResp{}, http.StatusBadRequest, fmt.Sprintf("threshold %v out of range [0, 1]", *req.Threshold)
@@ -818,8 +823,8 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		prepared[i] = l.PrepareQuery(req.Q, lopts)
 		cost += prepared[i].Cost()
 	}
-	// Admission: the summed charge across every ngram list the query
-	// touches (exact lists cost 0 and skip the gate entirely). The wait is
+	// Admission: the summed charge across every list the query touches,
+	// including exact-mode candidate materialization. The wait is
 	// bounded by the request context AND the queue timeout; exhaustion is a
 	// 503 — backpressure, not OOM. A single query costlier than the whole
 	// budget is refused outright: the budget is a ceiling, and quietly
@@ -959,7 +964,8 @@ func (s *srv) batchQuery(w http.ResponseWriter, r *http.Request) {
 // rejected by the Store before anything touches disk are 400 — an oversize
 // entry (engine.EntryTooLargeError) or an unbuildable index
 // (exact.KeyOverflowError, e.g. a million entries sharing one analyzed key).
-// Anything else is an IO failure, so 500.
+// Damage and generation replacement are state conflicts (409). Anything
+// else is an IO failure, so 500.
 func storeErrStatus(err error) int {
 	var tooLarge *engine.EntryTooLargeError
 	if errors.As(err, &tooLarge) {
@@ -969,6 +975,11 @@ func storeErrStatus(err error) int {
 	if errors.As(err, &replaced) {
 		// Not the client's fault and not retryable against this generation:
 		// the list they addressed no longer exists in the form they addressed.
+		return http.StatusConflict
+	}
+	if errors.Is(err, engine.ErrListDamaged) {
+		// The named resource exists but refuses mutation until repaired; this
+		// is a state conflict, consistent with reload's existing mapping.
 		return http.StatusConflict
 	}
 	var overflow *exact.KeyOverflowError

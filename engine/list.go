@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/kurn-dev/kurn/engine/analyzer"
 	"github.com/kurn-dev/kurn/engine/exact"
@@ -22,8 +23,10 @@ import (
 // QueryOpts are per-query overrides of the list's query-time defaults.
 // Zero values mean "use the list default"; NEGATIVE values are the
 // documented sentinel for "explicitly zero" — Threshold < 0 queries with no
-// score floor, TopK < 0 returns every candidate. (Zero itself can't carry
-// that meaning without breaking the zero-value-is-default convention.)
+// score floor, TopK < 0 returns every candidate. NaN Threshold is treated as
+// the zero value (use the list default); callers accepting floating-point
+// input should reject non-finite values at their boundary. (Zero itself can't
+// carry the sentinel meaning without breaking zero-value-is-default.)
 type QueryOpts struct {
 	Threshold float64
 	TopK      int
@@ -860,7 +863,11 @@ func (l *List) PrepareQuery(q string, opts QueryOpts) *PreparedQuery {
 	} else if opts.TopK < 0 {
 		topK = 0 // sentinel: explicit unlimited (see QueryOpts)
 	}
-	return &PreparedQuery{l: l, s: s, q: q, opts: opts, cost: scratchBytesSnap(s, topK)}
+	runes := utf8.RuneCountInString(q)
+	if runes < scratchDefaultQueryRunes {
+		runes = scratchDefaultQueryRunes
+	}
+	return &PreparedQuery{l: l, s: s, q: q, opts: opts, cost: scratchBytesSnap(s, topK, runes, len(l.cfg.Match.Grams))}
 }
 
 // Cost is the conservative scratch-memory charge for executing THIS
@@ -1022,9 +1029,11 @@ func (l *List) Version() string { return l.snap.Load().version }
 // the query really allocates.
 const scratchPerHitBytes = 192
 
-// ScratchBytesFor estimates the peak per-query memory an ngram lookup on
-// this list holds in flight when it runs with the given effective topK,
-// per segment (base + overlay):
+// ScratchBytesFor estimates the peak per-query memory a lookup on this list
+// holds in flight when it runs with the given effective topK, per segment
+// (base + overlay). It includes query buffers sized for at least a 512-rune
+// query; PrepareQuery charges longer library-level queries from their actual
+// rune count:
 //
 //   - 4 B × numOrds — the dense IDF accumulator (counts);
 //   - 4 B × numOrds — the touched-ordinal list: a flood query (hot gram,
@@ -1036,26 +1045,53 @@ const scratchPerHitBytes = 192
 //     UNLIMITED collection: every ordinal can become a hit and is charged
 //     as one.
 //
-// Exact-mode lists cost 0. Admission control sizes a concurrency budget
-// against this; an undercharge here turns concurrency into an OOM, so
-// every term errs upward. The cost model is MEMORY, but the same bound
-// also caps how many maximal-CPU no-floor scans run at once.
+// Exact-mode lists pay the same conservative per-hit materialization term,
+// without the ngram accumulator/query buffers. Admission control sizes a
+// concurrency budget against this; an undercharge here turns concurrency
+// into an OOM, so every term errs upward. The cost model is MEMORY, but the
+// same bound also caps how many maximal-CPU no-floor scans run at once.
 func (l *List) ScratchBytesFor(topK int) int64 {
-	return scratchBytesSnap(l.snap.Load(), topK)
+	return scratchBytesSnap(l.snap.Load(), topK, scratchDefaultQueryRunes, len(l.cfg.Match.Grams))
 }
+
+const (
+	// The HTTP boundary accepts at most 512 runes. Charging at least that
+	// shape keeps ScratchBytesFor useful for operators sizing a budget while
+	// PrepareQuery still scales for direct-library callers with longer input.
+	scratchDefaultQueryRunes = 512
+	// Per ngram index: roaring iterator batch plus offsets, dedup-map storage,
+	// gramInfo records, sorting and allocator slack. One potential gram per
+	// rune per configured size is the conservative upper shape.
+	scratchQueryFixedBytes   = 16 << 10
+	scratchQueryPerGramBytes = 64
+	scratchQueryPerRuneBytes = 8
+)
 
 // scratchBytesSnap is the model over one already-loaded snapshot — the
 // form PrepareQuery uses, so the cost and the executed snapshot can never
 // belong to different states.
-func scratchBytesSnap(s *snapshot, topK int) int64 {
+func scratchBytesSnap(s *snapshot, topK, queryRunes, gramSizes int) int64 {
 	masked := int64(len(s.tombstones))
 	var b int64
 	charge := func(sg *segment, masked int64) {
-		if sg == nil || sg.ng == nil {
+		if sg == nil {
+			return
+		}
+		if sg.ex != nil {
+			hits := int64(sg.ex.NumOrds())
+			if topK > 0 && int64(topK) < hits {
+				hits = int64(topK)
+			}
+			b += scratchPerHitBytes * hits
+			return
+		}
+		if sg.ng == nil {
 			return
 		}
 		ords := int64(sg.ng.NumOrds())
 		b += 8 * ords // counts + touched, both preallocated at numOrds
+		b += scratchQueryFixedBytes + int64(queryRunes)*scratchQueryPerRuneBytes
+		b += int64(queryRunes) * int64(gramSizes) * scratchQueryPerGramBytes
 		hits := ords
 		if topK > 0 {
 			if hb := int64(topK) + masked; hb < hits {
@@ -1074,6 +1110,47 @@ func scratchBytesSnap(s *snapshot, topK int) int64 {
 // know the effective topK (the server does) should charge ScratchBytesFor
 // instead.
 func (l *List) ScratchBytes() int64 { return l.ScratchBytesFor(0) }
+
+// ListStatus is one coherent view of a List snapshot for status and audit
+// surfaces. Reading the individual legacy accessors in sequence can mix two
+// mutations; this value is derived from one atomic snapshot load.
+type ListStatus struct {
+	Entries          int
+	Overlay          int
+	Tombstones       int
+	Version          string
+	DroppedKeys      int
+	KeylessEntries   int
+	UnindexedEntries int
+}
+
+// Status returns counters and version from one immutable snapshot.
+func (l *List) Status() ListStatus {
+	s := l.snap.Load()
+	var out ListStatus
+	out.Version = s.version
+	if s.base != nil {
+		out.Entries = len(s.base.entries)
+		for id := range s.tombstones {
+			if _, ok := s.base.byID[id]; ok {
+				out.Tombstones++
+			}
+		}
+	}
+	out.Entries -= out.Tombstones
+	if s.overlay != nil {
+		out.Overlay = len(s.overlay.entries)
+		out.Entries += out.Overlay
+	}
+	for _, seg := range []*segment{s.base, s.overlay} {
+		if seg != nil {
+			out.DroppedKeys += seg.droppedKeys
+			out.KeylessEntries += seg.keylessEntries
+			out.UnindexedEntries += seg.unindexedEntries
+		}
+	}
+	return out
+}
 
 // KeyCount returns the live raw-key count: base keys minus tombstoned
 // entries' keys plus overlay keys. Raw (pre-analysis) keys — the quota
@@ -1102,14 +1179,8 @@ func (l *List) KeyCount() int64 {
 // real-world list, a large droppedKeys is the difference between "loaded
 // fine" and "half my list silently vanished".
 func (l *List) BuildStats() (droppedKeys, keylessEntries int) {
-	s := l.snap.Load()
-	for _, seg := range []*segment{s.base, s.overlay} {
-		if seg != nil {
-			droppedKeys += seg.droppedKeys
-			keylessEntries += seg.keylessEntries
-		}
-	}
-	return droppedKeys, keylessEntries
+	s := l.Status()
+	return s.DroppedKeys, s.KeylessEntries
 }
 
 // IndexBuildInfo is what a prebuilt index cannot state about itself: how
@@ -1166,33 +1237,13 @@ func (seg *segment) applyBuildInfo(bi *IndexBuildInfo, n int, ords uint32) error
 // It is not part of BuildStats' return only because adding a third value
 // there would break every existing caller.
 func (l *List) UnindexedEntries() int {
-	s := l.snap.Load()
-	n := 0
-	for _, seg := range []*segment{s.base, s.overlay} {
-		if seg != nil {
-			n += seg.unindexedEntries
-		}
-	}
-	return n
+	return l.Status().UnindexedEntries
 }
 
 // Stats returns entry count (live), overlay size, and tombstone count. Only
 // tombstones actually present in base are counted — defensive; the snapshot
 // invariants make any others impossible.
 func (l *List) Stats() (entries, overlay, tombstones int) {
-	s := l.snap.Load()
-	if s.base != nil {
-		entries = len(s.base.entries)
-		for id := range s.tombstones {
-			if _, ok := s.base.byID[id]; ok {
-				tombstones++
-			}
-		}
-	}
-	entries -= tombstones
-	if s.overlay != nil {
-		overlay = len(s.overlay.entries)
-		entries += overlay
-	}
-	return entries, overlay, tombstones
+	s := l.Status()
+	return s.Entries, s.Overlay, s.Tombstones
 }

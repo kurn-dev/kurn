@@ -594,21 +594,21 @@ func (s *srv) deleteEntry(w http.ResponseWriter, r *http.Request) {
 func (s *srv) compact(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("list")
 	st := s.stOf(r.Context())
-	l, ok := st.List(name)
-	if !ok {
+	if _, ok := st.List(name); !ok {
 		jsonError(w, http.StatusNotFound, fmt.Sprintf("unknown list %q", name))
 		return
 	}
-	v, err := st.CompactVersioned(name)
+	res, err := st.CompactVersioned(name)
 	if err != nil {
 		mapStoreError(w, err)
 		return
 	}
 	s.reg.compacts.Add(1)
-	e, _, _ := l.Stats()
-	s.auditMut(r.Context(), "compact", name, e, v, false)
-	// l's snapshot was swapped in place by Compact: statsOf reads fresh state.
-	writeJSON(w, http.StatusOK, statsOf(l))
+	// Audit and response come from the RESULT: the compact resolves its
+	// list under the store lock, and a concurrent PUT could swap the name
+	// to a different generation than any pointer resolved above.
+	s.auditMut(r.Context(), "compact", name, res.Entries, res.Version, false)
+	writeJSON(w, http.StatusOK, statsOf(res.List))
 }
 
 // reload re-opens a list from its on-disk dir — the bundle publish path

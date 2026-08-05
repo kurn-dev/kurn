@@ -913,23 +913,36 @@ func (st *Store) Compact(name string) error {
 	return err
 }
 
-// CompactVersioned is Compact returning the committed version stamp (see
-// UpsertVersioned).
-func (st *Store) CompactVersioned(name string) (string, error) {
+// CompactResult is what one compact COMMITTED: the list generation it
+// operated on (resolved under the store lock — a concurrent PUT can swap
+// the name to a new generation between a caller's lookup and the compact),
+// the committed version, and the folded live-entry count. Callers writing
+// audit lines or responses must take all three from here; re-reading them
+// through a pointer resolved before the call can describe a different
+// generation or a later mutation.
+type CompactResult struct {
+	List    *List
+	Version string
+	Entries int
+}
+
+// CompactVersioned is Compact returning what it committed (see
+// CompactResult and UpsertVersioned).
+func (st *Store) CompactVersioned(name string) (CompactResult, error) {
 	if err := st.beginOp(); err != nil {
-		return "", err
+		return CompactResult{}, err
 	}
 	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
-		return "", err
+		return CompactResult{}, err
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
 	l := ls.l.Load()
 	b, err := l.PrepareCompact()
 	if err != nil {
-		return "", err
+		return CompactResult{}, err
 	}
 	lp := st.listPath(name)
 	id, published, err := st.persistBase(lp, b.live)
@@ -942,12 +955,12 @@ func (st *Store) CompactVersioned(name string) (string, error) {
 			// until a destructive retry succeeds.
 			ls.damaged = true
 		}
-		return "", err
+		return CompactResult{}, err
 	}
 	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil {
 		if !os.IsNotExist(err) {
-			ls.damaged = true // new base published, old journal beside it
-			return "", err    // a missing journal is already empty
+			ls.damaged = true           // new base published, old journal beside it
+			return CompactResult{}, err // a missing journal is already empty
 		}
 	} else if err := syncJournalTruncate(filepath.Join(lp, journalFile)); err != nil {
 		// The truncate must be DURABLE before the fold is acknowledged:
@@ -958,13 +971,13 @@ func (st *Store) CompactVersioned(name string) (string, error) {
 		// state — and the list damaged: the published fold cannot be
 		// rolled back, so writes must wait for a successful retry.
 		ls.damaged = true
-		return "", err
+		return CompactResult{}, err
 	}
 	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
 	ls.damaged = false
 	l.CommitCompact(b, id)
 	st.saveArtifact(l, lp, b.seg.ng, b.seg.ex)
-	return l.snap.Load().version, nil
+	return CompactResult{List: l, Version: l.snap.Load().version, Entries: len(b.live)}, nil
 }
 
 // Replace swaps the whole list content: new base + empty journal on disk,

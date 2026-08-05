@@ -1056,3 +1056,42 @@ func TestStorePresetPersistedAsSteps(t *testing.T) {
 		t.Fatalf("reopened list query: %+v", c)
 	}
 }
+
+// A compact's audit line and response must describe what IT committed: the
+// generation it resolved under the store lock, that generation's version,
+// and the folded entry count — a caller-held pointer from before the call
+// can be a different generation after a concurrent PUT, and its stats can
+// include later mutations.
+func TestCompactResultDescribesTheCommit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := engine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", personCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Upsert("people", []engine.Entry{
+		{ID: "p1", Keys: []string{"Marcus Chen"}},
+		{ID: "p2", Keys: []string{"Dana Kovak"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.CompactVersioned("people")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := st.List("people")
+	if res.List != cur {
+		t.Fatal("result carries a different list generation than the store serves")
+	}
+	if res.Entries != 2 {
+		t.Fatalf("result entries = %d, want the folded 2", res.Entries)
+	}
+	if res.Version != res.List.Version() {
+		t.Fatalf("result version %q != committed list version %q", res.Version, res.List.Version())
+	}
+	if !strings.Contains(res.Version, "@2+j0+c") {
+		t.Fatalf("result version %q is not the fold's content stamp", res.Version)
+	}
+}

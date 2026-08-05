@@ -6,15 +6,18 @@
 //
 // Parsers are stdlib-only and streaming: a 10 GB input never resides in
 // memory — records are decoded one at a time and yielded as they parse.
-// The claim is enforced, not assumed: every format bounds one record, and
-// an oversize one is a bad record the run can skip (SkipBad) rather than
-// something that ends the run or, worse, materializes. The single
-// exception: a CSV record that consumes more than a hard input ceiling
-// (16x the record bound) is fatal, terminated or not. At that point the
-// parser cannot tell a huge well-formed record from an unterminated
-// quote without unbounded reading, and resynchronizing by guessing at
-// quote state could silently misparse every record after it — a loud
-// stop is the only honest option left.
+// The claim is enforced, not assumed: every format bounds one record —
+// the CSV header row and an XML record's opening tag (attributes
+// included) count as records here, since both are materialized whole —
+// and an oversize one is a bad record the run can skip (SkipBad) rather
+// than something that ends the run or, worse, materializes. The
+// exception: a CSV or XML record that consumes more than a hard input
+// ceiling (16x the record bound) is fatal, terminated or not. At that
+// point skipping would mean unbounded reading — and for CSV,
+// resynchronizing means guessing at quote state, where a wrong guess
+// silently misparses every record after it — so a loud stop is the only
+// honest option left. The CSV header is also fatal past the record
+// bound itself: it names the columns, so it cannot be skipped.
 package ingest
 
 import (

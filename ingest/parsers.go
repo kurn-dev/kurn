@@ -106,22 +106,22 @@ func readRecordLine(br *bufio.Reader, max int) (line []byte, over bool, err erro
 // records alike.
 type badDoc struct{ err error }
 
-// maxCSVInputPerRecord is the memory backstop for csv.Reader, which
-// materializes a whole record before returning it: without a ceiling one
-// unterminated quote turns a 10 GB feed into a 10 GB allocation, and the
-// package's "a 10 GB input never resides in memory" promise is only true
-// for well-formed input. Deliberately far above MaxRecordBytes — a row
-// between the two bounds is a bad record the run can skip; only a row
-// past this one is fatal (see the package doc: SkipBad cannot apply,
-// because the parser cannot resynchronize past the ceiling without
-// guessing at quote state, and a wrong guess silently misparses the rest
-// of the feed).
-const maxCSVInputPerRecord = 16 * MaxRecordBytes
+// maxInputPerRecord is the memory backstop for parsers that materialize
+// a whole record (csv.Reader) or token (xml.Decoder) before returning it:
+// without a ceiling one unterminated quote — or one start tag dragging
+// megabytes of attributes — turns a 10 GB feed into a 10 GB allocation,
+// and the package's "a 10 GB input never resides in memory" promise is
+// only true for well-formed input. Deliberately far above MaxRecordBytes:
+// a record between the two bounds is a bad record the run can skip; only
+// one past this ceiling is fatal (see the package doc — the parser cannot
+// skip past it without unbounded reading, and for CSV a resync would mean
+// guessing at quote state and silently misparsing the rest of the feed).
+const maxInputPerRecord = 16 * MaxRecordBytes
 
 // parseCSV: header row names the columns; each row becomes a
 // map[string]string doc. Paths are column names verbatim.
 func parseCSV(r io.Reader, m *Mapping, handle func(any, int) error) error {
-	lr := &recordLimitReader{r: r, max: maxCSVInputPerRecord}
+	lr := &recordLimitReader{r: r, max: maxInputPerRecord, err: errCSVRecordTooBig}
 	cr := csv.NewReader(lr)
 	cr.FieldsPerRecord = -1 // ragged rows surface as missing fields, not reader errors
 	if m.Delimiter != "" {
@@ -130,6 +130,17 @@ func parseCSV(r io.Reader, m *Mapping, handle func(any, int) error) error {
 	header, err := cr.Read()
 	if err != nil {
 		return fmt.Errorf("ingest: csv header: %w", err)
+	}
+	// The header is a record too, and it is RETAINED for the whole run —
+	// every data row's doc is keyed by these names — so it gets the same
+	// bound data rows get. Unlike a data row it names the columns, so an
+	// oversize header cannot be skipped: fatal, before any row is read.
+	hsize := 0
+	for _, col := range header {
+		hsize += len(col)
+	}
+	if hsize > MaxRecordBytes {
+		return fmt.Errorf("ingest: csv header: %d bytes of column names exceeds the %d-byte record bound", hsize, MaxRecordBytes)
 	}
 	// A repeated column name would make the doc keep only the last one,
 	// so every path naming it silently reads a different column than the
@@ -205,16 +216,17 @@ func extraData(row []string, width int) int {
 	return n
 }
 
-var errCSVRecordTooBig = fmt.Errorf("record consumed over %d bytes of input — a huge well-formed row and an unterminated quote are indistinguishable here, so this is fatal regardless of -skip-bad; if the row is real data, it is %dx over the %d-byte record bound and needs a different transport than CSV", maxCSVInputPerRecord, maxCSVInputPerRecord/MaxRecordBytes, MaxRecordBytes)
+var errCSVRecordTooBig = fmt.Errorf("record consumed over %d bytes of input — a huge well-formed row and an unterminated quote are indistinguishable here, so this is fatal regardless of -skip-bad; if the row is real data, it is %dx over the %d-byte record bound and needs a different transport than CSV", maxInputPerRecord, maxInputPerRecord/MaxRecordBytes, MaxRecordBytes)
 
-// recordLimitReader caps how much INPUT one csv record may consume. The
-// caller marks each record's starting input offset; the reader refuses to
-// feed the parser more than max bytes past it. The parser's offset lags
-// the bytes delivered by at most one bufio buffer, which is noise against
-// a 16 MiB ceiling.
+// recordLimitReader caps how much INPUT one record may consume (err names
+// the format-specific ceiling error). The caller marks each record's
+// starting input offset; the reader refuses to feed the parser more than
+// max bytes past it. The parser's offset lags the bytes delivered by at
+// most one internal buffer, which is noise against a 16 MiB ceiling.
 type recordLimitReader struct {
 	r         io.Reader
 	max       int64
+	err       error
 	delivered int64
 	start     int64
 }
@@ -223,20 +235,31 @@ func (l *recordLimitReader) mark(off int64) { l.start = off }
 
 func (l *recordLimitReader) Read(p []byte) (int, error) {
 	if l.delivered-l.start > l.max {
-		return 0, errCSVRecordTooBig
+		return 0, l.err
 	}
 	n, err := l.r.Read(p)
 	l.delivered += int64(n)
 	return n, err
 }
 
+var errXMLInputTooBig = fmt.Errorf("record consumed over %d bytes of input — skipping past it would mean tokenizing without bound, so this is fatal regardless of -skip-bad; if the record is real data, it is %dx over the %d-byte record bound and needs to be split at the source", maxInputPerRecord, maxInputPerRecord/MaxRecordBytes, MaxRecordBytes)
+
 // parseXML: token-walks the stream, decoding one record element subtree
 // at a time (namespaces ignored — local names match). The record bound is
-// enforced via the decoder's input offset across the subtree.
+// enforced twice, like CSV's: the decoder's input offset across the
+// subtree makes a 1-16 MiB record a SKIPPABLE bad record, and the input
+// limiter is the fatal ceiling past 16 MiB. The limiter is what bounds a
+// single TOKEN too: the offset checks run between tokens, and one token —
+// the record's opening tag with its attributes included, or a text run —
+// is materialized whole by the decoder before any offset check can see
+// it. Marks refresh at every outer token, so the budget covers a record
+// from BEFORE its opening tag through its subtree and any skip-drain.
 func parseXML(r io.Reader, m *Mapping, handle func(any, int) error) error {
-	dec := xml.NewDecoder(r)
+	lr := &recordLimitReader{r: r, max: maxInputPerRecord, err: errXMLInputTooBig}
+	dec := xml.NewDecoder(lr)
 	recNo := 0
 	for {
+		lr.mark(dec.InputOffset())
 		tok, err := dec.Token()
 		if err == io.EOF {
 			return nil

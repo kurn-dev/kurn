@@ -293,3 +293,89 @@ func TestXMLManyCharDataSectionsDoNotAllocateQuadratically(t *testing.T) {
 }
 
 var _ io.Reader = (*endlessQuote)(nil)
+
+// The header is read before any data row and RETAINED for the whole run,
+// but it skipped the record bound data rows get — a header could grow to
+// the 16 MiB parser ceiling. It names the columns, so an oversize one is
+// fatal (there is nothing to skip to), and the error must say so before
+// any row is ingested.
+func TestCSVOversizeHeaderIsFatal(t *testing.T) {
+	in := "id,name," + strings.Repeat("c", 2<<20) + "\n1,Anna,x\n"
+	_, _, err := collect(t, idKeyMapping("csv"), in, ingest.Options{SkipBad: 99})
+	if err == nil {
+		t.Fatal("a 2 MiB header was accepted")
+	}
+	if !strings.Contains(err.Error(), "header") || !strings.Contains(err.Error(), "record bound") {
+		t.Fatalf("error does not name the header bound: %v", err)
+	}
+
+	// A wide-but-legal header stays fine.
+	var b strings.Builder
+	b.WriteString("id,name")
+	for i := 0; i < 500; i++ {
+		fmt.Fprintf(&b, ",col%04d", i)
+	}
+	b.WriteString("\n1,Anna" + strings.Repeat(",", 500) + "\n")
+	entries, _, err := collect(t, idKeyMapping("csv"), b.String(), ingest.Options{})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("legal wide header refused: entries=%d err=%v", len(entries), err)
+	}
+}
+
+// endlessAttr opens a record tag whose attribute value never ends: the
+// decoder materializes a start tag WHOLE (attributes included) before any
+// offset check can see it, so only an input-level ceiling bounds it.
+type endlessAttr struct{ n int64 }
+
+func (e *endlessAttr) Read(p []byte) (int, error) {
+	const head = `<root><rec id="` // an attribute value that never closes
+	if e.n >= endlessQuoteCap {
+		return 0, io.EOF
+	}
+	for i := range p {
+		if e.n < int64(len(head)) {
+			p[i] = head[e.n]
+		} else {
+			p[i] = 'x'
+		}
+		e.n++
+	}
+	return len(p), nil
+}
+
+// An XML record's opening tag was materialized before the record budget
+// started: a start tag dragging a huge attribute set was allocated whole,
+// outside every bound the package promises. The input ceiling now covers
+// it — fatal (skipping past it would mean tokenizing without bound), with
+// input consumption bounded.
+func TestXMLGiantOpeningTagHitsTheInputCeiling(t *testing.T) {
+	src := &endlessAttr{}
+	_, err := ingest.Parse(idKeyMapping("xml"), src, ingest.Options{SkipBad: 99},
+		func(engine.Entry) error { return nil })
+	if err == nil {
+		t.Fatal("an endless opening tag was accepted")
+	}
+	if !strings.Contains(err.Error(), "fatal regardless of -skip-bad") {
+		t.Fatalf("error does not state the contract: %v", err)
+	}
+	// Bounded, not merely terminated: 16 MiB ceiling plus reader slack.
+	if src.n > 24*1024*1024 {
+		t.Fatalf("consumed %d bytes before stopping — the ceiling is not bounding the opening tag", src.n)
+	}
+}
+
+// The two-tier contract XML now shares with CSV: a record between the
+// 1 MiB record bound and the 16 MiB ceiling stays a skippable bad record,
+// and the stream resumes after it.
+func TestXMLBetweenBoundsRecordStaysSkippable(t *testing.T) {
+	in := `<root><rec><id>a</id><name>Anna</name></rec>` +
+		`<rec><id>big</id><name>` + strings.Repeat("x", 2<<20) + `</name></rec>` +
+		`<rec><id>c</id><name>Clara</name></rec></root>`
+	entries, st, err := collect(t, idKeyMapping("xml"), in, ingest.Options{SkipBad: 1})
+	if err != nil {
+		t.Fatalf("between-bounds record aborted the run: %v", err)
+	}
+	if st.Bad != 1 || len(entries) != 2 || entries[0].ID != "a" || entries[1].ID != "c" {
+		t.Fatalf("Bad=%d entries=%+v, want 1 bad with a and c surviving", st.Bad, entries)
+	}
+}

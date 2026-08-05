@@ -2,6 +2,8 @@ package engine_test
 
 import (
 	"fmt"
+	"runtime"
+	"runtime/debug"
 	"testing"
 
 	"github.com/kurn-dev/kurn/engine"
@@ -72,4 +74,61 @@ func TestQueryAllocs(t *testing.T) {
 			t.Fatalf("attribution-heavy query allocates %.0f/op, ceiling %d", allocs, ceiling)
 		}
 	})
+}
+
+// TestFloodChargeCoversAllocation: admission control admits queries against
+// ScratchBytesFor, so that model must never charge LESS than a query
+// actually allocates — an undercharge multiplied by admitted concurrency is
+// an OOM, the exact defect this pins: hit collection used to materialize
+// every qualifying ordinal (~16 B each) while the model charged only the
+// 4 B/ordinal accumulator, a sixfold undercharge on flood shapes. The
+// corpus shares one hot gram across every entry and the query asks for
+// topK=1: every ordinal qualifies, and everything the query allocates must
+// still fit under the charge.
+func TestFloodChargeCoversAllocation(t *testing.T) {
+	const n = 100_000
+	l, err := engine.NewList("codes", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true, Threshold: 0.6, TopK: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]engine.Entry, n)
+	for i := range entries {
+		entries[i] = engine.Entry{ID: fmt.Sprintf("c%06d", i), Keys: []string{fmt.Sprintf("zq%06d", i)}}
+	}
+	if err := l.Replace(entries); err != nil {
+		t.Fatal(err)
+	}
+
+	// The query "zq" grams to the one posting every entry shares: a full
+	// flood. Warm once so the pooled per-ordinal scratch (counts + touched)
+	// is allocated and, with GC disabled, stays pooled — the measured run
+	// then shows exactly the per-QUERY allocations the model's non-pooled
+	// terms must cover. (With a cold pool the scratch itself is allocated
+	// too, still under the model's 8 B/ordinal term.)
+	opts := engine.QueryOpts{TopK: 1}
+	if c := l.Query("zq", opts); len(c) != 1 {
+		t.Fatalf("flood query returned %d candidates, want 1", len(c))
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	charge := l.ScratchBytesFor(1)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if c := l.Query("zq", opts); len(c) != 1 {
+		t.Fatal("flood query lost its hit")
+	}
+	runtime.ReadMemStats(&after)
+	measured := int64(after.TotalAlloc - before.TotalAlloc)
+
+	if measured > charge {
+		t.Fatalf("flood query allocated %d bytes but admission charges only %d — concurrency at the budget can exceed the budget", measured, charge)
+	}
+	// Validity guard: the flood really was corpus-wide (the charge's
+	// per-ordinal terms exist for a reason).
+	if charge < 8*n {
+		t.Fatalf("charge %d below 8 B x %d ordinals; the model lost its per-ordinal terms", charge, n)
+	}
 }

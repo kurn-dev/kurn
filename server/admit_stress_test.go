@@ -36,9 +36,11 @@ func TestQueryAdmissionSerializesUnderBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	l, _ := st.List("people")
-	// Budget = one query's cost: concurrency 1, everything else queues.
+	// Budget = one query's cost — as the server charges it: these requests
+	// omit topk, so the effective per-list collection bound is the global
+	// default cut of 100. Concurrency 1, everything else queues.
 	ts := httptest.NewServer(server.NewWith(st, server.Config{
-		QueryMemBudget:    l.ScratchBytes(),
+		QueryMemBudget:    l.ScratchBytesFor(100),
 		QueryQueueTimeout: 10 * time.Second,
 	}))
 	t.Cleanup(ts.Close)

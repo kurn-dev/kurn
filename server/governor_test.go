@@ -110,9 +110,11 @@ func TestTenantScratchIsolation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Each tenant's slice fits exactly one query on its own list.
+	// Each tenant's slice fits exactly one query on its own list, at the
+	// cost the server charges for these requests (topk omitted -> the
+	// global default cut of 100 bounds each list's collection).
 	l, _ := stores["aaa"].List("people")
-	sliceMB := (l.ScratchBytes() + (1 << 20) - 1) >> 20
+	sliceMB := (l.ScratchBytesFor(100) + (1 << 20) - 1) >> 20
 	for name, st := range stores {
 		rts[name] = server.TenantRuntime{
 			Spec: server.TenantSpec{

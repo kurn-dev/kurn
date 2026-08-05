@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -194,4 +195,56 @@ func diffSets(got, want map[uint32]float64) string {
 		}
 	}
 	return sb.String()
+}
+
+// Bounded top-K selection must be invisible in results: for every K,
+// Lookup(topK=K) returns exactly the first K hits of the unlimited
+// collection, in the same order with the same scores. (The final order —
+// score desc, ord asc — is a total order, so the top-K set is unique and
+// this equality is exact, not approximate.) The cap assertion is the memory
+// half of the claim: a flood query must not materialize a hit slice
+// proportional to every qualifying ordinal merely to discard all but K —
+// that shape is what admission control charges for.
+func TestBoundedTopKMatchesFullCollection(t *testing.T) {
+	keys := synthKeys()
+	b := ngram.NewBuilder(ngram.Config{Grams: []int{2, 3}, StripSpaces: true})
+	for ord, k := range keys {
+		b.Add(uint32(ord), []string{k})
+	}
+	idx := b.Finish()
+
+	queries := synthQueries(keys)
+	// threshold 0 is the explicit no-floor scan: every touched ordinal
+	// qualifies — the flood shape the bound exists for.
+	floods := 0
+	for _, threshold := range []float64{0, 0.4, 0.6} {
+		for _, q := range queries {
+			full := idx.Lookup(q, threshold, 0)
+			if len(full) > 50 {
+				floods++
+			}
+			for _, k := range []int{1, 2, 3, 7, 50, 299} {
+				got := idx.Lookup(q, threshold, k)
+				want := full
+				if len(want) > k {
+					want = want[:k]
+				}
+				if len(got) == 0 && len(want) == 0 {
+					continue
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("Lookup(%q, thr=%v, topK=%d) diverged from full collection:\ngot  %v\nwant %v", q, threshold, k, got, want)
+				}
+				if cap(got) > k {
+					t.Fatalf("Lookup(%q, thr=%v, topK=%d): hit slice capacity %d — collection was not bounded (%d ordinals qualified)",
+						q, threshold, k, cap(got), len(full))
+				}
+			}
+		}
+	}
+	// Validity guard: the corpus must actually produce floods far larger
+	// than the smallest K, or the cap assertion proved nothing.
+	if floods == 0 {
+		t.Fatal("no query flooded >50 hits; the bound was never exercised")
+	}
 }

@@ -896,26 +896,61 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 // restart-stable.
 func (l *List) Version() string { return l.snap.Load().version }
 
-// ScratchBytes estimates the per-query scratch memory an ngram lookup on
-// this list allocates (or pins in the pool) while in flight: 4 bytes ×
-// numOrds per segment index (the dense IDF accumulator), base + overlay.
+// scratchPerHitBytes models ONE collected hit across every layer admission
+// can see: the ngram Hit (16 B), the list-layer Candidate (~64 B of ID,
+// score, key and payload headers) with its attribution meta, the server's
+// response copy, and slice-growth overhead. Deliberately generous: the
+// bounded hit set is at most a few thousand entries, so overcharging per
+// hit costs the budget little while keeping the model safely above what
+// the query really allocates.
+const scratchPerHitBytes = 192
+
+// ScratchBytesFor estimates the peak per-query memory an ngram lookup on
+// this list holds in flight when it runs with the given effective topK,
+// per segment (base + overlay):
+//
+//   - 4 B × numOrds — the dense IDF accumulator (counts);
+//   - 4 B × numOrds — the touched-ordinal list: a flood query (hot gram,
+//     no-floor scan) can touch every ordinal, and the pool retains the
+//     grown slice after the query;
+//   - scratchPerHitBytes × the segment's hit-collection bound — topK plus
+//     the tombstone mask for the base segment (the engine collects up to
+//     topK+masked before masking), clamped to numOrds. topK <= 0 means
+//     UNLIMITED collection: every ordinal can become a hit and is charged
+//     as one.
+//
 // Exact-mode lists cost 0. Admission control sizes a concurrency budget
-// against this. Note the cost model is MEMORY: scratch size is independent
-// of threshold/topk. CPU worst case is different — an explicit no-floor
-// query (threshold 0 over HTTP, negative in QueryOpts) makes every query
-// gram a candidate generator, the maximal scan — so the same admission
-// bound is also what caps the damage of concurrent no-floor queries.
-func (l *List) ScratchBytes() int64 {
+// against this; an undercharge here turns concurrency into an OOM, so
+// every term errs upward. The cost model is MEMORY, but the same bound
+// also caps how many maximal-CPU no-floor scans run at once.
+func (l *List) ScratchBytesFor(topK int) int64 {
 	s := l.snap.Load()
+	masked := int64(len(s.tombstones))
 	var b int64
-	if s.base != nil && s.base.ng != nil {
-		b += 4 * int64(s.base.ng.NumOrds())
+	charge := func(sg *segment, masked int64) {
+		if sg == nil || sg.ng == nil {
+			return
+		}
+		ords := int64(sg.ng.NumOrds())
+		b += 8 * ords // counts + touched
+		hits := ords
+		if topK > 0 {
+			if hb := int64(topK) + masked; hb < hits {
+				hits = hb
+			}
+		}
+		b += scratchPerHitBytes * hits
 	}
-	if s.overlay != nil && s.overlay.ng != nil {
-		b += 4 * int64(s.overlay.ng.NumOrds())
-	}
+	charge(s.base, masked)
+	charge(s.overlay, 0)
 	return b
 }
+
+// ScratchBytes is ScratchBytesFor at the unlimited-collection worst case —
+// for callers sizing a budget without a concrete query shape. Callers that
+// know the effective topK (the server does) should charge ScratchBytesFor
+// instead.
+func (l *List) ScratchBytes() int64 { return l.ScratchBytesFor(0) }
 
 // KeyCount returns the live raw-key count: base keys minus tombstoned
 // entries' keys plus overlay keys. Raw (pre-analysis) keys — the quota

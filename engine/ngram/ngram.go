@@ -361,7 +361,22 @@ func (i *Index) LookupCtx(ctx context.Context, analyzed string, threshold float6
 		}
 	}
 
-	out := make([]Hit, 0, len(sc.touched))
+	// Hit collection is bounded when topK > 0: a flood query (a hot gram, an
+	// explicit no-floor scan) can qualify a huge fraction of the corpus, and
+	// materializing every hit merely to sort and truncate made worst-case
+	// query memory ~16 B × qualifying ordinals — unmodeled by admission
+	// control. A worst-at-root heap keeps exactly the current best K
+	// instead. The final order (score desc, ord asc) is a TOTAL order
+	// (ordinals are unique), so the kept set — and after the final sort, the
+	// output — is byte-identical to full collection + stable sort +
+	// truncate. The heap engages only once a query's hits EXCEED topK: the
+	// ordinary path is the same append it always was.
+	bound := len(sc.touched)
+	if topK > 0 && topK < bound {
+		bound = topK
+	}
+	out := make([]Hit, 0, bound)
+	heaped := false
 	for _, ord := range sc.touched {
 		if canceled() {
 			return nil
@@ -377,23 +392,67 @@ func (i *Index) LookupCtx(ctx context.Context, analyzed string, threshold float6
 				score += p.idf
 			}
 		}
-		if score >= floor {
-			out = append(out, Hit{Ord: ord, Score: math.Round(score / maxScore * 100)})
+		if score < floor {
+			continue
 		}
-	}
-	sort.SliceStable(out, func(a, b int) bool {
-		if out[a].Score != out[b].Score {
-			return out[a].Score > out[b].Score
+		h := Hit{Ord: ord, Score: math.Round(score / maxScore * 100)}
+		if topK <= 0 || len(out) < topK {
+			out = append(out, h)
+			continue
 		}
-		return out[a].Ord < out[b].Ord
-	})
-	if topK > 0 && len(out) > topK {
-		out = out[:topK]
+		if !heaped {
+			heapifyWorst(out)
+			heaped = true
+		}
+		if worseHit(h, out[0]) {
+			continue // doesn't beat the worst kept hit
+		}
+		out[0] = h
+		siftWorst(out, 0)
 	}
+	sort.Slice(out, func(a, b int) bool { return worseHit(out[b], out[a]) })
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// worseHit reports whether a ranks strictly worse than b in the final order
+// (score desc, ord asc). Ordinals are unique across hits, so this is a
+// total order — which is what makes bounded selection byte-identical to
+// full collection: the top-K set under a total order is unique, and the
+// final sort.Slice needs no stability.
+func worseHit(a, b Hit) bool {
+	if a.Score != b.Score {
+		return a.Score < b.Score
+	}
+	return a.Ord > b.Ord
+}
+
+// heapifyWorst / siftWorst maintain a worst-at-root binary heap over hits,
+// so replacing the root evicts the worst kept hit in O(log K).
+func heapifyWorst(h []Hit) {
+	for i := len(h)/2 - 1; i >= 0; i-- {
+		siftWorst(h, i)
+	}
+}
+
+func siftWorst(h []Hit, i int) {
+	for {
+		l, r := 2*i+1, 2*i+2
+		w := i
+		if l < len(h) && worseHit(h[l], h[w]) {
+			w = l
+		}
+		if r < len(h) && worseHit(h[r], h[w]) {
+			w = r
+		}
+		if w == i {
+			return
+		}
+		h[i], h[w] = h[w], h[i]
+		i = w
+	}
 }
 
 // EachGram calls fn once per gram of s not yet in seen, for every size in

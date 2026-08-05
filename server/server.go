@@ -757,13 +757,39 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		lists[i] = l
 	}
 
+	// effK is the global merge cut — it also bounds each list's collection.
+	effK := defaultTopK
+	if req.TopK != nil {
+		effK = *req.TopK
+	}
+	// Per-list effective engine top-K, resolved BEFORE admission so the
+	// charged cost covers the collection bound each list actually runs
+	// with. A list default of zero (exact-mode unlimited) or LARGER than
+	// the global cut is clamped to effK: the merge cut makes anything
+	// beyond effK per list unreachable (a list contributes at most K to
+	// the merged top-K), so collecting more — a list config may declare a
+	// default up to 2^20 — would build and copy candidates only to throw
+	// them away, far past the response the client can receive. Smaller
+	// list defaults are preserved.
+	listK := make([]int, len(lists))
+	for i, l := range lists {
+		k := l.Config().Match.TopK
+		if req.TopK != nil {
+			k = *req.TopK
+		} else if k == 0 || k > effK {
+			k = effK
+		}
+		listK[i] = k
+	}
+
 	// Admission: charge the query its scratch cost across every ngram list
-	// it touches (exact lists cost 0 and skip the gate entirely). The wait
-	// is bounded by the request context AND the queue timeout; exhaustion
-	// is a 503 — backpressure, not OOM.
+	// it touches (exact lists cost 0 and skip the gate entirely), at the
+	// top-K bound each list will run with. The wait is bounded by the
+	// request context AND the queue timeout; exhaustion is a 503 —
+	// backpressure, not OOM.
 	var cost int64
-	for _, l := range lists {
-		cost += l.ScratchBytes()
+	for i, l := range lists {
+		cost += l.ScratchBytesFor(listK[i])
 	}
 	// Two-level admission: the TENANT's slice first, then the global
 	// budget — a tenant's scan storm queues against its own budget before
@@ -801,23 +827,10 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 			opts.Threshold = *req.Threshold
 		}
 	}
-	// effK is the global merge cut — it also bounds each list's collection.
-	effK := defaultTopK
-	if req.TopK != nil {
-		effK = *req.TopK
-		opts.TopK = *req.TopK
-	}
 	for i, l := range lists {
 		name := names[i]
 		lopts := opts
-		if req.TopK == nil && l.Config().Match.TopK == 0 {
-			// The list's own default is unlimited (exact mode): the global
-			// cut at effK makes anything beyond effK per list unreachable
-			// (provably — a list contributes at most K to the merged top-K),
-			// so bound the collection instead of gathering a hot key's full
-			// hit set only to throw it away.
-			lopts.TopK = effK
-		}
+		lopts.TopK = listK[i] // the bound admission charged for (always > 0)
 		lstart := time.Now()
 		// Candidates and version from ONE snapshot: reading l.Version()
 		// separately here let a mutation that landed mid-query stamp this

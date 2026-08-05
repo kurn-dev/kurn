@@ -488,3 +488,57 @@ func TestDomainFallbackViaAPI(t *testing.T) {
 		t.Errorf("ngram+fallback: %d %s, want 400", resp.StatusCode, body)
 	}
 }
+
+// A request that omits topk runs each list at its own default only when that
+// default is a deliberate SMALL bound; a zero default (exact-mode unlimited)
+// or one beyond the global merge cut is clamped to the cut, because the
+// merge makes anything past it unreachable — a 2^20 list default must not
+// make the engine collect a million candidates to return 100. The small-
+// default half is the observable contract pinned here; the clamp half is
+// what the admission charge (ScratchBytesFor at the resolved bound) relies
+// on.
+func TestListTopKDefaultRespectedAndClamped(t *testing.T) {
+	ts := newTS(t)
+	resp, _ := do(t, "PUT", ts.URL+"/v1/lists/codes",
+		`{"analyzer":{"steps":["lowercase","trim"]},"match":{"mode":"exact","topk":3}}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("create: %d", resp.StatusCode)
+	}
+	var entries []string
+	for i := 0; i < 10; i++ {
+		entries = append(entries, fmt.Sprintf(`{"id":"c%d","keys":["hot"]}`, i))
+	}
+	resp, _ = do(t, "POST", ts.URL+"/v1/lists/codes/entries", "["+strings.Join(entries, ",")+"]")
+	if resp.StatusCode != 200 {
+		t.Fatalf("upsert: %d", resp.StatusCode)
+	}
+
+	var qr struct {
+		Candidates []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"candidates"`
+	}
+	// topk absent: the list's own default (3) caps the answer.
+	resp, body := do(t, "POST", ts.URL+"/v1/query", `{"q":"hot","lists":["codes"]}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("query: %d %s", resp.StatusCode, body)
+	}
+	if err := json.Unmarshal(body, &qr); err != nil {
+		t.Fatal(err)
+	}
+	if len(qr.Candidates) != 3 {
+		t.Fatalf("list default topk=3 ignored: %d candidates", len(qr.Candidates))
+	}
+	// Explicit topk overrides the list default upward.
+	resp, body = do(t, "POST", ts.URL+"/v1/query", `{"q":"hot","lists":["codes"],"topk":7}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("query: %d %s", resp.StatusCode, body)
+	}
+	qr.Candidates = nil
+	if err := json.Unmarshal(body, &qr); err != nil {
+		t.Fatal(err)
+	}
+	if len(qr.Candidates) != 7 {
+		t.Fatalf("explicit topk=7 got %d candidates", len(qr.Candidates))
+	}
+}

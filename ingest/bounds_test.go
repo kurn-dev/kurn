@@ -379,3 +379,41 @@ func TestXMLBetweenBoundsRecordStaysSkippable(t *testing.T) {
 		t.Fatalf("Bad=%d entries=%+v, want 1 bad with a and c surviving", st.Bad, entries)
 	}
 }
+
+// The review's reproduction of the header-bound gap: a 2 MiB header made
+// of "id,name," followed by bare commas decodes to almost zero field
+// bytes — the old decoded-length sum waved it through while the parser
+// retained a column slot per comma and every row iterated them all. The
+// bound must be on input consumed, with a column-count cap beside it.
+func TestCSVCommaOnlyHeaderIsFatal(t *testing.T) {
+	in := "id,name," + strings.Repeat(",", 2<<20) + "\n1,Anna\n"
+	_, _, err := collect(t, idKeyMapping("csv"), in, ingest.Options{SkipBad: 99})
+	if err == nil {
+		t.Fatal("a 2 MiB comma-only header was accepted")
+	}
+	if !strings.Contains(err.Error(), "header") {
+		t.Fatalf("error does not name the header: %v", err)
+	}
+
+	// Under the input bound but over the column cap: also fatal, named as
+	// the COUNT bound (distinct names, so the duplicate check cannot be
+	// the one refusing).
+	var b strings.Builder
+	b.WriteString("id,name")
+	for i := 0; i < 2000; i++ {
+		fmt.Fprintf(&b, ",c%04d", i)
+	}
+	b.WriteString("\n1,Anna\n")
+	_, _, err = collect(t, idKeyMapping("csv"), b.String(), ingest.Options{SkipBad: 99})
+	if err == nil || !strings.Contains(err.Error(), "column bound") {
+		t.Fatalf("a 2002-column header was not refused by the column bound: %v", err)
+	}
+
+	// Quoting overhead counts too: each quoted empty name is 3+ input
+	// bytes of zero decoded length.
+	in3 := "id,name," + strings.Repeat(`"",`, 700_000) + "z\n1,Anna\n"
+	_, _, err = collect(t, idKeyMapping("csv"), in3, ingest.Options{SkipBad: 99})
+	if err == nil {
+		t.Fatal("a quoted-empty 2 MiB header was accepted")
+	}
+}

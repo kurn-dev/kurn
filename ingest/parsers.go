@@ -118,6 +118,12 @@ type badDoc struct{ err error }
 // guessing at quote state and silently misparsing the rest of the feed).
 const maxInputPerRecord = 16 * MaxRecordBytes
 
+// maxCSVColumns bounds the header's column count: every row allocates and
+// iterates one slot per column, so a pathological header multiplies work
+// across the whole feed. Real exports use dozens of columns; 1024 is far
+// past any legitimate feed while keeping the retained header small.
+const maxCSVColumns = 1024
+
 // parseCSV: header row names the columns; each row becomes a
 // map[string]string doc. Paths are column names verbatim.
 func parseCSV(r io.Reader, m *Mapping, handle func(any, int) error) error {
@@ -132,15 +138,18 @@ func parseCSV(r io.Reader, m *Mapping, handle func(any, int) error) error {
 		return fmt.Errorf("ingest: csv header: %w", err)
 	}
 	// The header is a record too, and it is RETAINED for the whole run —
-	// every data row's doc is keyed by these names — so it gets the same
-	// bound data rows get. Unlike a data row it names the columns, so an
-	// oversize header cannot be skipped: fatal, before any row is read.
-	hsize := 0
-	for _, col := range header {
-		hsize += len(col)
+	// every data row's doc is keyed by these names, and every row iterates
+	// its slots. The bound is on INPUT CONSUMED, not decoded field bytes:
+	// two megabytes of bare commas decode to zero name bytes while
+	// allocating a column slot per comma (delimiters and quoting are
+	// invisible to a field-length sum). A column-count cap closes the same
+	// gap from the other side. The header names the columns, so an
+	// oversize one cannot be skipped: fatal, before any row is read.
+	if off := cr.InputOffset(); off > MaxRecordBytes {
+		return fmt.Errorf("ingest: csv header: %d bytes of input exceeds the %d-byte record bound", off, MaxRecordBytes)
 	}
-	if hsize > MaxRecordBytes {
-		return fmt.Errorf("ingest: csv header: %d bytes of column names exceeds the %d-byte record bound", hsize, MaxRecordBytes)
+	if len(header) > maxCSVColumns {
+		return fmt.Errorf("ingest: csv header: %d columns exceeds the %d-column bound", len(header), maxCSVColumns)
 	}
 	// A repeated column name would make the doc keep only the last one,
 	// so every path naming it silently reads a different column than the

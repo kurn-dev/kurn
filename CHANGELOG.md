@@ -1,6 +1,67 @@
 # Changelog
 
-## Unreleased (v0.2.0)
+## Unreleased (v0.2.1)
+
+### Version stamps now identify journal content
+
+A store-managed list's version was `<hash>@<entries>+j<journalBytes>` —
+and the byte position alone let two journals of equal encoded length but
+different mutations share a stamp while answering differently. Living
+lists now stamp `<hash>@<entries>+j<bytes>.<journalHash>`, a
+domain-separated sha256 prefix of the journal's exact byte content
+(omitted for an empty journal, so `+j0` stamps and bundle `version_id`
+prefixes are unchanged). Stamps recorded by earlier versions will not
+match the new format; that is deliberate — the old suffix was not
+evidence of content.
+
+### Added
+
+- `List.QueryVersioned` — candidates and version from one atomic
+  snapshot; `QueryCtx`/`Query` delegate to it. The server's query path
+  and audit trail use it: a response or audit line can no longer pair
+  one snapshot's answer with another snapshot's version.
+- `Store.UpsertVersioned`, `UpsertGenVersioned`, `DeleteVersioned`,
+  `ReplaceVersioned`, `CompactVersioned`, `CreateListVersioned`,
+  `ReloadListVersioned` — each mutation's committed version, captured
+  under the mutation lock. The unversioned methods are unchanged.
+- `List.ScratchBytesFor(topK)` — the admission charge for a query shape;
+  `ScratchBytes()` remains as the unlimited worst case.
+- `engine.ErrJournalDamaged` — appends are refused (reads keep serving)
+  when a failed append cannot be rolled back; Replace/Compact/ReloadList
+  repair.
+
+### Fixed
+
+- **Bounded hit collection** — the ngram lookup no longer materializes
+  every qualifying hit merely to sort and discard all but top-K; results
+  are byte-identical (the final order is total). Admission control
+  charges a conservative ceiling (~8 B/ordinal for the scan accumulators
+  plus a bounded per-hit term) instead of the 4 B/ordinal that
+  undercharged flood shapes about sixfold.
+- **Journal truncation is fsynced** before Replace/Compact acknowledge,
+  so power loss can no longer resurrect the pre-operation journal over
+  an acknowledged new base. The `.creating` marker's removal is fsynced
+  before CreateList acknowledges for the same reason.
+- **Failed journal appends roll back in every failure mode** (partial
+  write, fsync, close, group commit); an append can no longer leave a
+  torn fragment that silently swallows the next acknowledged write.
+- **`Store.Close` stops the interval-mode group committer** — each
+  retired interval-fsync store leaked one goroutine for the process
+  lifetime.
+- **List configs share no slices with callers** — mutating the config
+  passed to `NewList` (or the copy `Config` returns) could panic queries
+  through the shared backing arrays.
+- **Server clamps oversized per-list top-K defaults** to the global
+  merge cut when the request omits `topk`; small list defaults are
+  preserved.
+- **Ingest bounds the CSV header and XML opening tag** — both were
+  materialized outside the record bound; XML gains CSV's two-tier
+  contract (skippable to 1 MiB, fatal input ceiling at 16 MiB).
+- **NaN is rejected** in list threshold and golden min_score; a JSON
+  body with a trailing token (a lone `}`/`]`) is rejected; the
+  `kurn_list_entries` help text matches the exported value.
+
+## v0.2.0 — 2026-08-05
 
 ### Breaking: `engine/artifact` signatures
 

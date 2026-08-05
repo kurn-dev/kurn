@@ -1,6 +1,8 @@
 package engine_test
 
 import (
+	"context"
+	"fmt"
 	"math"
 	"testing"
 
@@ -284,5 +286,53 @@ func TestNonFiniteConfigRejected(t *testing.T) {
 		Match:    engine.MatchConfig{Mode: "ngram", Threshold: math.Inf(1)},
 	}); err == nil {
 		t.Error("+Inf threshold accepted")
+	}
+}
+
+// Admission charges a query's cost from one snapshot; execution must run
+// THAT snapshot. Pricing the current state, waiting on a budget, and then
+// loading a fresh snapshot lets a mutation that landed during the wait
+// grow the executed work arbitrarily past the charge. PrepareQuery pins
+// snapshot, cost, and execution together — a mutation between prepare and
+// execute must change none of them.
+func TestPreparedQueryExecutesTheSnapshotItCharged(t *testing.T) {
+	l, err := engine.NewList("people", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Preset: "person-name"},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true, Threshold: 0.6, TopK: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Replace([]engine.Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+	vBefore := l.Version()
+
+	p := l.PrepareQuery("marcus chen", engine.QueryOpts{TopK: 5})
+	costBefore := p.Cost()
+
+	// The "mutation while queued": replace the list with a much larger
+	// corpus whose scratch cost dwarfs the prepared one.
+	entries := make([]engine.Entry, 5000)
+	for i := range entries {
+		entries[i] = engine.Entry{ID: fmt.Sprintf("p%05d", i), Keys: []string{fmt.Sprintf("veko rima %04d", i)}}
+	}
+	if err := l.Replace(entries); err != nil {
+		t.Fatal(err)
+	}
+	// Validity guard: the mutation really did inflate the current cost.
+	if now := l.ScratchBytesFor(5); now <= 4*costBefore {
+		t.Fatalf("mutation did not inflate the cost (%d -> %d); the scenario shows nothing", costBefore, now)
+	}
+
+	if got := p.Cost(); got != costBefore {
+		t.Errorf("prepared cost changed %d -> %d after the mutation", costBefore, got)
+	}
+	cands, ver := p.Execute(context.Background())
+	if ver != vBefore {
+		t.Errorf("executed version %q, want the prepared snapshot's %q", ver, vBefore)
+	}
+	if len(cands) != 1 || cands[0].EntryID != "p1" {
+		t.Errorf("executed candidates %+v, want the prepared snapshot's p1", cands)
 	}
 }

@@ -783,41 +783,6 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		listK[i] = k
 	}
 
-	// Admission: charge the query its scratch cost across every ngram list
-	// it touches (exact lists cost 0 and skip the gate entirely), at the
-	// top-K bound each list will run with. The wait is bounded by the
-	// request context AND the queue timeout; exhaustion is a 503 —
-	// backpressure, not OOM.
-	var cost int64
-	for i, l := range lists {
-		cost += l.ScratchBytesFor(listK[i])
-	}
-	// Two-level admission: the TENANT's slice first, then the global
-	// budget — a tenant's scan storm queues against its own budget before
-	// it can contend for anyone else's. One queueTimeout bounds the
-	// combined wait; deferred releases unwind global-then-tenant.
-	actx, acancel := context.WithTimeout(ctx, s.queueTimeout)
-	defer acancel()
-	if t := tenantFrom(ctx); t != nil && t.admit != nil {
-		trelease, terr := t.admit.acquire(actx, cost)
-		if terr != nil {
-			queued, inflight := t.admit.depth()
-			return queryResp{}, http.StatusServiceUnavailable,
-				fmt.Sprintf("query admission timed out: tenant scratch budget exhausted (%d queued, %d bytes in flight)", queued, inflight)
-		}
-		defer trelease()
-	}
-	release, aerr := s.admit.acquire(actx, cost)
-	if aerr != nil {
-		queued, inflight := s.admit.depth()
-		return queryResp{}, http.StatusServiceUnavailable,
-			fmt.Sprintf("query admission timed out: scratch budget exhausted (%d queued, %d bytes in flight)", queued, inflight)
-	}
-	defer release()
-
-	start := time.Now()
-	out := make([]respCand, 0)
-	versions := make(map[string]string, len(lists))
 	// Translate the HTTP absent/explicit-zero distinction into the engine's
 	// zero-default/negative-sentinel convention (see engine.QueryOpts).
 	var opts engine.QueryOpts
@@ -828,15 +793,68 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 			opts.Threshold = *req.Threshold
 		}
 	}
+	// Prepare every list's query FIRST: each PreparedQuery pins one
+	// snapshot together with the cost computed from it, and execution below
+	// runs those exact snapshots. Charging the current snapshot and then
+	// re-loading after the admission wait let a mutation that landed while
+	// the request queued grow the executed work past what was charged.
+	prepared := make([]*engine.PreparedQuery, len(lists))
+	var cost int64
 	for i, l := range lists {
-		name := names[i]
 		lopts := opts
-		lopts.TopK = listK[i] // the bound admission charged for (always > 0)
+		lopts.TopK = listK[i] // the bound admission charges for (always > 0)
+		prepared[i] = l.PrepareQuery(req.Q, lopts)
+		cost += prepared[i].Cost()
+	}
+	// Admission: the summed charge across every ngram list the query
+	// touches (exact lists cost 0 and skip the gate entirely). The wait is
+	// bounded by the request context AND the queue timeout; exhaustion is a
+	// 503 — backpressure, not OOM. A single query costlier than the whole
+	// budget is refused outright: the budget is a ceiling, and quietly
+	// clamping the charge would let one query exceed it.
+	// Two-level admission: the TENANT's slice first, then the global
+	// budget — a tenant's scan storm queues against its own budget before
+	// it can contend for anyone else's. One queueTimeout bounds the
+	// combined wait; deferred releases unwind global-then-tenant.
+	actx, acancel := context.WithTimeout(ctx, s.queueTimeout)
+	defer acancel()
+	if t := tenantFrom(ctx); t != nil && t.admit != nil {
+		trelease, terr := t.admit.acquire(actx, cost)
+		if terr != nil {
+			var over *budgetExceededError
+			if errors.As(terr, &over) {
+				return queryResp{}, http.StatusServiceUnavailable,
+					"query refused: " + over.Error() + " (tenant scratch budget)"
+			}
+			queued, inflight := t.admit.depth()
+			return queryResp{}, http.StatusServiceUnavailable,
+				fmt.Sprintf("query admission timed out: tenant scratch budget exhausted (%d queued, %d bytes in flight)", queued, inflight)
+		}
+		defer trelease()
+	}
+	release, aerr := s.admit.acquire(actx, cost)
+	if aerr != nil {
+		var over *budgetExceededError
+		if errors.As(aerr, &over) {
+			return queryResp{}, http.StatusServiceUnavailable,
+				"query refused: " + over.Error() + " — raise -query-mem-budget-mb or query fewer/smaller lists"
+		}
+		queued, inflight := s.admit.depth()
+		return queryResp{}, http.StatusServiceUnavailable,
+			fmt.Sprintf("query admission timed out: scratch budget exhausted (%d queued, %d bytes in flight)", queued, inflight)
+	}
+	defer release()
+
+	start := time.Now()
+	out := make([]respCand, 0)
+	versions := make(map[string]string, len(lists))
+	for i := range lists {
+		name := names[i]
 		lstart := time.Now()
-		// Candidates and version from ONE snapshot: reading l.Version()
-		// separately here let a mutation that landed mid-query stamp this
-		// answer with data it never saw.
-		cands, ver := l.QueryVersioned(ctx, req.Q, lopts)
+		// Execute the exact snapshot admission charged for. Candidates and
+		// version come from that one snapshot: a mutation that landed
+		// since prepare affects neither the work nor the evidence.
+		cands, ver := prepared[i].Execute(ctx)
 		s.reg.observeQuery(tenantName(ctx), name, time.Since(lstart), len(cands) > 0)
 		for _, c := range cands {
 			out = append(out, respCand{

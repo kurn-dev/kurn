@@ -824,11 +824,53 @@ var testHookQuerySnapshot func()
 // identity. Callers recording versions (audit, response envelopes) must use
 // this instead of a separate Version() call.
 func (l *List) QueryVersioned(ctx context.Context, q string, opts QueryOpts) ([]Candidate, string) {
-	s := l.snap.Load()
+	p := l.PrepareQuery(q, opts)
 	if testHookQuerySnapshot != nil {
 		testHookQuerySnapshot()
 	}
-	return l.querySnap(ctx, s, q, opts), s.version
+	return p.Execute(ctx)
+}
+
+// PreparedQuery pins one snapshot of one list together with the query, its
+// effective options, and the admission cost computed FROM THAT snapshot.
+// Admission control must charge and execute the SAME snapshot: pricing the
+// current snapshot, waiting on the budget, and then loading a fresh one
+// lets a mutation that landed while the request queued grow the executed
+// work arbitrarily past what was charged — the same
+// time-of-check/time-of-use shape QueryVersioned closes for versions,
+// here between memory evidence and execution.
+type PreparedQuery struct {
+	l    *List
+	s    *snapshot
+	q    string
+	opts QueryOpts
+	cost int64
+}
+
+// PrepareQuery captures the snapshot a query will run against and its
+// conservative scratch cost. The returned value holds a reference to the
+// captured snapshot until executed and dropped — prepare, admit, execute,
+// in that order, promptly.
+func (l *List) PrepareQuery(q string, opts QueryOpts) *PreparedQuery {
+	s := l.snap.Load()
+	topK := l.cfg.Match.TopK
+	if opts.TopK > 0 {
+		topK = opts.TopK
+	} else if opts.TopK < 0 {
+		topK = 0 // sentinel: explicit unlimited (see QueryOpts)
+	}
+	return &PreparedQuery{l: l, s: s, q: q, opts: opts, cost: scratchBytesSnap(s, topK)}
+}
+
+// Cost is the conservative scratch-memory charge for executing THIS
+// prepared snapshot (see ScratchBytesFor for the model).
+func (p *PreparedQuery) Cost() int64 { return p.cost }
+
+// Execute runs the prepared query against its captured snapshot and
+// returns candidates plus that snapshot's version — the exact state the
+// admission charge was computed from.
+func (p *PreparedQuery) Execute(ctx context.Context) ([]Candidate, string) {
+	return p.l.querySnap(ctx, p.s, p.q, p.opts), p.s.version
 }
 
 // querySnap runs a query against one already-loaded snapshot (see
@@ -998,7 +1040,13 @@ const scratchPerHitBytes = 192
 // every term errs upward. The cost model is MEMORY, but the same bound
 // also caps how many maximal-CPU no-floor scans run at once.
 func (l *List) ScratchBytesFor(topK int) int64 {
-	s := l.snap.Load()
+	return scratchBytesSnap(l.snap.Load(), topK)
+}
+
+// scratchBytesSnap is the model over one already-loaded snapshot — the
+// form PrepareQuery uses, so the cost and the executed snapshot can never
+// belong to different states.
+func scratchBytesSnap(s *snapshot, topK int) int64 {
 	masked := int64(len(s.tombstones))
 	var b int64
 	charge := func(sg *segment, masked int64) {
@@ -1006,7 +1054,7 @@ func (l *List) ScratchBytesFor(topK int) int64 {
 			return
 		}
 		ords := int64(sg.ng.NumOrds())
-		b += 8 * ords // counts + touched
+		b += 8 * ords // counts + touched, both preallocated at numOrds
 		hits := ords
 		if topK > 0 {
 			if hb := int64(topK) + masked; hb < hits {

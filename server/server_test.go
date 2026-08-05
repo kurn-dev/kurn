@@ -565,3 +565,38 @@ func TestBodyTrailingTokenRejected(t *testing.T) {
 		t.Fatalf("clean body refused: %d", resp.StatusCode)
 	}
 }
+
+// The scratch budget is a ceiling: a single query charged more than the
+// WHOLE budget used to be clamped and run alone, quietly exceeding the
+// bound the flag promises. It must be refused with a 503 that names the
+// remedy instead.
+func TestOverBudgetQueryRefused(t *testing.T) {
+	st, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]engine.Entry, 2000)
+	for i := range entries {
+		entries[i] = engine.Entry{ID: fmt.Sprintf("p%05d", i), Keys: []string{fmt.Sprintf("veko rima %04d", i)}}
+	}
+	if err := st.Replace("people", entries); err != nil {
+		t.Fatal(err)
+	}
+	// A 1-byte budget no query on this list can fit under.
+	ts := httptest.NewServer(server.NewWith(st, server.Config{QueryMemBudget: 1}))
+	t.Cleanup(ts.Close)
+
+	resp, body := do(t, "POST", ts.URL+"/v1/query", `{"q":"veko rima 0001","lists":["people"]}`)
+	if resp.StatusCode != 503 {
+		t.Fatalf("over-budget query: %d %s, want 503", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "needs") || !strings.Contains(string(body), "query-mem-budget") {
+		t.Fatalf("503 does not name the remedy: %s", body)
+	}
+}

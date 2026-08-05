@@ -2,36 +2,44 @@ package ngram
 
 import "testing"
 
-// putScratch must shed a worst-case touched slice (flood query) instead of
-// pinning it in the pool forever, but keep a well-sized one. Inspecting a
-// scratch after putScratch is valid only because this single-goroutine test
-// has no intervening getScratch that could hand it out to another user.
-func TestPutScratchTrimsOversizedTouched(t *testing.T) {
+// Admission control charges exactly 4 B × numOrds for the touched slice, so
+// its capacity must be exactly numOrds — preallocated, never grown. The
+// previous grown-by-append slice retained ~8-11% more capacity than the
+// model on flood queries (110,592 for 100,000 ordinals), memory the
+// governor never admitted. Inspecting a scratch after putScratch is valid
+// only because this single-goroutine test has no intervening getScratch.
+func TestScratchCapacityMatchesTheChargedModel(t *testing.T) {
+	const n = 1000
 	b := NewBuilder(Config{Grams: []int{2}})
-	b.Add(0, []string{"elena vasquez"})
-	b.Add(1, []string{"marcus chen"})
+	for i := 0; i < n; i++ {
+		// Every key shares the gram "zq": one posting floods all ordinals.
+		b.Add(uint32(i), []string{"zq"})
+	}
 	idx := b.Finish()
+	if idx.numOrds != n {
+		t.Fatalf("numOrds = %d, want %d", idx.numOrds, n)
+	}
 
-	// Flood-shaped: huge cap, tiny use this time -> reallocated smaller.
 	s := idx.getScratch()
-	s.touched = append(make([]uint32, 0, scratchTrimCap+1), 0, 1)
+	if c := cap(s.touched); c != n {
+		t.Fatalf("fresh scratch touched capacity %d, want exactly %d", c, n)
+	}
+	if c := len(s.counts); c != n {
+		t.Fatalf("fresh scratch counts length %d, want %d", c, n)
+	}
 	idx.putScratch(s)
-	if c := cap(s.touched); c > 2 {
-		t.Errorf("oversized touched kept cap %d, want <= 2 (trimmed to used)", c)
-	}
-	if len(s.touched) != 0 {
-		t.Errorf("touched len %d after putScratch, want 0", len(s.touched))
-	}
 
-	// Well-used: huge cap but used > cap/4 -> kept (no realloc thrash).
+	// A flood lookup touches every ordinal; the pooled slice must come back
+	// reset and STILL at exactly the charged capacity.
+	if hits := idx.Lookup("zq", 0, 1); len(hits) != 1 {
+		t.Fatalf("flood lookup returned %d hits, want 1", len(hits))
+	}
 	s2 := idx.getScratch()
-	big := make([]uint32, 0, scratchTrimCap+1)
-	for i := 0; i < (scratchTrimCap+1)/2; i++ {
-		big = append(big, uint32(i%2)) // only valid ords; counts has numOrds=2
+	if c := cap(s2.touched); c != n {
+		t.Fatalf("post-flood touched capacity %d, want exactly %d — the model was overshot or trimmed", c, n)
 	}
-	s2.touched = big
+	if len(s2.touched) != 0 {
+		t.Fatalf("touched len %d after putScratch, want 0", len(s2.touched))
+	}
 	idx.putScratch(s2)
-	if c := cap(s2.touched); c != scratchTrimCap+1 {
-		t.Errorf("well-used touched cap %d, want %d (kept)", c, scratchTrimCap+1)
-	}
 }

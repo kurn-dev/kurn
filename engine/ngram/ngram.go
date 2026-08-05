@@ -25,10 +25,12 @@ type Config struct {
 // after Finish; safe for concurrent Lookup.
 //
 // Scratch memory: every concurrently active Lookup borrows a pooled dense
-// accumulator of ~4 B × numOrds (float32 counts) plus a touched-ordinals
-// slice sized by that query's generator hits. Scratches are pooled and
-// reused, so steady-state cost is ~4 B × numOrds × peak Lookup concurrency
-// (e.g. ~40 MB per concurrent query at 10M ordinals), not per call.
+// accumulator (float32 counts) plus a touched-ordinals slice, BOTH
+// preallocated at exactly numOrds — 8 B × numOrds per concurrent lookup
+// (e.g. ~80 MB per concurrent query at 10M ordinals), pooled and reused.
+// Exact preallocation is deliberate: admission control charges this model,
+// and a grown-by-append slice overshoots its modeled size by the growth
+// factor — memory the governor never admitted.
 type Index struct {
 	cfg      Config
 	postings map[string]*roaring.Bitmap
@@ -214,29 +216,24 @@ func (i *Index) getScratch() *scratch {
 	if v := i.scratch.Get(); v != nil {
 		return v.(*scratch)
 	}
+	// touched is preallocated to its exact worst case, like counts: a flood
+	// query touches every ordinal, and growing by append would retain a
+	// capacity ~10-25% past the 4 B × numOrds the admission model charges.
+	// The pool holding worst-case-shaped members IS the model's steady
+	// state; growth would exceed it, and trimming would only re-grow.
 	return &scratch{
-		counts: make([]float32, i.numOrds),
-		seen:   map[string]struct{}{},
-		ordBuf: make([]uint32, cancelCheckEvery),
+		counts:  make([]float32, i.numOrds),
+		touched: make([]uint32, 0, i.numOrds),
+		seen:    map[string]struct{}{},
+		ordBuf:  make([]uint32, cancelCheckEvery),
 	}
 }
 
-// scratchTrimCap: a pooled touched slice larger than this AND >4x the size
-// this query needed is reallocated smaller on return, so one flood query
-// (generators hitting a huge slice of the corpus) doesn't pin a worst-case
-// slice in the pool forever. 1M ordinals = 4 MB.
-const scratchTrimCap = 1 << 20
-
 func (i *Index) putScratch(s *scratch) {
-	used := len(s.touched)
 	for _, ord := range s.touched {
 		s.counts[ord] = 0
 	}
-	if c := cap(s.touched); c > scratchTrimCap && c > 4*used {
-		s.touched = make([]uint32, 0, used)
-	} else {
-		s.touched = s.touched[:0]
-	}
+	s.touched = s.touched[:0]
 	// query-gram buffers are O(query length) — reset, no trim needed
 	s.offs = s.offs[:0]
 	s.gi = s.gi[:0]

@@ -35,17 +35,28 @@ func newAdmitter(budgetBytes int64) *admitter {
 	return &admitter{budget: budgetBytes, sem: semaphore.NewWeighted(budgetBytes)}
 }
 
+// budgetExceededError reports a single query whose charge is larger than
+// the entire budget: it can never be admitted, and it must not run.
+type budgetExceededError struct{ cost, budget int64 }
+
+func (e *budgetExceededError) Error() string {
+	return fmt.Sprintf("this query needs %d MiB of scratch but the whole budget is %d MiB",
+		(e.cost+(1<<20)-1)>>20, e.budget>>20)
+}
+
 // acquire admits cost bytes, blocking while the budget is exhausted; ctx
 // bounds the wait (request context + queue timeout). A cost larger than the
-// whole budget is clamped — the query runs alone rather than never. The
-// returned release must be called exactly once; it is non-nil even on the
-// zero-cost fast path.
+// whole budget is REFUSED with budgetExceededError: the budget is
+// documented as a ceiling on in-flight query memory, and the earlier
+// clamp-and-run-alone behavior let exactly one query quietly exceed the
+// hard-looking bound. The returned release must be called exactly once; it
+// is non-nil even on the zero-cost fast path.
 func (a *admitter) acquire(ctx context.Context, cost int64) (release func(), err error) {
 	if a == nil || cost <= 0 {
 		return func() {}, nil
 	}
 	if cost > a.budget {
-		cost = a.budget
+		return nil, &budgetExceededError{cost: cost, budget: a.budget}
 	}
 	a.queued.Add(1)
 	err = a.sem.Acquire(ctx, cost)

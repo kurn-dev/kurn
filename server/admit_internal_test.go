@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -90,15 +91,27 @@ func TestAdmitterBlocksThenAdmitsOnRelease(t *testing.T) {
 	}
 }
 
-func TestAdmitterClampsOversizeCost(t *testing.T) {
+func TestAdmitterRefusesOversizeCost(t *testing.T) {
 	a := newAdmitter(100)
-	// A single query bigger than the whole budget runs alone, not never.
+	// The budget is a CEILING. A single query bigger than the whole budget
+	// used to be clamped and run alone — quietly exceeding the bound the
+	// setting promises — so it must now be refused with the typed error
+	// the server turns into an actionable 503.
 	r, err := a.acquire(context.Background(), 1000)
+	var over *budgetExceededError
+	if !errors.As(err, &over) {
+		if r != nil {
+			r()
+		}
+		t.Fatalf("over-budget cost admitted (err=%v), want budgetExceededError", err)
+	}
+	if _, in := a.depth(); in != 0 {
+		t.Fatalf("inflight = %d after a refusal, want 0", in)
+	}
+	// A cost exactly at the budget still runs.
+	r, err = a.acquire(context.Background(), 100)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if _, in := a.depth(); in != 100 {
-		t.Fatalf("inflight = %d, want clamped 100", in)
 	}
 	r()
 }

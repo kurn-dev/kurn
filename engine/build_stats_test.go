@@ -60,3 +60,54 @@ func TestBuildStatsCountsAnalyzedAwayKeys(t *testing.T) {
 		t.Fatalf("BuildStats after compact = (%d, %d), want (4, 2)", dropped, keyless)
 	}
 }
+
+// ReplaceWithIndex deliberately tolerates an index with fewer ordinals than
+// entries, so a stale-index crash window stays recoverable instead of
+// fatal. The entries past the index's reach are then live, counted in
+// Stats(), and findable by nothing — the same invisible loss a keyless
+// entry is, with a different cause. UnindexedEntries is what makes it
+// visible.
+func TestUnindexedEntriesAreCounted(t *testing.T) {
+	entries := []engine.Entry{
+		{ID: "p1", Keys: []string{"Marcus Chen"}},
+		{ID: "p2", Keys: []string{"Dana Kovak"}},
+		{ID: "p3", Keys: []string{"Clara Diaz"}},
+	}
+	// An index over the first two only: a base.idx one publish behind its
+	// base.jsonl.
+	idx := buildIdx(t, "marcus chen", "dana kovak")
+
+	l := personList(t)
+	if err := l.ReplaceWithIndex(entries, idx); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.UnindexedEntries(); got != 1 {
+		t.Fatalf("UnindexedEntries = %d, want 1", got)
+	}
+	// The count must describe something real: p3 is live in Stats and
+	// findable by nothing.
+	if n, _, _ := l.Stats(); n != 3 {
+		t.Fatalf("Stats entries = %d, want 3 — the entry IS live, that is the point", n)
+	}
+	// Its own key must not reach it. (Other entries may still surface: on a
+	// corpus this small nearly every query gram is unknown to the index and
+	// excluded from the score denominator, so one shared gram reads as 100.
+	// The claim here is about p3, not about what else matches.)
+	for _, c := range l.Query("clara diaz", engine.QueryOpts{}) {
+		if c.EntryID == "p3" {
+			t.Fatalf("the unindexed entry was findable after all: %+v", c)
+		}
+	}
+	if c := l.Query("dana kovak", engine.QueryOpts{}); len(c) != 1 {
+		t.Fatalf("an INDEXED entry stopped matching: %+v", c)
+	}
+	// A list whose index covers everything reports zero, so the number
+	// means what it says.
+	full := personList(t)
+	if err := full.ReplaceWithIndex(entries[:2], idx); err != nil {
+		t.Fatal(err)
+	}
+	if got := full.UnindexedEntries(); got != 0 {
+		t.Fatalf("fully indexed list reports %d unindexed entries, want 0", got)
+	}
+}

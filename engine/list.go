@@ -37,6 +37,15 @@ type segment struct {
 	droppedKeys    int
 	keylessEntries int
 
+	// unindexedEntries counts entries the segment holds but its index does
+	// not reach: ReplaceWithIndex tolerates an index with FEWER ordinals
+	// than entries (see there), and those entries are live, counted in
+	// Stats(), and findable by nothing. Same invisible loss as a keyless
+	// entry, different cause — an index stale against base.jsonl rather
+	// than an analyzer that ate the keys — so it gets its own number
+	// instead of muddying that one.
+	unindexedEntries int
+
 	// totalKeys counts the RAW keys of every entry in the segment (pre-
 	// analysis, dropped ones included) — the basis for List.KeyCount and
 	// the max_total_keys quota, which meters what the caller stores, not
@@ -341,6 +350,7 @@ func (l *List) ReplaceWithIndex(entries []Entry, idx *ngram.Index) error {
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
 	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ng: idx}
+	seg.unindexedEntries = len(entries) - int(idx.NumOrds())
 	for i := range entries {
 		seg.byID[entries[i].ID] = uint32(i)
 		seg.totalKeys += len(entries[i].Keys)
@@ -859,6 +869,28 @@ func (l *List) BuildStats() (droppedKeys, keylessEntries int) {
 		}
 	}
 	return droppedKeys, keylessEntries
+}
+
+// UnindexedEntries returns how many entries the current snapshot holds that
+// its index cannot reach, summed over base and overlay. Non-zero means a
+// base.idx covering fewer entries than base.jsonl was installed —
+// ReplaceWithIndex tolerates that deliberately, so a stale-index crash
+// window stays recoverable instead of fatal, but the entries past the
+// index's last ordinal will never match anything until the list is rebuilt
+// or compacted. It is separate from BuildStats because the repair differs:
+// dropped/keyless keys are an analyzer question, this is a stale artifact.
+//
+// It is not part of BuildStats' return only because adding a third value
+// there would break every existing caller.
+func (l *List) UnindexedEntries() int {
+	s := l.snap.Load()
+	n := 0
+	for _, seg := range []*segment{s.base, s.overlay} {
+		if seg != nil {
+			n += seg.unindexedEntries
+		}
+	}
+	return n
 }
 
 // Stats returns entry count (live), overlay size, and tombstone count. Only

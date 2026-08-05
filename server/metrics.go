@@ -188,6 +188,10 @@ func (s *srv) metrics(w http.ResponseWriter, r *http.Request) {
 		_, k := u.l.BuildStats()
 		fmt.Fprintf(w, "kurn_list_keyless_entries%s %d\n", gaugeLabels(u.tenant, u.l.Name()), k)
 	}
+	fmt.Fprintf(w, "# HELP kurn_list_unindexed_entries Entries the installed index does not reach (stale base.idx; counted in entries, unfindable).\n# TYPE kurn_list_unindexed_entries gauge\n")
+	for _, u := range units {
+		fmt.Fprintf(w, "kurn_list_unindexed_entries%s %d\n", gaugeLabels(u.tenant, u.l.Name()), u.l.UnindexedEntries())
+	}
 
 	m := s.reg
 	m.mu.RLock()

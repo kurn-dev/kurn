@@ -296,20 +296,25 @@ type statsResp struct {
 	// count in Entries while being unfindable.
 	DroppedKeys    int `json:"dropped_keys"`
 	KeylessEntries int `json:"keyless_entries"`
+	// Omitted when zero, which is every healthy list: it reports a stale
+	// base.idx, not a routine property, and the normal response stays
+	// exactly as it was.
+	UnindexedEntries int `json:"unindexed_entries,omitempty"`
 }
 
 func statsOf(l *engine.List) statsResp {
 	entries, overlay, tombstones := l.Stats()
 	dropped, keyless := l.BuildStats()
 	return statsResp{
-		Name:           l.Name(),
-		Entries:        entries,
-		Overlay:        overlay,
-		Tombstones:     tombstones,
-		Version:        l.Version(),
-		Mode:           l.Config().Match.Mode,
-		DroppedKeys:    dropped,
-		KeylessEntries: keyless,
+		Name:             l.Name(),
+		Entries:          entries,
+		Overlay:          overlay,
+		Tombstones:       tombstones,
+		Version:          l.Version(),
+		Mode:             l.Config().Match.Mode,
+		DroppedKeys:      dropped,
+		KeylessEntries:   keyless,
+		UnindexedEntries: l.UnindexedEntries(),
 	}
 }
 
@@ -324,7 +329,11 @@ func mutationResp(l *engine.List, verb string, n int) map[string]int {
 		return map[string]int{verb: n}
 	}
 	dropped, keyless := l.BuildStats()
-	return map[string]int{verb: n, "dropped_keys": dropped, "keyless_entries": keyless}
+	out := map[string]int{verb: n, "dropped_keys": dropped, "keyless_entries": keyless}
+	if u := l.UnindexedEntries(); u > 0 {
+		out["unindexed_entries"] = u
+	}
+	return out
 }
 
 // mustList re-loads the list after a successful mutation (the mutation

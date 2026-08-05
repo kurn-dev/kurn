@@ -156,10 +156,10 @@ quickstart query over a 2-entry list).
 | `GET /healthz` | health + admission metrics | `query_queue_depth` / `query_inflight_bytes` when admission control is on |
 | `GET /livez` | liveness | 200 once the process serves — never depends on data state |
 | `GET /readyz` | readiness | 200 iff every list dir opened cleanly AND every configured golden probe passes; 503 body enumerates each failure (list, probe, reason). Cached ~5s, invalidated instantly by any mutation |
-| `GET /metrics` | Prometheus text exposition | per-list query counters, hit rate, latency histogram (100µs–10s log buckets), entry/overlay/tombstone/build-loss gauges, mutation counters, admission queue depth |
+| `GET /metrics` | Prometheus text exposition | per-list query counters, hit rate, latency histogram (100µs–10s log buckets), entry/overlay/tombstone/build-loss gauges (incl. `kurn_list_unindexed_entries`), mutation counters, admission queue depth |
 | `GET /v1/lists` | stats for all lists | — |
 | `PUT /v1/lists/{list}` | create a list with config | replaces any existing list of that name, wiping its data |
-| `GET /v1/lists/{list}` | one list's stats | entries/overlay/tombstones/version/mode |
+| `GET /v1/lists/{list}` | one list's stats | entries/overlay/tombstones/version/mode, plus the build-loss counters `dropped_keys`/`keyless_entries`, and `unindexed_entries` when non-zero (see below) |
 | `POST /v1/lists/{list}/entries` | upsert entries | body is a JSON array, or NDJSON when `Content-Type: application/x-ndjson` (streamed, 1 MiB per-line bound, no whole-body bound). `?replace=true` atomically swaps the whole list content instead of upserting; the parameter is strict — only `true`/`false`, anything else is a 400. **Bulk loads should use replace**: append mode rebuilds the overlay per batch and journals every entry; NDJSON append failures mid-stream are partial (response reports `applied`). An append stream is pinned to the list generation it started on: if a `PUT`/reload replaces the list mid-upload, the stream stops with **409** rather than letting the remainder land in the new list |
 | `DELETE /v1/lists/{list}/entries/{id}` | delete one entry | idempotent tombstone |
 | `POST /v1/lists/{list}/reload` | publish a shipped bundle: re-open the list from disk | atomic swap; failure keeps previous content serving (409); response = fresh stats + golden-probe results |
@@ -178,6 +178,19 @@ Domain blocklists: use analyzer preset `domain` with `"fallback":
 `key` names the listed domain either way. List the bare parent domain, not
 wildcard rows: a listed `*.tempmail.com` matches only the literal starred
 query, while a listed `tempmail.com` covers every subdomain via fallback.
+
+**Three ways a list can hold entries nothing can find**, all reported rather
+than left to be discovered by a query that should have matched:
+`dropped_keys` counts keys the analyzer collapsed to empty, `keyless_entries`
+counts entries whose keys ALL collapsed, and `unindexed_entries` counts
+entries an installed `base.idx` does not reach — which happens when a bundle
+ships an index covering fewer entries than its `base.jsonl`. The engine
+tolerates that last case on purpose, so a crash between writing the two
+leaves a recoverable list rather than a fatal one, but the entries past the
+index's reach match nothing until the list is compacted or rebuilt. The
+first two are an analyzer question; the third means a stale artifact.
+`unindexed_entries` is omitted from JSON when zero and is a gauge on
+`/metrics` worth alerting on.
 
 Scores are only comparable within a list: 90 means "parent-suffix match" on
 an exact-mode list but "90% fuzzy similarity" on an ngram list — aggregators

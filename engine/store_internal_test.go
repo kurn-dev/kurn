@@ -492,3 +492,87 @@ func TestCreateListPostWipeFailureQuarantinesMutations(t *testing.T) {
 		t.Fatalf("repaired list broken: %+v", c)
 	}
 }
+
+// TestCreateDamageRefusesReplaceAndCompactRepairs — a failed PUT-recreate
+// can leave the NEW declaration's config.json (and always the .creating
+// marker) on disk while old memory serves the old configuration. The
+// advertised Replace/Compact "repairs" rewrote only base+journal and then
+// cleared the damage: live memory answered ngram-typo queries that a
+// restart — loading the exact-mode config — did not, under different
+// versions. Those repairs must refuse create damage; only a successful
+// re-create rebuilds the whole declaration.
+func TestCreateDamageRefusesReplaceAndCompactRepairs(t *testing.T) {
+	ngramCfg := ListConfig{
+		Analyzer: AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true},
+	}
+	exactCfg := ListConfig{
+		Analyzer: AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    MatchConfig{Mode: "exact"},
+	}
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("codes", ngramCfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Replace("codes", []Entry{{ID: "e1", Keys: []string{"alpha"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The PUT to exact mode dies after its destructive window began — the
+	// exact config may already be on disk under the surviving marker.
+	syncMarkerRemove = func(string) error { return errors.New("injected sync failure") }
+	if _, err := st.CreateList("codes", exactCfg); err == nil {
+		syncMarkerRemove = syncDir
+		t.Fatal("create with failed marker sync reported success")
+	}
+	syncMarkerRemove = syncDir
+
+	// Replace and Compact used to acknowledge a "repair" here.
+	if err := st.Replace("codes", []Entry{{ID: "e1", Keys: []string{"alpha"}}}); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("Replace on create damage: err=%v, want ErrListDamaged", err)
+	}
+	if err := st.Compact("codes"); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("Compact on create damage: err=%v, want ErrListDamaged", err)
+	}
+	if err := st.Upsert("codes", []Entry{{ID: "e2", Keys: []string{"beta"}}}); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("Upsert on create damage: err=%v, want ErrListDamaged", err)
+	}
+
+	// The real repair: re-create, then load content.
+	if _, err := st.CreateList("codes", exactCfg); err != nil {
+		t.Fatalf("re-create repair: %v", err)
+	}
+	if err := st.Replace("codes", []Entry{{ID: "e1", Keys: []string{"alpha"}}}); err != nil {
+		t.Fatalf("replace after repair: %v", err)
+	}
+	l, _ := st.List("codes")
+	v := l.Version()
+	// Exact mode: the ngram-typo probe must MISS in live memory...
+	if c := l.Query("alphaa", QueryOpts{}); len(c) != 0 {
+		t.Fatalf("live list still answers like ngram: %+v", c)
+	}
+
+	// ...and the restart must agree with live memory on version and
+	// semantics — the divergence this test exists to prevent.
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st2.Skipped) != 0 {
+		t.Fatalf("repaired list skipped on restart: %+v", st2.Skipped)
+	}
+	l2, _ := st2.List("codes")
+	if got := l2.Version(); got != v {
+		t.Fatalf("restart version %q != live version %q", got, v)
+	}
+	if c := l2.Query("alphaa", QueryOpts{}); len(c) != 0 {
+		t.Fatalf("restart answers differently from live memory: %+v", c)
+	}
+	if c := l2.Query("alpha", QueryOpts{}); len(c) != 1 || c[0].EntryID != "e1" {
+		t.Fatalf("repaired content lost across restart: %+v", c)
+	}
+}

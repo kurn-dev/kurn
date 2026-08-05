@@ -267,21 +267,42 @@ type listState struct {
 	// in-flight fold per list (see maybeAutoCompact).
 	autoCompacting atomic.Bool
 
-	// damaged is set (guarded by lock) whenever this process can no longer
-	// vouch that the list's disk state matches what it serves and hashes:
-	//   - a failed journal append whose rollback ALSO failed (the file may
-	//     hold bytes never acknowledged, and the next append would glue
-	//     onto the torn fragment); or
-	//   - a destructive operation (Replace/Compact/CreateList) that failed
-	//     AFTER publishing disk state it cannot roll back — old memory
-	//     keeps serving the acknowledged snapshot, but an append now would
-	//     land in a journal belonging to the NEW disk base, and a restart
-	//     would replay it over state that was never acknowledged.
-	// Append-path mutations are refused until an operation that rebuilds
-	// the disk state wholesale (Replace, Compact, CreateList, ReloadList)
-	// succeeds. Queries keep serving the last acknowledged snapshot.
-	damaged bool
+	// damage records (guarded by lock) whether — and HOW — this process
+	// lost the ability to vouch that the list's disk state matches what it
+	// serves and hashes. The KIND decides which repairs count: content
+	// damage is repaired by anything that rebuilds base+journal wholesale,
+	// while create damage — a failed PUT window that may have installed a
+	// DIFFERENT config.json and always leaves the .creating marker behind
+	// — is repaired only by a successful re-create. Replace and Compact
+	// rewrite base and journal but neither restores config.json nor
+	// removes the marker, so letting them clear create damage produced a
+	// "repaired" list whose memory and restart interpreted the same base
+	// under different configurations. Append-path mutations are refused
+	// while any damage stands; queries keep serving the last acknowledged
+	// snapshot.
+	damage damageKind
 }
+
+// damageKind classifies why a list can no longer accept appends — see
+// listState.damage for the repair semantics each kind implies.
+type damageKind uint8
+
+const (
+	damageNone damageKind = iota
+	// damageContent: base/journal bytes are unverifiable (failed append
+	// rollback, or a Replace/Compact that failed after publishing its new
+	// base) while config.json still matches the served List. Repaired by
+	// any successful destructive rebuild: Replace, Compact, re-create, or
+	// reload.
+	damageContent
+	// damageCreate: a PUT-recreate failed inside its destructive window.
+	// The directory may hold the NEW declaration's config.json while
+	// memory serves the OLD list, and the fsynced .creating marker
+	// survives, so a restart skips the directory entirely. Only a
+	// successful re-create repairs; Replace/Compact must refuse rather
+	// than acknowledge a "repair" that leaves config and marker behind.
+	damageCreate
+)
 
 const (
 	configFile  = "config.json"
@@ -614,23 +635,23 @@ func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string
 	// stranded or replayed against state the caller never acknowledged.
 	for _, f := range []string{baseFile, idxFile, journalFile} {
 		if err := os.Remove(filepath.Join(lp, f)); err != nil && !os.IsNotExist(err) {
-			ls.damaged = true
+			ls.damage = damageCreate
 			return nil, "", err
 		}
 	}
 	raw, err := json.Marshal(l.Config()) // resolved config (defaults applied)
 	if err != nil {
-		ls.damaged = true
+		ls.damage = damageCreate
 		return nil, "", err
 	}
 	if err := writeFileAtomic(filepath.Join(lp, configFile), append(raw, '\n')); err != nil {
-		ls.damaged = true
+		ls.damage = damageCreate
 		return nil, "", err
 	}
 	if err := os.Remove(mp); err != nil {
 		// Disk state is complete but the marker survives: without this remove
 		// the next Open would skip the list, so surface the failure now.
-		ls.damaged = true
+		ls.damage = damageCreate
 		return nil, "", fmt.Errorf("store: clearing %s: %w", markerFile, err)
 	}
 	// The removal must be DURABLE before the create is acknowledged: the
@@ -638,13 +659,13 @@ func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string
 	// acknowledged PUT could resurrect the directory entry and make the
 	// next Open skip an otherwise complete list as "interrupted".
 	if err := syncMarkerRemove(lp); err != nil {
-		ls.damaged = true
+		ls.damage = damageCreate
 		return nil, "", fmt.Errorf("store: syncing %s removal: %w", markerFile, err)
 	}
 	l.SetBaseID("empty") // store-managed: content-addressed stamps from the start
 	l.setJournalHash(newJournalHash())
-	l.stampFresh()     // the virgin snapshot carries the full form, config digest included
-	ls.damaged = false // wiped and rebuilt wholesale: any prior damage is repaired
+	l.stampFresh()         // the virgin snapshot carries the full form, config digest included
+	ls.damage = damageNone // wiped and rebuilt wholesale: any prior damage is repaired
 	ls.l.Store(l)
 	// Captured under ls.lock: the version this create committed, not
 	// whatever a later mutation may have installed by audit time.
@@ -835,7 +856,7 @@ func (st *Store) ReloadListVersioned(name string) (*List, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	ls.damaged = false // openList re-read/re-hashed whatever is on disk
+	ls.damage = damageNone // openList rebuilt the List from a coherent, marker-free dir
 	ls.l.Store(l)
 	return l, l.snap.Load().version, nil
 }
@@ -939,6 +960,12 @@ func (st *Store) CompactVersioned(name string) (CompactResult, error) {
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
+	// See ReplaceVersioned: create damage needs a re-create, and a compact
+	// (including a background auto-compact reaching this path) must not
+	// clear it as a side effect.
+	if ls.damage == damageCreate {
+		return CompactResult{}, ls.damageErr()
+	}
 	l := ls.l.Load()
 	b, err := l.PrepareCompact()
 	if err != nil {
@@ -953,13 +980,13 @@ func (st *Store) CompactVersioned(name string) (CompactResult, error) {
 			// further append would write into a journal that a restart
 			// replays over the NEVER-acknowledged fold. Refuse mutations
 			// until a destructive retry succeeds.
-			ls.damaged = true
+			ls.damage = damageContent
 		}
 		return CompactResult{}, err
 	}
 	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil {
 		if !os.IsNotExist(err) {
-			ls.damaged = true           // new base published, old journal beside it
+			ls.damage = damageContent   // new base published, old journal beside it
 			return CompactResult{}, err // a missing journal is already empty
 		}
 	} else if err := syncJournalTruncate(filepath.Join(lp, journalFile)); err != nil {
@@ -970,11 +997,11 @@ func (st *Store) CompactVersioned(name string) (CompactResult, error) {
 		// base. Failing here leaves memory pre-compact — the acknowledged
 		// state — and the list damaged: the published fold cannot be
 		// rolled back, so writes must wait for a successful retry.
-		ls.damaged = true
+		ls.damage = damageContent
 		return CompactResult{}, err
 	}
 	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
-	ls.damaged = false
+	ls.damage = damageNone
 	l.CommitCompact(b, id)
 	st.saveArtifact(l, lp, b.seg.ng, b.seg.ex)
 	return CompactResult{List: l, Version: l.snap.Load().version, Entries: len(b.live)}, nil
@@ -1024,6 +1051,15 @@ func (st *Store) ReplaceVersioned(name string, entries []Entry) (string, error) 
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
+	// Create damage cannot be repaired here: Replace rewrites base and
+	// journal but leaves the failed PUT's config.json and .creating marker
+	// in place — acknowledging it as a repair produced a list whose memory
+	// and restart interpreted the same base under different configurations
+	// (and whose directory a restart skips entirely). Only a re-create
+	// rebuilds the whole declaration.
+	if ls.damage == damageCreate {
+		return "", ls.damageErr()
+	}
 	l := ls.l.Load()
 	entries, seg, err := l.prepareBase(entries)
 	if err != nil {
@@ -1041,13 +1077,13 @@ func (st *Store) ReplaceVersioned(name string, entries []Entry) (string, error) 
 			// restart replays over the new base — recovering to a state
 			// nobody acknowledged. Contain it: refuse mutations until a
 			// destructive retry succeeds.
-			ls.damaged = true
+			ls.damage = damageContent
 		}
 		return "", err
 	}
 	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil {
 		if !os.IsNotExist(err) {
-			ls.damaged = true // new base published, old journal beside it
+			ls.damage = damageContent // new base published, old journal beside it
 			return "", err
 		}
 	} else if err := syncJournalTruncate(filepath.Join(lp, journalFile)); err != nil {
@@ -1055,11 +1091,11 @@ func (st *Store) ReplaceVersioned(name string, entries []Entry) (string, error) 
 		// power loss and replay over the acknowledged replacement —
 		// resurrecting the very entries the Replace removed. See Compact
 		// for the identical reasoning, damage containment included.
-		ls.damaged = true
+		ls.damage = damageContent
 		return "", err
 	}
 	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
-	ls.damaged = false
+	ls.damage = damageNone
 	l.SetBaseID(id) // before install: the base stamp carries the new hash
 	l.installBase(seg)
 	st.saveArtifact(l, lp, seg.ng, seg.ex)
@@ -1279,11 +1315,28 @@ var fileTruncate = (*os.File).Truncate
 // list's disk state — a failed append could not be rolled back, or a
 // destructive operation failed after publishing disk changes it cannot
 // undo. Append-path mutations are refused (reads keep serving the last
-// acknowledged snapshot) until the disk state is rebuilt wholesale: retry
-// the Replace or Compact, or PUT-recreate the list. Reload is NOT a
-// repair here — it refuses any non-empty journal by ship discipline, and
-// a damaged list's journal is usually exactly that.
-var ErrListDamaged = errors.New("store: list left in an unverifiable disk/memory state by a failed operation; a successful replace, compact, or re-create repairs it")
+// acknowledged snapshot) until a repair succeeds; the wrapped message
+// names which repair applies. Content damage (failed append rollback,
+// failed Replace/Compact tail) is repaired by any successful destructive
+// rebuild — Replace, Compact, or re-create. Create damage (a PUT window
+// that died after its wipe began) is repaired ONLY by a successful
+// re-create: the directory may hold the new declaration's config while
+// memory serves the old list, and the .creating marker survives, so
+// Replace and Compact refuse rather than acknowledge a partial repair.
+// Reload is not a repair in either case — it refuses non-empty journals
+// by ship discipline and marker-bearing directories outright. Match with
+// errors.Is.
+var ErrListDamaged = errors.New("store: list left in an unverifiable disk/memory state by a failed operation")
+
+// damageErr renders the list's damage as an ErrListDamaged-wrapping error
+// whose text names the repair that will actually work. Caller holds
+// ls.lock.
+func (ls *listState) damageErr() error {
+	if ls.damage == damageCreate {
+		return fmt.Errorf("%w: a create/replace of the list died mid-window (its directory may carry the new declaration and the .creating marker); only a successful PUT re-create repairs it", ErrListDamaged)
+	}
+	return fmt.Errorf("%w: a successful replace, compact, or re-create repairs it", ErrListDamaged)
+}
 
 // appendJournal appends recs as JSON lines in a single write, then applies
 // the store's JournalFsync policy (none / fsync-now / group commit) before
@@ -1309,8 +1362,8 @@ var ErrListDamaged = errors.New("store: list left in an unverifiable disk/memory
 // Returns the journal byte position just past the appended records — the
 // replay-depth half of the version stamp.
 func (st *Store) appendJournal(ls *listState, l *List, path string, recs []journalRec) (int64, error) {
-	if ls.damaged {
-		return 0, ErrListDamaged
+	if ls.damage != damageNone {
+		return 0, ls.damageErr()
 	}
 	var buf []byte
 	for i := range recs {
@@ -1339,7 +1392,7 @@ func (st *Store) appendJournal(ls *listState, l *List, path string, recs []journ
 	}
 	rollback := func(werr error) (int64, error) {
 		if terr := fileTruncate(f, start); terr != nil {
-			ls.damaged = true
+			ls.damage = damageContent
 		}
 		f.Close()
 		return 0, werr
@@ -1355,14 +1408,14 @@ func (st *Store) appendJournal(ls *listState, l *List, path string, recs []journ
 	if cerr := f.Close(); cerr != nil {
 		// The write may or may not have reached the file; reopen to roll back.
 		if terr := os.Truncate(path, start); terr != nil {
-			ls.damaged = true
+			ls.damage = damageContent
 		}
 		return 0, cerr
 	}
 	if st.JournalFsync == FsyncInterval {
 		if gerr := st.groupCommit(path); gerr != nil {
 			if terr := os.Truncate(path, start); terr != nil {
-				ls.damaged = true
+				ls.damage = damageContent
 			}
 			return 0, gerr
 		}

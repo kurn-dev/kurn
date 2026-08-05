@@ -86,6 +86,14 @@ func TestQueryAllocs(t *testing.T) {
 // topK=1: every ordinal qualifies, and everything the query allocates must
 // still fit under the charge.
 func TestFloodChargeCoversAllocation(t *testing.T) {
+	if raceEnabled {
+		// The model targets production allocation. Race instrumentation
+		// deliberately defeats sync.Pool reuse, so the pooled per-ordinal
+		// scratch re-allocates every query and its growth chain double-
+		// counts — the measurement stops describing what the governor
+		// bounds.
+		t.Skip("allocation measurement is meaningless under the race detector")
+	}
 	const n = 100_000
 	l, err := engine.NewList("codes", engine.ListConfig{
 		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
@@ -108,11 +116,14 @@ func TestFloodChargeCoversAllocation(t *testing.T) {
 	// then shows exactly the per-QUERY allocations the model's non-pooled
 	// terms must cover. (With a cold pool the scratch itself is allocated
 	// too, still under the model's 8 B/ordinal term.)
+	// GC off BEFORE the warm-up: a collection between warm-up and
+	// measurement could empty the scratch pool and bill the re-allocation
+	// (plus its growth chain) to the measured query.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	opts := engine.QueryOpts{TopK: 1}
 	if c := l.Query("zq", opts); len(c) != 1 {
 		t.Fatalf("flood query returned %d candidates, want 1", len(c))
 	}
-	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 
 	charge := l.ScratchBytesFor(1)
 	var before, after runtime.MemStats

@@ -341,3 +341,39 @@ func TestJournalTruncateSyncedBeforeAck(t *testing.T) {
 		t.Fatal("compact did not commit; the order check proved nothing")
 	}
 }
+
+// TestCreateSyncsMarkerRemovalBeforeAck: the .creating marker is fsynced
+// into existence, so its removal must be fsynced too — before CreateList
+// acknowledges. Otherwise power loss after an acknowledged PUT can
+// resurrect the directory entry and the next Open skips the complete list
+// as "interrupted". Pinned through the seam: at sync time the marker is
+// already gone from the directory and the list is NOT yet installed (the
+// acknowledgment has not happened).
+func TestCreateSyncsMarkerRemovalBeforeAck(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var synced int
+	syncMarkerRemove = func(lp string) error {
+		synced++
+		if _, err := os.Stat(filepath.Join(lp, markerFile)); !os.IsNotExist(err) {
+			t.Errorf("sync called with the marker still present (err=%v)", err)
+		}
+		if _, ok := st.List("people"); ok {
+			t.Error("list installed (acknowledged) before the marker removal was durable")
+		}
+		return syncDir(lp)
+	}
+	defer func() { syncMarkerRemove = syncDir }()
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if synced != 1 {
+		t.Fatalf("marker removal not synced (synced=%d)", synced)
+	}
+	if _, ok := st.List("people"); !ok {
+		t.Fatal("create did not complete; the order check proved nothing")
+	}
+}

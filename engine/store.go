@@ -231,6 +231,10 @@ func syncPath(path string) error {
 	return f.Close()
 }
 
+// syncMarkerRemove makes the .creating marker's removal power-loss-durable
+// (a directory fsync); a seam for the same reason as syncJournalTruncate.
+var syncMarkerRemove = syncDir
+
 // syncJournalTruncate makes a journal truncation power-loss-durable; a seam
 // so tests can pin WHEN it happens (after the truncate, before the in-memory
 // install acknowledges) — real power loss is not reproducible in a test.
@@ -607,6 +611,13 @@ func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string
 		// Disk state is complete but the marker survives: without this remove
 		// the next Open would skip the list, so surface the failure now.
 		return nil, "", fmt.Errorf("store: clearing %s: %w", markerFile, err)
+	}
+	// The removal must be DURABLE before the create is acknowledged: the
+	// marker was fsynced into existence, so a power loss after an
+	// acknowledged PUT could resurrect the directory entry and make the
+	// next Open skip an otherwise complete list as "interrupted".
+	if err := syncMarkerRemove(lp); err != nil {
+		return nil, "", fmt.Errorf("store: syncing %s removal: %w", markerFile, err)
 	}
 	l.SetBaseID("empty") // store-managed: content-addressed stamps from the start
 	l.setJournalHash(newJournalHash())

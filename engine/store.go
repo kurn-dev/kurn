@@ -442,9 +442,18 @@ func (st *Store) openList(name string) (*List, error) {
 // or entries/ordinal mismatch. Takes ownership of entries only on success.
 func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) bool {
 	wantDigest := AnalyzerSpecDigest(l.an)
+	// The identity check is the one that carries correctness. An index maps
+	// grams to ordinal POSITIONS in one specific base.jsonl; against any
+	// other content — even of identical length — every structural check can
+	// pass while queries attribute one entry's matching evidence to
+	// another (entity C returned with entity A's score and key). The
+	// analyzer digest, config, and counts cannot see that; only the base
+	// content hash can, so an artifact recording a different or absent
+	// identity rebuilds.
+	wantBase := l.BaseIDForArtifact()
 	if l.cfg.Match.Mode == "exact" {
 		idx, digest, build, err := artifact.LoadExact(idxPath)
-		if err != nil || digest == "" || digest != wantDigest || build == nil {
+		if err != nil || digest == "" || digest != wantDigest || build == nil || build.BaseID != wantBase {
 			return false
 		}
 		return l.ReplaceWithExactIndexInfo(entries, idx, buildInfo(build)) == nil
@@ -453,7 +462,7 @@ func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) b
 		return false
 	}
 	idx, digest, build, err := artifact.Load(idxPath)
-	if err != nil || digest == "" || digest != wantDigest || build == nil {
+	if err != nil || digest == "" || digest != wantDigest || build == nil || build.BaseID != wantBase {
 		return false
 	}
 	want := ngram.Config{Grams: l.cfg.Match.Grams, StripSpaces: l.cfg.Match.StripSpaces}
@@ -892,7 +901,7 @@ func (st *Store) saveArtifact(l *List, lp string, ng *ngram.Index, ex *exact.Ind
 	// analyzer loss as a stale artifact (see IndexBuildInfo).
 	dropped, keyless := l.BuildStats()
 	entries, _, _ := l.Stats()
-	build := artifact.BuildInfo{Entries: entries, DroppedKeys: dropped, KeylessEntries: keyless}
+	build := artifact.BuildInfo{BaseID: l.BaseIDForArtifact(), Entries: entries, DroppedKeys: dropped, KeylessEntries: keyless}
 	var err error
 	switch {
 	case ng != nil:

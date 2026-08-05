@@ -184,3 +184,33 @@ func TestFailedDeltaLeavesARetryableDirectory(t *testing.T) {
 		}
 	}
 }
+
+// An interrupted delta-enabled attempt leaves delta.jsonl behind; a retry
+// WITHOUT PrevDir publishes no delta, so the leftover would sit beside a
+// manifest that knows nothing of it — and convention-driven consumers read
+// the file, not the manifest. The no-delta publish must remove it.
+func TestNoDeltaRetryRemovesAStaleDelta(t *testing.T) {
+	d := t.TempDir()
+	mp := &ingest.Mapping{Format: "csv", ID: "id",
+		Keys: []ingest.KeyRule{{Path: "name"}}, List: exactList()}
+
+	out := filepath.Join(d, "out")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "delta.jsonl"),
+		[]byte(`{"op":"add","id":"stale"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	man, err := ingest.Build(mp, strings.NewReader("id,name\n1,Anna\n"), out, ingest.BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if man.Delta != nil {
+		t.Fatalf("no-delta build reported delta stats: %+v", man.Delta)
+	}
+	if _, err := os.Stat(filepath.Join(out, "delta.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("stale delta.jsonl survived a no-delta publish (stat err: %v)", err)
+	}
+}

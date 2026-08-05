@@ -2,6 +2,8 @@ package engine_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -125,6 +127,20 @@ func cfgDigest(t *testing.T, cfg engine.ListConfig) string {
 }
 
 // TestStoreArtifactFastPathUsed proves Open installs the on-disk artifact
+
+// baseIDOf computes base.jsonl's content identity the way readBase does:
+// sha256 of the file bytes, 12 hex chars. Doctored-artifact tests must
+// state the real identity or the install path (correctly) rebuilds.
+func baseIDOf(t *testing.T, dir, list string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, list, "base.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 // rather than rebuilding: base.idx is overwritten with a valid, config-
 // matching index built from DIFFERENT keys, and after restart queries follow
 // the doctored index, not base.jsonl's keys.
@@ -138,7 +154,7 @@ func TestStoreArtifactFastPathUsed(t *testing.T) {
 
 	b := ngram.NewBuilder(ngram.Config{Grams: []int{2, 3}, StripSpaces: true})
 	b.Add(0, []string{"dana kovak"})
-	if err := artifact.Save(filepath.Join(dir, "people", "base.idx"), b.Finish(), cfgDigest(t, personCfg()), artifact.BuildInfo{Entries: 1}); err != nil {
+	if err := artifact.Save(filepath.Join(dir, "people", "base.idx"), b.Finish(), cfgDigest(t, personCfg()), artifact.BuildInfo{BaseID: baseIDOf(t, dir, "people"), Entries: 1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -419,7 +435,7 @@ func TestStoreExactArtifactFastPathUsed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), doctored, cfgDigest(t, exactCfg()), artifact.BuildInfo{Entries: 2}); err != nil {
+	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), doctored, cfgDigest(t, exactCfg()), artifact.BuildInfo{BaseID: baseIDOf(t, dir, "codes"), Entries: 2}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -474,7 +490,7 @@ func TestStoreExactMismatchedArtifactFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), oversized, cfgDigest(t, exactCfg()), artifact.BuildInfo{Entries: 3}); err != nil {
+	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), oversized, cfgDigest(t, exactCfg()), artifact.BuildInfo{BaseID: baseIDOf(t, dir, "codes"), Entries: 3}); err != nil {
 		t.Fatal(err)
 	}
 

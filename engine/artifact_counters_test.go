@@ -8,6 +8,7 @@ package engine_test
 // bundle) for a condition whose real repair is the analyzer.
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,17 +82,115 @@ func TestLossCountersSurviveArtifactReload(t *testing.T) {
 	}
 }
 
-// The counter still has to fire for the condition it names. Truncating
-// base.jsonl's entry list while keeping the artifact leaves a list whose
-// index genuinely does not cover every entry.
-func TestStaleArtifactIsReportedAsUnindexed(t *testing.T) {
+// A base.jsonl that no longer matches the artifact must REBUILD, not
+// install. The first version of this test expected the mismatch to install
+// with unindexed_entries counting the gap — but an index maps grams to
+// ordinal positions in one specific base content, and against modified
+// content of the same length every count can agree while queries attribute
+// one entry's evidence to another (the second follow-up review demonstrated
+// entity C returned with entity A's score and key). Identity, not counts,
+// is what the install path checks now; the unindexed counter remains for
+// library callers who install a deliberately partial index WITH its info.
+func TestModifiedBaseRebuildsInsteadOfServingTheArtifact(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func([]byte) []byte
+	}{
+		{"append", func(raw []byte) []byte {
+			return append(raw, []byte(`{"id":"c","keys":["charlie"]}`+"\n")...)
+		}},
+		{"same-length swap", func(raw []byte) []byte {
+			return bytes.ReplaceAll(raw, []byte("alpha"), []byte("gamma"))
+		}},
+		{"reorder", func(raw []byte) []byte {
+			lines := bytes.SplitAfter(raw, []byte("\n"))
+			lines[0], lines[1] = lines[1], lines[0]
+			return bytes.Join(lines, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st, err := engine.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.CreateList("l", lossyList("ngram")); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Replace("l", []engine.Entry{
+				{ID: "a", Keys: []string{"alpha"}},
+				{ID: "b", Keys: []string{"bravo"}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			bp := filepath.Join(dir, "l", "base.jsonl")
+			raw, err := os.ReadFile(bp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(bp, tc.mut(raw), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			st2, err := engine.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			l2, ok := st2.List("l")
+			if !ok {
+				t.Fatal("list lost on reopen")
+			}
+			// Rebuilt from the current base: every present key finds its
+			// OWN entry, and nothing is reported unreachable.
+			if u := l2.UnindexedEntries(); u != 0 {
+				t.Fatalf("unindexed = %d, want 0 after a rebuild", u)
+			}
+			// Assert entity identity, not key-shaped echoes: with stale
+			// postings a query returns the WRONG entry whose own key is
+			// attributed to it, so a check conditioned on key==query
+			// passes vacuously (the first version of this test did).
+			mustFind := func(q, want string) {
+				t.Helper()
+				c := l2.Query(q, engine.QueryOpts{})
+				if len(c) == 0 || c[0].EntryID != want {
+					t.Fatalf("query %q -> %+v, want entry %s", q, c, want)
+				}
+			}
+			mustMiss := func(q string) {
+				t.Helper()
+				if c := l2.Query(q, engine.QueryOpts{}); len(c) != 0 {
+					t.Fatalf("query %q found %+v, want nothing — a removed key still resolves", q, c)
+				}
+			}
+			switch tc.name {
+			case "append":
+				mustFind("alpha", "a")
+				mustFind("charlie", "c")
+			case "same-length swap":
+				mustFind("gamma", "a")
+				mustFind("bravo", "b")
+				mustMiss("alpha")
+			case "reorder":
+				mustFind("alpha", "a")
+				mustFind("bravo", "b")
+			}
+		})
+	}
+}
+
+// Exact mode: the same same-length swap must also rebuild, not serve the
+// old postings.
+func TestModifiedBaseRebuildsExact(t *testing.T) {
 	dir := t.TempDir()
 	st, err := engine.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := lossyList("ngram")
-	if _, err := st.CreateList("l", cfg); err != nil {
+	if _, err := st.CreateList("l", lossyList("exact")); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Replace("l", []engine.Entry{
@@ -103,32 +202,24 @@ func TestStaleArtifactIsReportedAsUnindexed(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	// Append an entry to base.jsonl that the saved artifact never saw —
-	// the shape a crash between writing the two files leaves behind.
 	bp := filepath.Join(dir, "l", "base.jsonl")
 	raw, err := os.ReadFile(bp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw = append(raw, []byte(`{"id":"c","keys":["charlie"]}`+"\n")...)
-	if err := os.WriteFile(bp, raw, 0o644); err != nil {
+	if err := os.WriteFile(bp, bytes.ReplaceAll(raw, []byte("alpha"), []byte("gamma")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
 	st2, err := engine.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	l2, ok := st2.List("l")
-	if !ok {
-		t.Fatal("list lost on reopen")
+	l2, _ := st2.List("l")
+	if c := l2.Query("alpha", engine.QueryOpts{}); len(c) != 0 {
+		t.Fatalf("stale postings served: %+v", c)
 	}
-	if n, _, _ := l2.Stats(); n != 3 {
-		t.Fatalf("entries = %d, want 3", n)
-	}
-	if u := l2.UnindexedEntries(); u != 1 {
-		t.Fatalf("unindexed = %d, want 1 — the appended entry is unreachable", u)
+	if c := l2.Query("gamma", engine.QueryOpts{}); len(c) != 1 || c[0].EntryID != "a" {
+		t.Fatalf("rebuilt index wrong: %+v", c)
 	}
 }
 

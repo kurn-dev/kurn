@@ -176,7 +176,17 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 	// Publish. Renames within one filesystem; base.jsonl goes LAST because
 	// it is the file the already-contains-a-bundle guard checks, so until
 	// it lands the directory still reads as retryable, and a crash between
-	// renames leaves leftovers a retry simply overwrites.
+	// renames leaves leftovers a retry simply overwrites — overwrites, so a
+	// leftover the CURRENT build does not produce must be removed instead:
+	// a delta-enabled attempt that failed leaves delta.jsonl, and a
+	// no-delta retry would otherwise publish a manifest with no delta
+	// stats beside a stale delta file that convention-driven consumers
+	// would still read.
+	if opts.PrevDir == "" {
+		if err := os.Remove(filepath.Join(outDir, "delta.jsonl")); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("ingest: removing stale delta: %w", err)
+		}
+	}
 	for _, f := range append(files, "base.jsonl") {
 		if err := os.Rename(filepath.Join(stage, f), filepath.Join(outDir, f)); err != nil {
 			return nil, fmt.Errorf("ingest: publishing bundle: %w", err)

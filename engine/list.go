@@ -286,6 +286,15 @@ func (l *List) SetBaseID(id string) {
 	l.baseID = id
 }
 
+// BaseIDForArtifact returns the declared base content identity ("" for
+// library-managed lists). saveArtifact records it so a reopen can refuse an
+// index whose ordinals were assigned against different base content.
+func (l *List) BaseIDForArtifact() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.baseID
+}
+
 // compactBuild is a prepared fold: the live entry set and its built segment,
 // not yet installed. Store.Compact prepares, persists the fold to disk, and
 // only then commits — a failed persist leaves the list untouched (no folded
@@ -358,7 +367,9 @@ func (l *List) ReplaceWithIndexInfo(entries []Entry, idx *ngram.Index, bi *Index
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
 	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ng: idx}
-	seg.applyBuildInfo(bi, len(entries))
+	if err := seg.applyBuildInfo(bi, len(entries)); err != nil {
+		return fmt.Errorf("list %s: %s", l.name, err)
+	}
 	for i := range entries {
 		seg.byID[entries[i].ID] = uint32(i)
 		seg.totalKeys += len(entries[i].Keys)
@@ -392,7 +403,9 @@ func (l *List) ReplaceWithExactIndexInfo(entries []Entry, idx *exact.Index, bi *
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
 	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ex: idx}
-	seg.applyBuildInfo(bi, len(entries))
+	if err := seg.applyBuildInfo(bi, len(entries)); err != nil {
+		return fmt.Errorf("list %s: %s", l.name, err)
+	}
 	for i := range entries {
 		seg.byID[entries[i].ID] = uint32(i)
 		seg.totalKeys += len(entries[i].Keys)
@@ -903,15 +916,23 @@ type IndexBuildInfo struct {
 // applyBuildInfo sets a prebuilt segment's loss counters. With no info the
 // segment claims nothing: reporting zero for something unknown is wrong, but
 // inferring it from the index is wrong in a way that names the wrong repair.
-func (seg *segment) applyBuildInfo(bi *IndexBuildInfo, n int) {
+func (seg *segment) applyBuildInfo(bi *IndexBuildInfo, n int) error {
 	if bi == nil {
-		return
+		return nil
+	}
+	// The library boundary gets the same refusal the artifact loader gives
+	// a malformed record: impossible values would surface as negative
+	// metrics and a fabricated unindexed count.
+	if bi.Entries < 0 || bi.DroppedKeys < 0 || bi.KeylessEntries < 0 ||
+		bi.KeylessEntries > bi.Entries || bi.Entries > n {
+		return fmt.Errorf("build info %+v is impossible for %d entries", *bi, n)
 	}
 	seg.droppedKeys = bi.DroppedKeys
 	seg.keylessEntries = bi.KeylessEntries
 	if u := n - bi.Entries; u > 0 {
 		seg.unindexedEntries = u
 	}
+	return nil
 }
 
 // UnindexedEntries returns how many entries the current snapshot holds that

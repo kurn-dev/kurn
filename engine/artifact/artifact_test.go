@@ -250,3 +250,24 @@ func BenchmarkLoad(b *testing.B) {
 		}
 	}
 }
+
+// A persisted build record with impossible values is corrupt metadata and
+// must fail the load, so the store rebuilds instead of serving it.
+func TestLoadRejectsImpossibleBuildRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.idx")
+	// Two families: values the relational NumOrds guard also catches, and
+	// ones ONLY the record's own validation can (negative loss counts and
+	// keyless > entries are invisible to the ordinal arithmetic).
+	for name, b := range map[string]artifact.BuildInfo{
+		"negative entries":     {BaseID: "abc", Entries: -1},
+		"negative counts":      {BaseID: "abc", Entries: 3, DroppedKeys: -2, KeylessEntries: -3},
+		"keyless past entries": {BaseID: "abc", Entries: 3, KeylessEntries: 4},
+	} {
+		if err := artifact.Save(path, buildIdx(), testDigest, b); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := artifact.Load(path); err == nil {
+			t.Errorf("%s: record %+v loaded cleanly", name, b)
+		}
+	}
+}

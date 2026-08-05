@@ -37,6 +37,16 @@ func TestCloseAdmitsNoWriteAfterItReturns(t *testing.T) {
 				defer wg.Done()
 				e := []engine.Entry{{ID: fmt.Sprint(i), Keys: []string{"Anna Smith"}}}
 				for j := 0; j < 40; j++ {
+					// Sample BEFORE the attempt. Sampling after the call is a
+					// false positive: a mutation can finish before Close even
+					// begins, the worker gets descheduled, Close returns, and
+					// the late load then miscounts that finished mutation.
+					// (That flake shipped and failed a full race run.) A
+					// mutation STARTED after Close returned succeeding is the
+					// genuine violation; already-admitted work draining
+					// before Close returns is the deterministic internal
+					// test's job, which this sampling cannot cover.
+					sawReturned := returned.Load()
 					var err error
 					switch j % 4 {
 					case 0:
@@ -48,7 +58,7 @@ func TestCloseAdmitsNoWriteAfterItReturns(t *testing.T) {
 					case 3:
 						err = st.Compact("people")
 					}
-					if err == nil && returned.Load() {
+					if err == nil && sawReturned {
 						late.Add(1)
 					}
 				}

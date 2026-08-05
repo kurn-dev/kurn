@@ -125,3 +125,24 @@ func TestUnindexedEntriesAreCounted(t *testing.T) {
 		t.Fatalf("a list given no build info claimed %d unindexed entries", got)
 	}
 }
+
+// Build info is a claim about the index, and impossible claims must be
+// refused at the boundary: negative counts would surface as negative
+// metrics, and Entries past the slice fabricates an unindexed count.
+func TestImpossibleBuildInfoIsRefused(t *testing.T) {
+	entries := []engine.Entry{
+		{ID: "p1", Keys: []string{"Marcus Chen"}},
+		{ID: "p2", Keys: []string{"Dana Kovak"}},
+	}
+	idx := buildIdx(t, "marcus chen", "dana kovak")
+	for name, bi := range map[string]*engine.IndexBuildInfo{
+		"negative everything":  {Entries: -1, DroppedKeys: -2, KeylessEntries: -3},
+		"keyless past entries": {Entries: 2, KeylessEntries: 3},
+		"entries past slice":   {Entries: 5},
+	} {
+		l := personList(t)
+		if err := l.ReplaceWithIndexInfo(entries, idx, bi); err == nil {
+			t.Errorf("%s: accepted %+v", name, bi)
+		}
+	}
+}

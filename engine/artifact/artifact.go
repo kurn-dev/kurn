@@ -57,11 +57,36 @@ type meta struct {
 	Build *BuildInfo `json:"build,omitempty"`
 }
 
-// BuildInfo travels with an index so its loss counters survive a reload.
+// BuildInfo travels with an index so its loss counters survive a reload,
+// and — the load-bearing half — binds the index to the exact base content
+// whose ordinal assignments it encodes.
 type BuildInfo struct {
-	Entries        int `json:"entries"`
-	DroppedKeys    int `json:"dropped_keys"`
-	KeylessEntries int `json:"keyless_entries"`
+	// BaseID is the content-addressed identity of the base.jsonl the index
+	// was built from (the version stamp's hash half). An index is a map
+	// from grams to ORDINAL POSITIONS in that specific file: against any
+	// other content of the same length every check can pass while the
+	// postings point at different entities, so a query returns entry X
+	// carrying entry Y's matching evidence. Counts cannot detect that;
+	// only identity can.
+	BaseID         string `json:"base_id"`
+	Entries        int    `json:"entries"`
+	DroppedKeys    int    `json:"dropped_keys"`
+	KeylessEntries int    `json:"keyless_entries"`
+}
+
+// validate rejects records no build can produce. A malformed record is
+// treated exactly like a corrupt artifact section: the load fails and the
+// store rebuilds, rather than serving impossible metrics.
+func (b *BuildInfo) validate() error {
+	switch {
+	case b == nil:
+		return nil // absent: pre-record artifact, caller rebuilds
+	case b.Entries < 0 || b.DroppedKeys < 0 || b.KeylessEntries < 0:
+		return fmt.Errorf("artifact: build record with negative counts (%+v)", *b)
+	case b.KeylessEntries > b.Entries:
+		return fmt.Errorf("artifact: build record claims %d keyless of %d entries", b.KeylessEntries, b.Entries)
+	}
+	return nil
 }
 
 func Save(path string, idx *ngram.Index, analyzerDigest string, build BuildInfo) error {
@@ -191,13 +216,20 @@ func Load(path string) (*ngram.Index, string, *BuildInfo, error) {
 	if err != nil {
 		return nil, "", nil, fmt.Errorf("artifact: %s: %w", path, err)
 	}
+	if err := m.Build.validate(); err != nil {
+		return nil, "", nil, err
+	}
 	// An index holding ordinals cannot have been built from zero entries,
 	// so a zero record is a caller that passed no real info (or a
 	// hand-made file), not a genuinely empty list. Report it as absent
-	// rather than let it read as "every entry is unindexed".
+	// rather than let it read as "every entry is unindexed". NumOrds
+	// bounded by the claimed entry count for the same reason.
 	build := m.Build
 	if build != nil && build.Entries == 0 && m.NumOrds > 0 {
 		build = nil
+	}
+	if build != nil && int(m.NumOrds) > build.Entries {
+		return nil, "", nil, fmt.Errorf("artifact: %d ordinals from a claimed %d entries", m.NumOrds, build.Entries)
 	}
 	return idx, m.Analyzer, build, nil
 }

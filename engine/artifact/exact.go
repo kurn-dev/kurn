@@ -206,13 +206,17 @@ func LoadExact(path string) (*exact.Index, string, *BuildInfo, error) {
 	if err != nil {
 		return nil, "", nil, fmt.Errorf("artifact: %s: %w", path, err)
 	}
-	// An index holding ordinals cannot have been built from zero entries,
-	// so a zero record is a caller that passed no real info (or a
-	// hand-made file), not a genuinely empty list. Report it as absent
-	// rather than let it read as "every entry is unindexed".
+	if err := m.Build.validate(); err != nil {
+		return nil, "", nil, err
+	}
+	// See Load: a zero record on a non-empty index means "no info", and
+	// the ordinal count cannot exceed the claimed entry count.
 	build := m.Build
 	if build != nil && build.Entries == 0 && idx.NumOrds() > 0 {
 		build = nil
+	}
+	if build != nil && int(idx.NumOrds()) > build.Entries {
+		return nil, "", nil, fmt.Errorf("artifact: %d ordinals from a claimed %d entries", idx.NumOrds(), build.Entries)
 	}
 	return idx, m.Analyzer, build, nil
 }

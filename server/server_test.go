@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -598,5 +600,66 @@ func TestOverBudgetQueryRefused(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "needs") || !strings.Contains(string(body), "query-mem-budget") {
 		t.Fatalf("503 does not name the remedy: %s", body)
+	}
+}
+
+// A list refusing mutations because of a disk/memory split (see
+// engine.ErrListDamaged) must show in /readyz — a restart of this node can
+// load a different generation than it serves, so it must not claim ready —
+// and both ENTERING and LEAVING damage must invalidate the readiness cache
+// immediately, not after its TTL. Damage is injected without seams: a
+// read-only journal makes Replace fail at its truncate step, after the new
+// base has already been published.
+func TestReadinessSurfacesDamagedLists(t *testing.T) {
+	dir := t.TempDir()
+	st, err := engine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Upsert("people", []engine.Entry{{ID: "p1", Keys: []string{"marcus chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(st))
+	t.Cleanup(ts.Close)
+
+	// Prime the cache with a ready result inside the TTL window.
+	resp, _ := do(t, "GET", ts.URL+"/readyz", "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("baseline readyz: %d", resp.StatusCode)
+	}
+
+	// Injected post-publication failure: journal truncation cannot happen.
+	jp := filepath.Join(dir, "people", "journal.jsonl")
+	if err := os.Chmod(jp, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Replace("people", []engine.Entry{{ID: "p2", Keys: []string{"dana kovak"}}}); err == nil {
+		os.Chmod(jp, 0o644)
+		t.Skip("truncate of a read-only journal succeeded (running privileged?); cannot inject damage")
+	}
+	os.Chmod(jp, 0o644)
+
+	resp, body := do(t, "GET", ts.URL+"/readyz", "")
+	if resp.StatusCode != 503 {
+		t.Fatalf("readyz with a damaged list: %d %s (cached ready result served?)", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "people") || !strings.Contains(string(body), "unverifiable") {
+		t.Fatalf("503 does not name the damaged list and cause: %s", body)
+	}
+
+	// The named repair (retry the replace) clears it — and readiness must
+	// see that immediately too.
+	if err := st.Replace("people", []engine.Entry{{ID: "p2", Keys: []string{"dana kovak"}}}); err != nil {
+		t.Fatalf("replace retry: %v", err)
+	}
+	resp, body = do(t, "GET", ts.URL+"/readyz", "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("readyz after repair: %d %s (cached failure served?)", resp.StatusCode, body)
 	}
 }

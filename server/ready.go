@@ -36,10 +36,14 @@ type readyResult struct {
 // readyKey identifies one list's state at evaluation time. The version
 // covers DATA identity (content-addressed), but not config: a PUT-replace
 // with different golden probes can reproduce an identical version, so the
-// *List pointer (fresh per CreateList) covers config identity.
+// *List pointer (fresh per CreateList) covers config identity. The damage
+// repair string covers quarantine state: entering OR leaving damage must
+// invalidate the cache immediately, not after the TTL — a node with a
+// known disk/memory split must stop claiming ready as soon as it exists.
 type readyKey struct {
 	l       *engine.List
 	version string
+	damage  string
 }
 
 type readyCache struct {
@@ -91,8 +95,12 @@ func (s *srv) readyResult() readyResult {
 	units := s.tenantStores()
 	keys := make(map[string]readyKey)
 	for _, u := range units {
+		dmg := map[string]string{}
+		for _, d := range u.st.DamagedLists() {
+			dmg[d.List] = d.Repair
+		}
 		for _, l := range u.st.Lists() {
-			keys[u.name+"/"+l.Name()] = readyKey{l: l, version: l.Version()}
+			keys[u.name+"/"+l.Name()] = readyKey{l: l, version: l.Version(), damage: dmg[l.Name()]}
 		}
 	}
 	if c := s.ready.Load(); c != nil && time.Now().Before(c.expires) && keysMatch(c.keys, keys) {
@@ -139,6 +147,17 @@ func evaluateReadiness(st *engine.Store, lists []*engine.List) readyResult {
 		failures = append(failures, readyFailure{
 			List:   q.List,
 			Reason: fmt.Sprintf("journal quarantined at open (%v) — journaled operations not live until %s is repaired", q.Err, q.Path),
+		})
+	}
+	// Damage is a RUNTIME state, not an open-time one: a destructive
+	// operation failed after publishing disk changes, so a restart can
+	// load a different generation than this node serves. Queries continue
+	// on the acknowledged snapshot, but the node must not claim ready
+	// until the named repair succeeds.
+	for _, d := range st.DamagedLists() {
+		failures = append(failures, readyFailure{
+			List:   d.List,
+			Reason: "mutations refused (disk/memory state unverifiable) — " + d.Repair,
 		})
 	}
 	for _, l := range lists {

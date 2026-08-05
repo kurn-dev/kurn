@@ -68,6 +68,11 @@ type Store struct {
 	// OnArtifactError, if set, observes non-fatal base.idx save failures
 	// (see Compact/Replace: the artifact is a pure cache, so a failed save
 	// still acknowledges the operation). Set it before concurrent use.
+	//
+	// It is called while the list's lock is held, so the callback must not
+	// mutate that list (or any list, since it cannot tell which locks the
+	// caller holds): doing so self-deadlocks. Log it, count it, or send it
+	// to a channel — do not act on it inline.
 	OnArtifactError func(list string, err error)
 
 	// Quarantined lists the journals Open could not apply (see openList): a
@@ -460,9 +465,13 @@ func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) b
 // CreateList creates (or PUT-replaces) a list: validates the name (it becomes
 // a directory) and config, wipes any existing data files, writes the resolved
 // config, and installs a fresh empty list in memory. Files first, memory
-// second: a failed create leaves the old in-memory list untouched only if the
-// wipe hasn't started; once data files are wiped the in-memory swap is
-// unconditional, matching disk.
+// second, and the in-memory swap is the LAST statement: every error path —
+// including the four after the wipe has begun — returns without swapping, so
+// memory keeps serving the old list while disk no longer matches it. That
+// divergence is intentional and bounded by the marker: it survives all four,
+// so the next Open skips the directory rather than serving the mismatch, and
+// the repair is a fresh PUT. The nastiest case is the last one, where disk
+// holds a complete and valid new list and only the marker removal failed.
 func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 	if err := st.mutable(); err != nil {
 		return nil, err

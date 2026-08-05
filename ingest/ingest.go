@@ -95,6 +95,15 @@ type Mapping struct {
 // strong aka ANYWHERE". Both are well-defined; only one is usually what
 // you meant. If a filter should constrain the same repeated element the
 // keys come from, the where paths must share that element's prefix.
+//
+// The same shift also collapses HOW MANY keys you get, which is the
+// easier half to miss. One instance emits one key — the FIRST match of
+// each path — so a rule over a repeated element yields one key per element
+// while its prefix stays shared, and exactly one key the moment a
+// shallower where path empties the common prefix. Adding a record-level
+// filter to an aka-scoped rule therefore turns N alias keys into 1, with
+// no error and nothing counted: the entry stays findable under its first
+// alias only.
 type KeyRule struct {
 	// Path is sugar for a single-element Paths.
 	Path string `json:"path,omitempty"`

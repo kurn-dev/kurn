@@ -407,6 +407,10 @@ func (i *Index) LookupCtx(ctx context.Context, analyzed string, threshold float6
 // The emission order equals iterating grams() output with a cross-size dedup
 // set — the order LookupCtx and attribution consumed before streaming — so
 // consumers see byte-identical sequences.
+//
+// Unlike CharGrams (the index side), this preserves invalid UTF-8 verbatim
+// rather than folding it to U+FFFD; see CharGrams for why that asymmetry is
+// unreachable from the server.
 func EachGram(s string, sizes []int, seen map[string]struct{}, offs []int, fn func(g string)) []int {
 	offs = offs[:0]
 	for i := range s { // byte offsets of rune starts
@@ -436,6 +440,15 @@ func EachGram(s string, sizes []int, seen map[string]struct{}, offs []int, fn fu
 
 // CharGrams returns the distinct character n-grams of s (s itself if shorter
 // than n runes).
+//
+// Invalid UTF-8 is where this and EachGram part company, and they are the
+// index and query halves of the same operation. CharGrams round-trips
+// through []rune, so every invalid byte becomes U+FFFD and two keys
+// differing only in invalid bytes index identically; EachGram slices the
+// original string and preserves those bytes, so the same query does not
+// match what was indexed. Nothing reachable through the server can hit it —
+// encoding/json replaces invalid UTF-8 on the way in — so this is a
+// library-only caveat: callers passing raw bytes should sanitize first.
 func CharGrams(s string, n int) []string {
 	r := []rune(s)
 	if len(r) < n {

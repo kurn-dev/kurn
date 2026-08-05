@@ -33,10 +33,13 @@ type DryRunReport struct {
 	// EmptyKeyRate = EmptyKeys / RawKeys (0 when no keys).
 	EmptyKeyRate float64 `json:"empty_key_rate"`
 
-	// EstMemoryBytes is a rough serving-memory estimate for the FULL feed
-	// scaled from the sample: analyzed keys × the measured B/key of the
-	// list's mode (bench records: ~114 ngram, ~133 exact). An estimate,
-	// not a promise — corpus shape moves it.
+	// EstMemoryBytes is a rough serving-memory estimate for the records
+	// SAMPLED, not for the whole feed: AnalyzedKeys × the measured B/key
+	// of the list's mode (bench records: ~114 ngram, ~133 exact). A
+	// dry-run stops at its sample size and never learns the feed's total
+	// record count, so it cannot scale this itself — multiply by
+	// (total records / Sampled) to project. An estimate either way, not a
+	// promise: corpus shape moves it.
 	EstMemoryBytes int64 `json:"est_memory_bytes"`
 
 	// Samples are the first few mapped entries with their analyzed keys —

@@ -73,17 +73,3 @@ func (g *authGate) allow(r *http.Request) bool {
 	}
 	return ok == 1
 }
-
-func (g *authGate) middleware(next http.Handler) http.Handler {
-	if g == nil {
-		return next
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !exemptFromAuth(r.URL.Path) && !g.allow(r) {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="kurn"`)
-			jsonError(w, http.StatusUnauthorized, "missing or invalid API key")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}

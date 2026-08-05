@@ -129,8 +129,8 @@ func TestTenantScratchIsolation(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	// A: 8 concurrent no-floor scans (the maximal-work shape) against a
-	// one-scan slice and a 30ms queue timeout — overflow 503s must name
-	// the TENANT budget.
+	// one-scan slice and a 1ms queue timeout — one is admitted immediately
+	// and the rest overflow, and those 503s must name the TENANT budget.
 	noFloor := `{"q":"veko rima nasol 1234","lists":["people"],"threshold":0}`
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -155,25 +155,42 @@ func TestTenantScratchIsolation(t *testing.T) {
 			}
 		}()
 	}
-	// B concurrently: every query must succeed — A's storm queues against
-	// A's slice, and the global budget (1 GiB) has room for B.
-	bDone := make(chan error, 4)
-	for i := 0; i < 4; i++ {
-		go func() {
+	// B runs SEQUENTIALLY for as long as A's storm lasts. B's slice also
+	// fits exactly one query, so concurrent B queries would queue against
+	// each other and time out on their own account — which is not the
+	// property under test and is unsatisfiable whenever a scan outlives the
+	// queue timeout (any -race run). One at a time, every B query must be
+	// admitted immediately, because A's storm can only ever consume A's
+	// slice.
+	stormDone := make(chan struct{})
+	bDone := make(chan error, 1)
+	go func() {
+		ran := 0
+		for {
+			select {
+			case <-stormDone:
+				if ran == 0 {
+					bDone <- fmt.Errorf("tenant B never got a query in during A's storm")
+					return
+				}
+				bDone <- nil
+				return
+			default:
+			}
 			resp, body := doAuth(t, ts, "POST", "/v1/query",
 				`{"q":"veko rima nasol 0007","lists":["people"]}`, "X-API-Key", "key-bbb")
 			if resp.StatusCode != 200 {
-				bDone <- fmt.Errorf("tenant B query failed during A's storm: %d %s", resp.StatusCode, body)
+				bDone <- fmt.Errorf("tenant B query %d failed during A's storm: %d %s",
+					ran, resp.StatusCode, body)
 				return
 			}
-			bDone <- nil
-		}()
-	}
-	wg.Wait()
-	for i := 0; i < 4; i++ {
-		if err := <-bDone; err != nil {
-			t.Fatal(err)
+			ran++
 		}
+	}()
+	wg.Wait()
+	close(stormDone)
+	if err := <-bDone; err != nil {
+		t.Fatal(err)
 	}
 	if saw200 == 0 || saw503 == 0 {
 		t.Fatalf("storm shape off: %d ok, %d rejected — want both (some serialized in, overflow rejected)", saw200, saw503)

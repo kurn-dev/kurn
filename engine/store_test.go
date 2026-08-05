@@ -1094,4 +1094,21 @@ func TestCompactResultDescribesTheCommit(t *testing.T) {
 	if !strings.Contains(res.Version, "@2+j0+c") {
 		t.Fatalf("result version %q is not the fold's content stamp", res.Version)
 	}
+	if res.Mode != "ngram" || res.DroppedKeys != 0 || res.KeylessEntries != 0 {
+		t.Fatalf("result stats %+v do not describe the fold", res)
+	}
+
+	// The result is VALUES: a mutation landing after the compact returns
+	// changes the LIST (entries, version) but cannot change what the
+	// caller reports about the compact.
+	vFold := res.Version
+	if err := st.Upsert("people", []engine.Entry{{ID: "p3", Keys: []string{"Iris Bell"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if cur, _ := st.List("people"); cur.Version() == vFold {
+		t.Fatal("mutation did not change the live version; the invariance claim shows nothing")
+	}
+	if res.Entries != 2 || res.Version != vFold {
+		t.Fatalf("result changed after a later mutation: %+v", res)
+	}
 }

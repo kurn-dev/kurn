@@ -936,17 +936,21 @@ func (st *Store) Compact(name string) error {
 	return err
 }
 
-// CompactResult is what one compact COMMITTED: the list generation it
-// operated on (resolved under the store lock — a concurrent PUT can swap
-// the name to a new generation between a caller's lookup and the compact),
-// the committed version, and the folded live-entry count. Callers writing
-// audit lines or responses must take all three from here; re-reading them
-// through a pointer resolved before the call can describe a different
-// generation or a later mutation.
+// CompactResult is what one compact COMMITTED, as immutable values: the
+// list generation it operated on (resolved under the store lock — a
+// concurrent PUT can swap the name to a new generation between a caller's
+// lookup and the compact), the committed version, and the folded
+// snapshot's statistics, all captured while the mutation lock was still
+// held. Callers writing audit lines or responses must use these values;
+// re-reading state through ANY pointer after the call returns — List
+// included — can observe a later mutation and describe a snapshot the
+// compact never produced (or mix two).
 type CompactResult struct {
-	List    *List
-	Version string
-	Entries int
+	List                        *List // the generation operated on; for config-shaped reads only
+	Version                     string
+	Entries                     int // folded live entries (overlay and tombstones are 0 by construction)
+	Mode                        string
+	DroppedKeys, KeylessEntries int // build-loss counters of the fold
 }
 
 // CompactVersioned is Compact returning what it committed (see
@@ -1006,7 +1010,16 @@ func (st *Store) CompactVersioned(name string) (CompactResult, error) {
 	ls.setDamage(damageNone)
 	l.CommitCompact(b, id)
 	st.saveArtifact(l, lp, b.seg.ng, b.seg.ex)
-	return CompactResult{List: l, Version: l.snap.Load().version, Entries: len(b.live)}, nil
+	// Captured under ls.lock: no mutation can land before these reads, so
+	// they describe exactly the fold that was just committed.
+	dropped, keyless := l.BuildStats()
+	return CompactResult{
+		List:        l,
+		Version:     l.snap.Load().version,
+		Entries:     len(b.live),
+		Mode:        l.cfg.Match.Mode,
+		DroppedKeys: dropped, KeylessEntries: keyless,
+	}, nil
 }
 
 // Replace swaps the whole list content: new base + empty journal on disk,

@@ -604,11 +604,23 @@ func (s *srv) compact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reg.compacts.Add(1)
-	// Audit and response come from the RESULT: the compact resolves its
-	// list under the store lock, and a concurrent PUT could swap the name
-	// to a different generation than any pointer resolved above.
+	// Audit AND response come entirely from the RESULT's committed values:
+	// the compact resolves its list under the store lock (a concurrent PUT
+	// could swap the name to a different generation than any pointer
+	// resolved above), and reading stats through even the result's List
+	// pointer after the lock is released could describe a later mutation.
 	s.auditMut(r.Context(), "compact", name, res.Entries, res.Version, false)
-	writeJSON(w, http.StatusOK, statsOf(res.List))
+	writeJSON(w, http.StatusOK, statsResp{
+		Name:           name,
+		Entries:        res.Entries,
+		Overlay:        0, // a fold empties the overlay by construction
+		Tombstones:     0, // and the tombstone set
+		Version:        res.Version,
+		Mode:           res.Mode,
+		DroppedKeys:    res.DroppedKeys,
+		KeylessEntries: res.KeylessEntries,
+		// UnindexedEntries: a fold is a full fresh build — zero, omitted.
+	})
 }
 
 // reload re-opens a list from its on-disk dir — the bundle publish path

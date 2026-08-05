@@ -130,8 +130,10 @@ bundle/
 "prev_sha256", "delta":{"adds","updates","deletes"}}`. The identity
 property the platform may build on: **`version_id` is the PREFIX of the
 version stamp the node reports after loading the bundle** (the full
-stamp is `<version_id>@<entries>+j<journalBytes>`, `+j0` right after a
-clean publish) — publish-time and query-time identity share one number,
+stamp is `<version_id>@<entries>+j<journalBytes>.<journalHash>`, where
+the journal suffix is `+j0` right after a clean publish and gains a
+content hash of the journal's exact bytes once mutations land on top) —
+publish-time and query-time identity share one number,
 so "which list version answered this query" joins directly against the
 registry of built bundles.
 

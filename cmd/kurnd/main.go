@@ -26,7 +26,7 @@ func main() {
 	fsyncInterval := flag.Duration("journal-fsync-interval", 2*time.Millisecond,
 		"group-commit window for -journal-fsync=interval")
 	queryMemMB := flag.Int64("query-mem-budget-mb", 1024,
-		"scratch-memory budget for in-flight queries in MiB (~4B x list ordinals per query); 0 disables admission control")
+		"scratch-memory budget for in-flight queries in MiB (each query is charged a conservative ceiling: ~8B x list ordinals plus a bounded per-hit term); 0 disables admission control")
 	queueTimeout := flag.Duration("query-queue-timeout", 2*time.Second,
 		"max wait for query admission before 503")
 	apiKeysFile := flag.String("api-keys-file", "",

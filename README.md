@@ -7,8 +7,10 @@ customers, domains, denylists, any list you have. Typo-tolerant
 (character-ngram, IDF-weighted, scored 0–100) or exact, it runs as a Go
 library inside your service or as a sidecar (`kurnd`) beside it, so there is
 no search cluster to maintain. Every answer carries the content-addressed
-version of the data it was computed against: same query, same version, same
-result — byte for byte, on any machine, forever.
+version of the data it was computed against — candidates and version come
+from one atomic snapshot — so the same query against the same version, on
+the same kurn version, returns the same candidates: byte for byte, on any
+machine.
 
 A common shape: your database stays the system of record, a query exports the
 rows worth matching, `kurn build` turns them into a content-addressed bundle,
@@ -46,7 +48,8 @@ curl -s -X POST localhost:8080/v1/lists/people/entries \
 
 curl -s -X POST localhost:8080/v1/query -d '{"q":"vasquez elna","lists":["people"]}'
 # {"candidates":[{"list":"people","entry_id":"p1","score":100,"key":"Elena Vasquez",
-#   "payload":{"listed":"2024-01-01"}}],"versions":{"people":"empty@0+j178"},"took_us":44}
+#   "payload":{"listed":"2024-01-01"}}],"versions":{"people":"empty@0+j174.d2e39af703db"},
+#  "took_us":44}
 ```
 
 Note: the minimal `{"mode":"ngram"}` above uses the defaults only. The
@@ -68,12 +71,12 @@ curl -s -X POST 'localhost:8080/v1/lists/people/entries?replace=true' \
 # {"dropped_keys":0,"keyless_entries":0,"replaced":3}
 
 curl -s -X POST localhost:8080/v1/lists/people/compact
-# {"name":"people","entries":3,"overlay":0,"tombstones":0,"version":"ca764d77fea0@3+j0",
+# {"name":"people","entries":3,"overlay":0,"tombstones":0,"version":"eeaf668a8628@3+j0",
 #  "mode":"ngram","dropped_keys":0,"keyless_entries":0}
 
 curl -s -X POST localhost:8080/v1/query -d '{"q":"astrom ingrid","lists":["people"]}'
 # {"candidates":[{"list":"people","entry_id":"p3","score":100,"key":"Ingrid Åström"}],
-#  "versions":{"people":"ca764d77fea0@3+j0"},"took_us":43}
+#  "versions":{"people":"eeaf668a8628@3+j0"},"took_us":43}
 ```
 
 Domain blocklist (exact mode, parent-suffix fallback): listing a domain
@@ -408,21 +411,26 @@ LB on `/readyz`, alert on `/metrics`.
   concurrent mutations through one fsync per window (default 2 ms).
   Base/config writes are always fsynced, directory entry included.
 - **Query admission is memory-based**: in-flight queries are bounded by a
-  scratch-memory budget (`-query-mem-budget-mb`, default 1024; ~4 bytes ×
-  list ordinals per query), with FIFO queuing and a 503 after
-  `-query-queue-timeout`. The budget counts memory, not CPU — an explicit
-  no-floor query (`threshold: 0`) is the most CPU-expensive shape, and
-  concurrency capping plus client-disconnect cancellation are what bound
-  it.
+  scratch-memory budget (`-query-mem-budget-mb`, default 1024). Each query
+  is charged a conservative ceiling — ~8 bytes × list ordinals for the
+  scan accumulators plus a bounded per-hit term — with FIFO queuing and a
+  503 after `-query-queue-timeout`. The budget counts memory, not CPU — an
+  explicit no-floor query (`threshold: 0`) is the most CPU-expensive
+  shape, and concurrency capping plus client-disconnect cancellation are
+  what bound it.
 - **Scores are segment-local**: base and overlay carry separate IDF stats,
   so a candidate's score can shift slightly when compaction folds the
   overlay into the base. Ordering by score within one segment is stable.
 - **Version stamps are content-addressed for daemon/store-managed lists**:
-  `<hash>@<baseEntries>+j<journalBytes>` where `<hash>` is a sha256 prefix
-  of `base.jsonl` (or `empty`) — the same disk state always yields the same
-  version across restarts, and equal versions imply equal answers. Only
-  lists managed DIRECTLY through the library (`engine.NewList`, no Store)
-  still stamp process-local `gen…` counters, which do not survive restarts.
+  `<hash>@<baseEntries>+j<journalBytes>.<journalHash>` where `<hash>` is a
+  sha256 prefix of `base.jsonl` (or `empty`) and `<journalHash>` — omitted
+  for an empty journal (`+j0`) — is a sha256 prefix of the journal's exact
+  byte content, with the byte count as replay depth. The same disk state
+  always yields the same version across restarts, and equal versions
+  identify equal data: two journals of equal length but different
+  mutations get different stamps. Only lists managed DIRECTLY through the
+  library (`engine.NewList`, no Store) still stamp process-local `gen…`
+  counters, which do not survive restarts.
 - **`fold_diacritics` only strips combining marks**: foldables that don't
   decompose to base + mark — `ø`, `Ł`, `ß`, `æ`, `Đ` — do not fold.
 

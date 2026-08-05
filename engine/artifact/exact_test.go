@@ -35,10 +35,10 @@ func buildExactIdx(tb testing.TB) *exact.Index {
 func TestExactRoundTrip(t *testing.T) {
 	idx := buildExactIdx(t)
 	path := filepath.Join(t.TempDir(), "base.idx")
-	if err := artifact.SaveExact(path, idx, testDigest); err != nil {
+	if err := artifact.SaveExact(path, idx, testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
-	loaded, digest, err := artifact.LoadExact(path)
+	loaded, digest, _, err := artifact.LoadExact(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,10 +88,10 @@ func TestExactRoundTripDifferential(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 	path := filepath.Join(t.TempDir(), "base.idx")
-	if err := artifact.SaveExact(path, idx, testDigest); err != nil {
+	if err := artifact.SaveExact(path, idx, testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
-	loaded, _, err := artifact.LoadExact(path)
+	loaded, _, _, err := artifact.LoadExact(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,10 +114,10 @@ func TestExactDeterministic(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.idx")
 	b := filepath.Join(dir, "b.idx")
-	if err := artifact.SaveExact(a, buildExactIdx(t), testDigest); err != nil {
+	if err := artifact.SaveExact(a, buildExactIdx(t), testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := artifact.SaveExact(b, buildExactIdx(t), testDigest); err != nil {
+	if err := artifact.SaveExact(b, buildExactIdx(t), testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
 	da, _ := os.ReadFile(a)
@@ -130,33 +130,33 @@ func TestExactDeterministic(t *testing.T) {
 func TestExactRejectCorrupt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.idx")
 	os.WriteFile(path, []byte("not an artifact"), 0o644)
-	if _, _, err := artifact.LoadExact(path); err == nil {
+	if _, _, _, err := artifact.LoadExact(path); err == nil {
 		t.Fatal("want error for corrupt file")
 	}
 	// An ngram artifact is not an exact artifact (magic differs).
 	os.WriteFile(path, []byte("KURNIDX1..."), 0o644)
-	if _, _, err := artifact.LoadExact(path); err == nil {
+	if _, _, _, err := artifact.LoadExact(path); err == nil {
 		t.Fatal("want error for ngram magic")
 	}
 	// truncated: write a valid one, cut it in half
 	good := filepath.Join(t.TempDir(), "good.idx")
-	if err := artifact.SaveExact(good, buildExactIdx(t), testDigest); err != nil {
+	if err := artifact.SaveExact(good, buildExactIdx(t), testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
 	// Reverse cross-magic: the ngram loader must reject an exact artifact.
-	if _, _, err := artifact.Load(good); err == nil {
+	if _, _, _, err := artifact.Load(good); err == nil {
 		t.Fatal("ngram Load accepted an exact artifact")
 	}
 	data, _ := os.ReadFile(good)
 	for _, n := range []int{len(data) / 2, len(data) - 1} {
 		os.WriteFile(path, data[:n], 0o644)
-		if _, _, err := artifact.LoadExact(path); err == nil {
+		if _, _, _, err := artifact.LoadExact(path); err == nil {
 			t.Fatalf("want error for file truncated to %d/%d bytes", n, len(data))
 		}
 	}
 	// trailing data: a valid artifact with extra bytes appended
 	os.WriteFile(path, append(append([]byte{}, data...), 0xff), 0o644)
-	if _, _, err := artifact.LoadExact(path); err == nil {
+	if _, _, _, err := artifact.LoadExact(path); err == nil {
 		t.Fatal("want error for trailing data")
 	}
 }
@@ -184,7 +184,7 @@ func TestExactRejectHostileHeader(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, _, err := artifact.LoadExact(mk(tc.hdr)); err == nil || !strings.Contains(err.Error(), "implausible") {
+			if _, _, _, err := artifact.LoadExact(mk(tc.hdr)); err == nil || !strings.Contains(err.Error(), "implausible") {
 				t.Fatalf("want plausibility-bound error, got: %v", err)
 			}
 		})
@@ -198,7 +198,7 @@ func TestExactRejectHostileHeader(t *testing.T) {
 		`{"key_count":2,"postings_len":1,"arena_len":2}`, // fewer postings than keys
 		`{"key_count":2,"postings_len":2,"arena_len":1}`, // arena smaller than one byte per key
 	} {
-		if _, _, err := artifact.LoadExact(mk(hdr)); err == nil {
+		if _, _, _, err := artifact.LoadExact(mk(hdr)); err == nil {
 			t.Fatalf("header %s accepted", hdr)
 		}
 	}
@@ -230,7 +230,7 @@ func BenchmarkExactSave(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := artifact.SaveExact(filepath.Join(dir, fmt.Sprintf("big-%d.idx", i)), idx, testDigest); err != nil {
+		if err := artifact.SaveExact(filepath.Join(dir, fmt.Sprintf("big-%d.idx", i)), idx, testDigest, artifact.BuildInfo{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -239,7 +239,7 @@ func BenchmarkExactSave(b *testing.B) {
 func BenchmarkExactLoad(b *testing.B) {
 	idx := buildBigExactIdx(b)
 	path := filepath.Join(b.TempDir(), "big.idx")
-	if err := artifact.SaveExact(path, idx, testDigest); err != nil {
+	if err := artifact.SaveExact(path, idx, testDigest, artifact.BuildInfo{}); err != nil {
 		b.Fatal(err)
 	}
 	if fi, err := os.Stat(path); err == nil {
@@ -248,7 +248,7 @@ func BenchmarkExactLoad(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, _, err := artifact.LoadExact(path); err != nil {
+		if _, _, _, err := artifact.LoadExact(path); err != nil {
 			b.Fatal(err)
 		}
 	}

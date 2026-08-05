@@ -147,10 +147,10 @@ func TestDifferentialRecall(t *testing.T) {
 	// Round-trip through the artifact so the same differential also pins the
 	// Load()ed index.
 	path := filepath.Join(t.TempDir(), "diff.idx")
-	if err := artifact.Save(path, idx, "differential-test-digest"); err != nil {
+	if err := artifact.Save(path, idx, "differential-test-digest", artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
-	loaded, _, err := artifact.Load(path)
+	loaded, _, _, err := artifact.Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -46,9 +46,25 @@ type meta struct {
 	// treated as unknown by the install path, which rebuilds rather than
 	// risk keys analyzed one way and queries another).
 	Analyzer string `json:"analyzer,omitempty"`
+	// Build is what the index cannot state about itself: how many base
+	// entries it was built from, plus that build's loss counters. Without
+	// the entry count a reader cannot tell a STALE artifact (built from
+	// fewer entries than base.jsonl now holds) from a correct one whose
+	// last entries analyzed to nothing — both simply lower NumOrds. Absent
+	// in artifacts written before this field existed; nil then means
+	// "unknown", and the install path rebuilds rather than guess, exactly
+	// as it does for a pre-digest artifact.
+	Build *BuildInfo `json:"build,omitempty"`
 }
 
-func Save(path string, idx *ngram.Index, analyzerDigest string) error {
+// BuildInfo travels with an index so its loss counters survive a reload.
+type BuildInfo struct {
+	Entries        int `json:"entries"`
+	DroppedKeys    int `json:"dropped_keys"`
+	KeylessEntries int `json:"keyless_entries"`
+}
+
+func Save(path string, idx *ngram.Index, analyzerDigest string, build BuildInfo) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".idx-*")
 	if err != nil {
 		return err
@@ -61,7 +77,7 @@ func Save(path string, idx *ngram.Index, analyzerDigest string) error {
 	}
 	cfg := idx.Cfg()
 	post := idx.Postings()
-	hdr, _ := json.Marshal(meta{Grams: cfg.Grams, StripSpaces: cfg.StripSpaces, NumOrds: idx.NumOrds(), GramCount: len(post), Analyzer: analyzerDigest})
+	hdr, _ := json.Marshal(meta{Grams: cfg.Grams, StripSpaces: cfg.StripSpaces, NumOrds: idx.NumOrds(), GramCount: len(post), Analyzer: analyzerDigest, Build: &build})
 	if err := writeUvarint(w, uint64(len(hdr))); err != nil {
 		return err
 	}
@@ -98,45 +114,45 @@ func Save(path string, idx *ngram.Index, analyzerDigest string) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-func Load(path string) (*ngram.Index, string, error) {
+func Load(path string) (*ngram.Index, string, *BuildInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	r := bufio.NewReaderSize(f, 1<<20)
 
 	got := make([]byte, len(magic))
 	if _, err := io.ReadFull(r, got); err != nil || string(got) != magic {
-		return nil, "", fmt.Errorf("artifact: bad magic in %s", path)
+		return nil, "", nil, fmt.Errorf("artifact: bad magic in %s", path)
 	}
 	hlen, err := binary.ReadUvarint(r)
 	if err != nil {
-		return nil, "", fmt.Errorf("artifact: header: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: header: %w", err)
 	}
 	if hlen == 0 || hlen > maxLen {
-		return nil, "", fmt.Errorf("artifact: header length %d out of range", hlen)
+		return nil, "", nil, fmt.Errorf("artifact: header length %d out of range", hlen)
 	}
 	hdr := make([]byte, hlen)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		return nil, "", fmt.Errorf("artifact: header: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: header: %w", err)
 	}
 	var m meta
 	if err := json.Unmarshal(hdr, &m); err != nil {
-		return nil, "", fmt.Errorf("artifact: header: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: header: %w", err)
 	}
 	if len(m.Grams) == 0 {
-		return nil, "", fmt.Errorf("artifact: header: missing grams")
+		return nil, "", nil, fmt.Errorf("artifact: header: missing grams")
 	}
 	if m.GramCount < 0 {
-		return nil, "", fmt.Errorf("artifact: header: negative gram_count %d", m.GramCount)
+		return nil, "", nil, fmt.Errorf("artifact: header: negative gram_count %d", m.GramCount)
 	}
 	if int64(m.GramCount) > fi.Size()/minPairBytes {
-		return nil, "", fmt.Errorf("artifact: header: gram_count %d implausible for %d-byte file", m.GramCount, fi.Size())
+		return nil, "", nil, fmt.Errorf("artifact: header: gram_count %d implausible for %d-byte file", m.GramCount, fi.Size())
 	}
 	hint := m.GramCount
 	if hint > maxMapHint {
@@ -146,36 +162,44 @@ func Load(path string) (*ngram.Index, string, error) {
 	for i := 0; i < m.GramCount; i++ {
 		glen, err := binary.ReadUvarint(r)
 		if err != nil {
-			return nil, "", fmt.Errorf("artifact: gram %d: %w", i, err)
+			return nil, "", nil, fmt.Errorf("artifact: gram %d: %w", i, err)
 		}
 		if glen == 0 || glen > maxLen {
-			return nil, "", fmt.Errorf("artifact: gram %d: length %d out of range", i, glen)
+			return nil, "", nil, fmt.Errorf("artifact: gram %d: length %d out of range", i, glen)
 		}
 		g := make([]byte, glen)
 		if _, err := io.ReadFull(r, g); err != nil {
-			return nil, "", fmt.Errorf("artifact: gram %d: %w", i, err)
+			return nil, "", nil, fmt.Errorf("artifact: gram %d: %w", i, err)
 		}
 		bm := roaring.New()
 		if _, err := bm.ReadFrom(r); err != nil {
-			return nil, "", fmt.Errorf("artifact: bitmap %d: %w", i, err)
+			return nil, "", nil, fmt.Errorf("artifact: bitmap %d: %w", i, err)
 		}
 		// Map assignment would silently keep only the last bitmap for a
 		// repeated gram — a silently-wrong index. Save never writes
 		// duplicates (sorted unique keys), so this is corruption; reject like
 		// exact.Restore rejects duplicate keys.
 		if _, dup := postings[string(g)]; dup {
-			return nil, "", fmt.Errorf("artifact: gram %d: duplicate gram %q", i, g)
+			return nil, "", nil, fmt.Errorf("artifact: gram %d: duplicate gram %q", i, g)
 		}
 		postings[string(g)] = bm
 	}
 	if _, err := r.ReadByte(); err != io.EOF {
-		return nil, "", fmt.Errorf("artifact: trailing data after %d grams in %s", m.GramCount, path)
+		return nil, "", nil, fmt.Errorf("artifact: trailing data after %d grams in %s", m.GramCount, path)
 	}
 	idx, err := ngram.Restore(ngram.Config{Grams: m.Grams, StripSpaces: m.StripSpaces}, postings, m.NumOrds)
 	if err != nil {
-		return nil, "", fmt.Errorf("artifact: %s: %w", path, err)
+		return nil, "", nil, fmt.Errorf("artifact: %s: %w", path, err)
 	}
-	return idx, m.Analyzer, nil
+	// An index holding ordinals cannot have been built from zero entries,
+	// so a zero record is a caller that passed no real info (or a
+	// hand-made file), not a genuinely empty list. Report it as absent
+	// rather than let it read as "every entry is unindexed".
+	build := m.Build
+	if build != nil && build.Entries == 0 && m.NumOrds > 0 {
+		build = nil
+	}
+	return idx, m.Analyzer, build, nil
 }
 
 func writeUvarint(w *bufio.Writer, v uint64) error {

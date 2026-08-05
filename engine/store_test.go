@@ -138,7 +138,7 @@ func TestStoreArtifactFastPathUsed(t *testing.T) {
 
 	b := ngram.NewBuilder(ngram.Config{Grams: []int{2, 3}, StripSpaces: true})
 	b.Add(0, []string{"dana kovak"})
-	if err := artifact.Save(filepath.Join(dir, "people", "base.idx"), b.Finish(), cfgDigest(t, personCfg())); err != nil {
+	if err := artifact.Save(filepath.Join(dir, "people", "base.idx"), b.Finish(), cfgDigest(t, personCfg()), artifact.BuildInfo{Entries: 1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -229,7 +229,7 @@ func TestStoreMismatchedArtifactFallsBack(t *testing.T) {
 	b.Add(0, []string{"marcus chen"})
 	b.Add(1, []string{"dana kovak"})
 	b.Add(2, []string{"rosa almeida"}) // 3 ords > 2 entries
-	if err := artifact.Save(filepath.Join(dir, "people", "base.idx"), b.Finish(), cfgDigest(t, personCfg())); err != nil {
+	if err := artifact.Save(filepath.Join(dir, "people", "base.idx"), b.Finish(), cfgDigest(t, personCfg()), artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -419,7 +419,7 @@ func TestStoreExactArtifactFastPathUsed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), doctored, cfgDigest(t, exactCfg())); err != nil {
+	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), doctored, cfgDigest(t, exactCfg()), artifact.BuildInfo{Entries: 2}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -474,7 +474,7 @@ func TestStoreExactMismatchedArtifactFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), oversized, cfgDigest(t, exactCfg())); err != nil {
+	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), oversized, cfgDigest(t, exactCfg()), artifact.BuildInfo{Entries: 3}); err != nil {
 		t.Fatal(err)
 	}
 

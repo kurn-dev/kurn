@@ -125,7 +125,7 @@ func TestPreDigestArtifactRebuilds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), doctored, ""); err != nil {
+	if err := artifact.SaveExact(filepath.Join(dir, "codes", "base.idx"), doctored, "", artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
 

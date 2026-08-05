@@ -51,10 +51,13 @@ type exactMeta struct {
 	// have no index-time knobs beyond the analyzer, so this digest IS the
 	// whole config-identity check for KURNEXA1.
 	Analyzer string `json:"analyzer,omitempty"`
+	// Build: see meta.Build in artifact.go — same contract, same "nil means
+	// unknown, so rebuild" handling.
+	Build *BuildInfo `json:"build,omitempty"`
 }
 
 // SaveExact atomically writes idx to path in KURNEXA1 format.
-func SaveExact(path string, idx *exact.Index, analyzerDigest string) error {
+func SaveExact(path string, idx *exact.Index, analyzerDigest string, build BuildInfo) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".idx-*")
 	if err != nil {
 		return err
@@ -71,7 +74,7 @@ func SaveExact(path string, idx *exact.Index, analyzerDigest string) error {
 		arenaLen += len(k)
 		postLen += len(idx.Lookup(k))
 	}
-	hdr, _ := json.Marshal(exactMeta{KeyCount: len(keys), PostingsLen: postLen, ArenaLen: arenaLen, Analyzer: analyzerDigest})
+	hdr, _ := json.Marshal(exactMeta{KeyCount: len(keys), PostingsLen: postLen, ArenaLen: arenaLen, Analyzer: analyzerDigest, Build: &build})
 	if err := writeUvarint(w, uint64(len(hdr))); err != nil {
 		return err
 	}
@@ -117,71 +120,71 @@ func SaveExact(path string, idx *exact.Index, analyzerDigest string) error {
 // Any structural problem — bad magic, implausible header, short section,
 // trailing bytes, inconsistent lengths — is an error; the caller falls back
 // to a rebuild.
-func LoadExact(path string) (*exact.Index, string, error) {
+func LoadExact(path string) (*exact.Index, string, *BuildInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	r := bufio.NewReaderSize(f, 1<<20)
 
 	got := make([]byte, len(exactMagic))
 	if _, err := io.ReadFull(r, got); err != nil || string(got) != exactMagic {
-		return nil, "", fmt.Errorf("artifact: bad exact magic in %s", path)
+		return nil, "", nil, fmt.Errorf("artifact: bad exact magic in %s", path)
 	}
 	hlen, err := binary.ReadUvarint(r)
 	if err != nil {
-		return nil, "", fmt.Errorf("artifact: exact header: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: exact header: %w", err)
 	}
 	if hlen == 0 || hlen > maxLen {
-		return nil, "", fmt.Errorf("artifact: exact header length %d out of range", hlen)
+		return nil, "", nil, fmt.Errorf("artifact: exact header length %d out of range", hlen)
 	}
 	hdr := make([]byte, hlen)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		return nil, "", fmt.Errorf("artifact: exact header: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: exact header: %w", err)
 	}
 	var m exactMeta
 	if err := json.Unmarshal(hdr, &m); err != nil {
-		return nil, "", fmt.Errorf("artifact: exact header: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: exact header: %w", err)
 	}
 	// Internal consistency: counts non-negative, every key needs >= 1 arena
 	// byte and >= 1 posting.
 	if m.KeyCount < 0 || m.PostingsLen < m.KeyCount || m.ArenaLen < m.KeyCount {
-		return nil, "", fmt.Errorf("artifact: exact header: inconsistent counts key_count=%d postings_len=%d arena_len=%d", m.KeyCount, m.PostingsLen, m.ArenaLen)
+		return nil, "", nil, fmt.Errorf("artifact: exact header: inconsistent counts key_count=%d postings_len=%d arena_len=%d", m.KeyCount, m.PostingsLen, m.ArenaLen)
 	}
 	// Plausibility against the file size, so a hostile header cannot trigger
 	// giant allocations.
 	if int64(m.KeyCount) > fi.Size()/minExactKeyBytes {
-		return nil, "", fmt.Errorf("artifact: exact header: key_count %d implausible for %d-byte file", m.KeyCount, fi.Size())
+		return nil, "", nil, fmt.Errorf("artifact: exact header: key_count %d implausible for %d-byte file", m.KeyCount, fi.Size())
 	}
 	if int64(m.ArenaLen) > fi.Size() {
-		return nil, "", fmt.Errorf("artifact: exact header: arena_len %d implausible for %d-byte file", m.ArenaLen, fi.Size())
+		return nil, "", nil, fmt.Errorf("artifact: exact header: arena_len %d implausible for %d-byte file", m.ArenaLen, fi.Size())
 	}
 	if int64(m.PostingsLen) > fi.Size()/4 {
-		return nil, "", fmt.Errorf("artifact: exact header: postings_len %d implausible for %d-byte file", m.PostingsLen, fi.Size())
+		return nil, "", nil, fmt.Errorf("artifact: exact header: postings_len %d implausible for %d-byte file", m.PostingsLen, fi.Size())
 	}
 
 	arena := make([]byte, m.ArenaLen)
 	if _, err := io.ReadFull(r, arena); err != nil {
-		return nil, "", fmt.Errorf("artifact: exact arena: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: exact arena: %w", err)
 	}
 	keyLens := make([]int, 0, min(m.KeyCount, maxSliceHint))
 	runLens := make([]int, 0, min(m.KeyCount, maxSliceHint))
 	for i := 0; i < m.KeyCount; i++ {
 		kl, err := binary.ReadUvarint(r)
 		if err != nil {
-			return nil, "", fmt.Errorf("artifact: exact key %d length: %w", i, err)
+			return nil, "", nil, fmt.Errorf("artifact: exact key %d length: %w", i, err)
 		}
 		rl, err := binary.ReadUvarint(r)
 		if err != nil {
-			return nil, "", fmt.Errorf("artifact: exact key %d run length: %w", i, err)
+			return nil, "", nil, fmt.Errorf("artifact: exact key %d run length: %w", i, err)
 		}
 		if kl > uint64(m.ArenaLen) || rl > uint64(m.PostingsLen) {
-			return nil, "", fmt.Errorf("artifact: exact key %d: lengths %d/%d exceed declared sections", i, kl, rl)
+			return nil, "", nil, fmt.Errorf("artifact: exact key %d: lengths %d/%d exceed declared sections", i, kl, rl)
 		}
 		keyLens = append(keyLens, int(kl))
 		runLens = append(runLens, int(rl))
@@ -190,18 +193,26 @@ func LoadExact(path string) (*exact.Index, string, error) {
 	// file size above, so this cannot allocate more than the file holds).
 	raw := make([]byte, 4*m.PostingsLen)
 	if _, err := io.ReadFull(r, raw); err != nil {
-		return nil, "", fmt.Errorf("artifact: exact postings: %w", err)
+		return nil, "", nil, fmt.Errorf("artifact: exact postings: %w", err)
 	}
 	postings := make([]uint32, m.PostingsLen)
 	for i := range postings {
 		postings[i] = binary.LittleEndian.Uint32(raw[4*i:])
 	}
 	if _, err := r.ReadByte(); err != io.EOF {
-		return nil, "", fmt.Errorf("artifact: trailing data after %d postings in %s", m.PostingsLen, path)
+		return nil, "", nil, fmt.Errorf("artifact: trailing data after %d postings in %s", m.PostingsLen, path)
 	}
 	idx, err := exact.Restore(arena, keyLens, runLens, postings)
 	if err != nil {
-		return nil, "", fmt.Errorf("artifact: %s: %w", path, err)
+		return nil, "", nil, fmt.Errorf("artifact: %s: %w", path, err)
 	}
-	return idx, m.Analyzer, nil
+	// An index holding ordinals cannot have been built from zero entries,
+	// so a zero record is a caller that passed no real info (or a
+	// hand-made file), not a genuinely empty list. Report it as absent
+	// rather than let it read as "every entry is unindexed".
+	build := m.Build
+	if build != nil && build.Entries == 0 && idx.NumOrds() > 0 {
+		build = nil
+	}
+	return idx, m.Analyzer, build, nil
 }

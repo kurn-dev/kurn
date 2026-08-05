@@ -437,22 +437,23 @@ func (st *Store) openList(name string) (*List, error) {
 // e.g. config.json hand-edited between restarts — so the artifact's keys are
 // normalized differently than queries would be; for exact indexes, which
 // have no other index-time knobs, the digest is the whole identity check),
-// a pre-digest artifact (unknown analyzer ⇒ rebuild once), or entries/
-// ordinal mismatch. Takes ownership of entries only on success.
+// a pre-digest artifact or one without build info (both unknown ⇒ rebuild
+// once, which is also what makes the restored loss counters trustworthy),
+// or entries/ordinal mismatch. Takes ownership of entries only on success.
 func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) bool {
 	wantDigest := AnalyzerSpecDigest(l.an)
 	if l.cfg.Match.Mode == "exact" {
-		idx, digest, err := artifact.LoadExact(idxPath)
-		if err != nil || digest == "" || digest != wantDigest {
+		idx, digest, build, err := artifact.LoadExact(idxPath)
+		if err != nil || digest == "" || digest != wantDigest || build == nil {
 			return false
 		}
-		return l.ReplaceWithExactIndex(entries, idx) == nil
+		return l.ReplaceWithExactIndexInfo(entries, idx, buildInfo(build)) == nil
 	}
 	if l.cfg.Match.Mode != "ngram" {
 		return false
 	}
-	idx, digest, err := artifact.Load(idxPath)
-	if err != nil || digest == "" || digest != wantDigest {
+	idx, digest, build, err := artifact.Load(idxPath)
+	if err != nil || digest == "" || digest != wantDigest || build == nil {
 		return false
 	}
 	want := ngram.Config{Grams: l.cfg.Match.Grams, StripSpaces: l.cfg.Match.StripSpaces}
@@ -460,7 +461,7 @@ func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) b
 	if !slices.Equal(got.Grams, want.Grams) || got.StripSpaces != want.StripSpaces {
 		return false
 	}
-	return l.ReplaceWithIndex(entries, idx) == nil
+	return l.ReplaceWithIndexInfo(entries, idx, buildInfo(build)) == nil
 }
 
 // CreateList creates (or PUT-replaces) a list: validates the name (it becomes
@@ -870,6 +871,14 @@ func (st *Store) persistBase(lp string, entries []Entry) (string, error) {
 	return id, syncDir(lp)
 }
 
+// buildInfo converts the artifact package's record into the engine's.
+func buildInfo(b *artifact.BuildInfo) *IndexBuildInfo {
+	if b == nil {
+		return nil
+	}
+	return &IndexBuildInfo{Entries: b.Entries, DroppedKeys: b.DroppedKeys, KeylessEntries: b.KeylessEntries}
+}
+
 // saveArtifact persists whichever base index the list's mode produced (at
 // most one of ng/ex is non-nil; both nil means no base — nothing to save) as
 // the list's base.idx, recording the digest of l's analyzer spec so the
@@ -877,12 +886,19 @@ func (st *Store) persistBase(lp string, entries []Entry) (string, error) {
 // Non-fatal by design — see Compact/Replace step comments.
 func (st *Store) saveArtifact(l *List, lp string, ng *ngram.Index, ex *exact.Index) {
 	digest := AnalyzerSpecDigest(l.an)
+	// The counters are recorded WITH the index because they cannot be
+	// recovered from it: a reload that skips analysis has no way to
+	// recompute them, and inferring them from the index misattributes
+	// analyzer loss as a stale artifact (see IndexBuildInfo).
+	dropped, keyless := l.BuildStats()
+	entries, _, _ := l.Stats()
+	build := artifact.BuildInfo{Entries: entries, DroppedKeys: dropped, KeylessEntries: keyless}
 	var err error
 	switch {
 	case ng != nil:
-		err = artifact.Save(filepath.Join(lp, idxFile), ng, digest)
+		err = artifact.Save(filepath.Join(lp, idxFile), ng, digest, build)
 	case ex != nil:
-		err = artifact.SaveExact(filepath.Join(lp, idxFile), ex, digest)
+		err = artifact.SaveExact(filepath.Join(lp, idxFile), ex, digest, build)
 	default:
 		return
 	}

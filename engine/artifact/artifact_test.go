@@ -29,10 +29,10 @@ const testDigest = "0123456789ab"
 func TestRoundTrip(t *testing.T) {
 	idx := buildIdx()
 	path := filepath.Join(t.TempDir(), "base.idx")
-	if err := artifact.Save(path, idx, testDigest); err != nil {
+	if err := artifact.Save(path, idx, testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
-	loaded, digest, err := artifact.Load(path)
+	loaded, digest, _, err := artifact.Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,10 +54,10 @@ func TestDeterministic(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.idx")
 	b := filepath.Join(dir, "b.idx")
-	if err := artifact.Save(a, buildIdx(), testDigest); err != nil {
+	if err := artifact.Save(a, buildIdx(), testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := artifact.Save(b, buildIdx(), testDigest); err != nil {
+	if err := artifact.Save(b, buildIdx(), testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
 	da, _ := os.ReadFile(a)
@@ -119,7 +119,7 @@ func TestRejectHostileGrams(t *testing.T) {
 		if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := artifact.Load(path); err == nil || !strings.Contains(err.Error(), "gram size") {
+		if _, _, _, err := artifact.Load(path); err == nil || !strings.Contains(err.Error(), "gram size") {
 			t.Errorf("header %s: want gram-size rejection, got: %v", tc, err)
 		}
 	}
@@ -137,7 +137,7 @@ func TestRejectDuplicateGramKeys(t *testing.T) {
 	b.Add(1, []string{"cd"}) // exactly two grams: "ab", "cd"
 	idx := b.Finish()
 	path := filepath.Join(t.TempDir(), "dup.idx")
-	if err := artifact.Save(path, idx, testDigest); err != nil {
+	if err := artifact.Save(path, idx, testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -153,7 +153,7 @@ func TestRejectDuplicateGramKeys(t *testing.T) {
 	if err := os.WriteFile(path, doctored, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := artifact.Load(path); err == nil || !strings.Contains(err.Error(), "duplicate") {
+	if _, _, _, err := artifact.Load(path); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("want duplicate-gram rejection, got: %v", err)
 	}
 }
@@ -161,22 +161,22 @@ func TestRejectDuplicateGramKeys(t *testing.T) {
 func TestRejectCorrupt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.idx")
 	os.WriteFile(path, []byte("not an artifact"), 0o644)
-	if _, _, err := artifact.Load(path); err == nil {
+	if _, _, _, err := artifact.Load(path); err == nil {
 		t.Fatal("want error for corrupt file")
 	}
 	// truncated: write a valid one, cut it in half
 	good := filepath.Join(t.TempDir(), "good.idx")
-	if err := artifact.Save(good, buildIdx(), testDigest); err != nil {
+	if err := artifact.Save(good, buildIdx(), testDigest, artifact.BuildInfo{}); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(good)
 	os.WriteFile(path, data[:len(data)/2], 0o644)
-	if _, _, err := artifact.Load(path); err == nil {
+	if _, _, _, err := artifact.Load(path); err == nil {
 		t.Fatal("want error for truncated file")
 	}
 	// trailing data: a valid artifact with extra bytes appended
 	os.WriteFile(path, append(append([]byte{}, data...), 0xff), 0o644)
-	if _, _, err := artifact.Load(path); err == nil {
+	if _, _, _, err := artifact.Load(path); err == nil {
 		t.Fatal("want error for trailing data")
 	}
 }
@@ -197,7 +197,7 @@ func TestRejectHostileGramCount(t *testing.T) {
 	}
 	// Require the plausibility rejection specifically: pre-fix code also
 	// errored eventually, but only after preallocating a ~1.8GB postings map.
-	if _, _, err := artifact.Load(path); err == nil || !strings.Contains(err.Error(), "implausible") {
+	if _, _, _, err := artifact.Load(path); err == nil || !strings.Contains(err.Error(), "implausible") {
 		t.Fatalf("want plausibility-bound error for hostile gram_count, got: %v", err)
 	}
 }
@@ -227,7 +227,7 @@ func BenchmarkSave(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := artifact.Save(filepath.Join(dir, fmt.Sprintf("big-%d.idx", i)), idx, testDigest); err != nil {
+		if err := artifact.Save(filepath.Join(dir, fmt.Sprintf("big-%d.idx", i)), idx, testDigest, artifact.BuildInfo{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -236,7 +236,7 @@ func BenchmarkSave(b *testing.B) {
 func BenchmarkLoad(b *testing.B) {
 	idx := buildBigIdx(b)
 	path := filepath.Join(b.TempDir(), "big.idx")
-	if err := artifact.Save(path, idx, testDigest); err != nil {
+	if err := artifact.Save(path, idx, testDigest, artifact.BuildInfo{}); err != nil {
 		b.Fatal(err)
 	}
 	if fi, err := os.Stat(path); err == nil {
@@ -245,7 +245,7 @@ func BenchmarkLoad(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, _, err := artifact.Load(path); err != nil {
+		if _, _, _, err := artifact.Load(path); err != nil {
 			b.Fatal(err)
 		}
 	}

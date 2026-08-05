@@ -65,8 +65,12 @@ func TestBuildStatsCountsAnalyzedAwayKeys(t *testing.T) {
 // entries, so a stale-index crash window stays recoverable instead of
 // fatal. The entries past the index's reach are then live, counted in
 // Stats(), and findable by nothing — the same invisible loss a keyless
-// entry is, with a different cause. UnindexedEntries is what makes it
-// visible.
+// entry is, with a different cause.
+//
+// Which cause it is cannot be read off the index: an entry whose keys all
+// analyzed away contributes no postings and lowers the highest ordinal
+// exactly as a missing entry does. The count therefore travels WITH the
+// index (IndexBuildInfo) instead of being inferred from it.
 func TestUnindexedEntriesAreCounted(t *testing.T) {
 	entries := []engine.Entry{
 		{ID: "p1", Keys: []string{"Marcus Chen"}},
@@ -74,11 +78,12 @@ func TestUnindexedEntriesAreCounted(t *testing.T) {
 		{ID: "p3", Keys: []string{"Clara Diaz"}},
 	}
 	// An index over the first two only: a base.idx one publish behind its
-	// base.jsonl.
+	// base.jsonl, and it says so.
 	idx := buildIdx(t, "marcus chen", "dana kovak")
+	stale := &engine.IndexBuildInfo{Entries: 2}
 
 	l := personList(t)
-	if err := l.ReplaceWithIndex(entries, idx); err != nil {
+	if err := l.ReplaceWithIndexInfo(entries, idx, stale); err != nil {
 		t.Fatal(err)
 	}
 	if got := l.UnindexedEntries(); got != 1 {
@@ -98,16 +103,25 @@ func TestUnindexedEntriesAreCounted(t *testing.T) {
 			t.Fatalf("the unindexed entry was findable after all: %+v", c)
 		}
 	}
-	if c := l.Query("dana kovak", engine.QueryOpts{}); len(c) != 1 {
-		t.Fatalf("an INDEXED entry stopped matching: %+v", c)
-	}
-	// A list whose index covers everything reports zero, so the number
-	// means what it says.
+
+	// An index that covers every entry reports zero even though the same
+	// arithmetic on ordinals would not: this is the case the old inference
+	// got wrong.
 	full := personList(t)
-	if err := full.ReplaceWithIndex(entries[:2], idx); err != nil {
+	if err := full.ReplaceWithIndexInfo(entries[:2], idx, &engine.IndexBuildInfo{Entries: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if got := full.UnindexedEntries(); got != 0 {
 		t.Fatalf("fully indexed list reports %d unindexed entries, want 0", got)
+	}
+
+	// With no build info nothing is claimed. Reporting zero for an unknown
+	// is wrong, but inferring it from the index names the wrong repair.
+	quiet := personList(t)
+	if err := quiet.ReplaceWithIndex(entries, idx); err != nil {
+		t.Fatal(err)
+	}
+	if got := quiet.UnindexedEntries(); got != 0 {
+		t.Fatalf("a list given no build info claimed %d unindexed entries", got)
 	}
 }

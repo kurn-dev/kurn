@@ -339,6 +339,14 @@ func (l *List) CommitCompact(b *compactBuild, id string) {
 // index crash window recoverable instead of fatal. Takes ownership of entries
 // like Replace.
 func (l *List) ReplaceWithIndex(entries []Entry, idx *ngram.Index) error {
+	return l.ReplaceWithIndexInfo(entries, idx, nil)
+}
+
+// ReplaceWithIndexInfo is ReplaceWithIndex carrying the index's build info
+// (see IndexBuildInfo). Pass nil when it is genuinely unknown: the loss
+// counters then read zero rather than being inferred from the index, which
+// cannot distinguish a stale artifact from entries that analyzed to nothing.
+func (l *List) ReplaceWithIndexInfo(entries []Entry, idx *ngram.Index, bi *IndexBuildInfo) error {
 	if l.cfg.Match.Mode != "ngram" {
 		return fmt.Errorf("list %s: ReplaceWithIndex requires ngram mode, have %q", l.name, l.cfg.Match.Mode)
 	}
@@ -350,7 +358,7 @@ func (l *List) ReplaceWithIndex(entries []Entry, idx *ngram.Index) error {
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
 	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ng: idx}
-	seg.unindexedEntries = len(entries) - int(idx.NumOrds())
+	seg.applyBuildInfo(bi, len(entries))
 	for i := range entries {
 		seg.byID[entries[i].ID] = uint32(i)
 		seg.totalKeys += len(entries[i].Keys)
@@ -367,6 +375,12 @@ func (l *List) ReplaceWithIndex(entries []Entry, idx *ngram.Index) error {
 // panic later in Query), while NumOrds < len(entries) is tolerated. Takes
 // ownership of entries like Replace.
 func (l *List) ReplaceWithExactIndex(entries []Entry, idx *exact.Index) error {
+	return l.ReplaceWithExactIndexInfo(entries, idx, nil)
+}
+
+// ReplaceWithExactIndexInfo is ReplaceWithExactIndex carrying build info; see
+// ReplaceWithIndexInfo.
+func (l *List) ReplaceWithExactIndexInfo(entries []Entry, idx *exact.Index, bi *IndexBuildInfo) error {
 	if l.cfg.Match.Mode != "exact" {
 		return fmt.Errorf("list %s: ReplaceWithExactIndex requires exact mode, have %q", l.name, l.cfg.Match.Mode)
 	}
@@ -378,6 +392,7 @@ func (l *List) ReplaceWithExactIndex(entries []Entry, idx *exact.Index) error {
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
 	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ex: idx}
+	seg.applyBuildInfo(bi, len(entries))
 	for i := range entries {
 		seg.byID[entries[i].ID] = uint32(i)
 		seg.totalKeys += len(entries[i].Keys)
@@ -869,6 +884,34 @@ func (l *List) BuildStats() (droppedKeys, keylessEntries int) {
 		}
 	}
 	return droppedKeys, keylessEntries
+}
+
+// IndexBuildInfo is what a prebuilt index cannot state about itself: how
+// many base entries it was built from, and that build's loss counters.
+//
+// The entry count is the load-bearing part. An index reports its highest
+// ordinal, which drops both when the artifact is STALE (built from fewer
+// entries than base.jsonl now holds) and when the final entries analyzed to
+// nothing — indistinguishable causes with different repairs. Carrying the
+// count separates them.
+type IndexBuildInfo struct {
+	Entries        int
+	DroppedKeys    int
+	KeylessEntries int
+}
+
+// applyBuildInfo sets a prebuilt segment's loss counters. With no info the
+// segment claims nothing: reporting zero for something unknown is wrong, but
+// inferring it from the index is wrong in a way that names the wrong repair.
+func (seg *segment) applyBuildInfo(bi *IndexBuildInfo, n int) {
+	if bi == nil {
+		return
+	}
+	seg.droppedKeys = bi.DroppedKeys
+	seg.keylessEntries = bi.KeylessEntries
+	if u := n - bi.Entries; u > 0 {
+		seg.unindexedEntries = u
+	}
 }
 
 // UnindexedEntries returns how many entries the current snapshot holds that

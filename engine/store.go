@@ -210,6 +210,12 @@ func syncPath(path string) error {
 	return f.Close()
 }
 
+// syncJournalTruncate makes a journal truncation power-loss-durable; a seam
+// so tests can pin WHEN it happens (after the truncate, before the in-memory
+// install acknowledges) — real power loss is not reproducible in a test.
+// Production is syncPath.
+var syncJournalTruncate = syncPath
+
 // syncDir fsyncs a directory, making a rename inside it power-loss-durable.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
@@ -834,10 +840,13 @@ func (st *Store) maybeAutoCompact(name string, ls *listState, l *List) {
 //     journal over the already-folded base — idempotent for the live set
 //     (upsert of an identical entry / delete of an absent one), scores may
 //     differ from the never-acknowledged fold, which is fine.
-//  5. truncate journal — only after the new base is fully in place. A
-//     FAILED truncate returns the error with memory still pre-compact: the
-//     served state matches what was acknowledged, disk recovers to the same
-//     live set on restart.
+//  5. truncate journal AND fsync the truncation — only after the new base
+//     is fully in place, and durably before (6): the new base's rename is
+//     already synced, so an unsynced truncate could survive power loss as
+//     "new base + old journal" for an ACKNOWLEDGED fold, replaying stale
+//     mutations over it. A FAILED truncate or sync returns the error with
+//     memory still pre-compact: the served state matches what was
+//     acknowledged, disk recovers to the same live set on restart.
 //  6. l.CommitCompact — the in-memory swap, stamped with the persisted
 //     content hash. Acknowledged from here.
 //  7. artifact.Save base.idx — LAST and non-fatal: the artifact is a pure
@@ -872,8 +881,18 @@ func (st *Store) CompactVersioned(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil && !os.IsNotExist(err) {
-		return "", err // a missing journal is already empty
+	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil {
+		if !os.IsNotExist(err) {
+			return "", err // a missing journal is already empty
+		}
+	} else if err := syncJournalTruncate(filepath.Join(lp, journalFile)); err != nil {
+		// The truncate must be DURABLE before the fold is acknowledged:
+		// power loss can otherwise keep the new base (synced by
+		// persistBase) while the journal's shorter length is lost, and
+		// restart would replay the pre-compact journal over the folded
+		// base. Failing here leaves memory pre-compact — the acknowledged
+		// state — exactly like a failed truncate.
+		return "", err
 	}
 	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
 	ls.journalDamaged = false
@@ -897,7 +916,9 @@ func (st *Store) CompactVersioned(name string) (string, error) {
 //     pre-replace ops onto the new base — an anomaly, but only for a Replace
 //     that was never acknowledged; truncating the journal BEFORE (4) instead
 //     would lose acknowledged upserts/deletes on a crash between the two.
-//  5. truncate journal.
+//  5. truncate journal and fsync the truncation, so the acknowledged
+//     replacement cannot power-loss back into "new base + old journal" —
+//     which would resurrect the entries the Replace removed.
 //  6. install the prebuilt segment in memory — memory now equals disk and the
 //     operation is acknowledged from here on.
 //  7. artifact.Save base.idx — LAST and non-fatal (pure cache, rebuild
@@ -936,7 +957,15 @@ func (st *Store) ReplaceVersioned(name string, entries []Entry) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil && !os.IsNotExist(err) {
+	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil {
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+	} else if err := syncJournalTruncate(filepath.Join(lp, journalFile)); err != nil {
+		// Durable before acknowledgment, or the old journal can outlive
+		// power loss and replay over the acknowledged replacement —
+		// resurrecting the very entries the Replace removed. See Compact
+		// for the identical reasoning.
 		return "", err
 	}
 	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file

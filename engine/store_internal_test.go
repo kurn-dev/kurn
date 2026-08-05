@@ -266,3 +266,78 @@ func TestStorePerListLocking(t *testing.T) {
 		t.Fatal("Upsert(b) still blocked after unlock")
 	}
 }
+
+// TestJournalTruncateSyncedBeforeAck: Replace and Compact must make the
+// journal truncation DURABLE (fsync) after truncating and before the
+// in-memory install acknowledges. The base rename is already synced, so a
+// power loss that keeps the rename but loses an unsynced truncate would
+// replay the old journal over an acknowledged replacement, resurrecting
+// deleted entries. Real power loss is untestable here; this pins the order
+// through the seam: at sync time the file must already be empty and the
+// list must still serve the PRE-operation state (the ack has not happened).
+func TestJournalTruncateSyncedBeforeAck(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatal(err)
+	}
+	// A journaled mutation gives both operations a non-empty journal to
+	// truncate and something the pre-ack check can observe.
+	if err := st.Upsert("people", []Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+	l, _ := st.List("people")
+
+	var synced int
+	check := func(op string, path string) error {
+		synced++
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("%s: sync called on unstatable journal: %v", op, err)
+		} else if fi.Size() != 0 {
+			t.Errorf("%s: sync called before the truncate (size %d)", op, fi.Size())
+		}
+		return syncPath(path)
+	}
+
+	// Replace: at sync time the OLD content must still serve — the install
+	// (= the acknowledgment) comes after the durability point.
+	syncJournalTruncate = func(path string) error {
+		if c := l.Query("marcus chen", QueryOpts{}); len(c) != 1 || c[0].EntryID != "p1" {
+			t.Errorf("replace: acknowledged (new content serving) before the truncate was durable: %+v", c)
+		}
+		return check("replace", path)
+	}
+	defer func() { syncJournalTruncate = syncPath }()
+	if err := st.Replace("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if synced != 1 {
+		t.Fatalf("replace did not sync its journal truncation (synced=%d)", synced)
+	}
+
+	// Compact: journal a mutation again, then fold. At sync time the
+	// pre-compact version must still be the served one.
+	if err := st.Upsert("people", []Entry{{ID: "p3", Keys: []string{"Iris Bell"}}}); err != nil {
+		t.Fatal(err)
+	}
+	vBefore := l.Version()
+	syncJournalTruncate = func(path string) error {
+		if v := l.Version(); v != vBefore {
+			t.Errorf("compact: acknowledged (version %q -> %q) before the truncate was durable", vBefore, v)
+		}
+		return check("compact", path)
+	}
+	if err := st.Compact("people"); err != nil {
+		t.Fatal(err)
+	}
+	if synced != 2 {
+		t.Fatalf("compact did not sync its journal truncation (synced=%d)", synced)
+	}
+	if v := l.Version(); v == vBefore {
+		t.Fatal("compact did not commit; the order check proved nothing")
+	}
+}

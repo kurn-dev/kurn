@@ -81,10 +81,27 @@ type List struct {
 }
 
 // NewList validates config and returns an empty list.
+// maxListTopK bounds a list's default topK. Far above any useful value —
+// the server caps a request at 1000 — and low enough that topK plus the
+// tombstone count cannot overflow the per-segment cut.
+const maxListTopK = 1 << 20
+
 func NewList(name string, cfg ListConfig) (*List, error) {
 	an, err := ResolveAnalyzer(cfg.Analyzer)
 	if err != nil {
 		return nil, err
+	}
+	// Threshold/TopK carry a NEGATIVE sentinel per QUERY (see QueryOpts),
+	// never per list: a config is a set of defaults, and "default to no
+	// floor at all" or "default to unlimited" are not defaults anyone
+	// writes on purpose. Unvalidated, a hand-edited config.json loaded
+	// straight into the maximal-scan, unlimited-collection shape, and a
+	// near-MaxInt topk overflowed segK (topK + len(masked)) negative.
+	if cfg.Match.Threshold < 0 || cfg.Match.Threshold > 1 {
+		return nil, fmt.Errorf("list %s: match threshold %v out of range [0, 1] (0 means the mode default; the no-floor sentinel is per-query, not per-list)", name, cfg.Match.Threshold)
+	}
+	if cfg.Match.TopK < 0 || cfg.Match.TopK > maxListTopK {
+		return nil, fmt.Errorf("list %s: match topk %d out of range [0, %d] (0 means the mode default; the unlimited sentinel is per-query, not per-list)", name, cfg.Match.TopK, maxListTopK)
 	}
 	switch cfg.Match.Mode {
 	case "ngram":

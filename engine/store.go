@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -252,12 +253,15 @@ const (
 // listNameRE validates list names, which become directory names.
 var listNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
-// sweepTempFiles removes .base-* / .cfg-* survivors of crashed atomic writes
-// (writeBaseTemp / writeFileAtomic clean up via defers, which a crash skips).
+// sweepTempFiles removes .base-* / .cfg-* / .idx-* survivors of crashed
+// atomic writes (writeBaseTemp / writeFileAtomic / artifact.Save clean up via
+// defers, which a crash skips). Every CreateTemp prefix under a list
+// directory must appear here: one missed prefix leaks one file per crash,
+// forever, since nothing else ever looks at them.
 // Best-effort: a failed remove just leaves the orphan for the next Open. Runs
 // at Open, when no writer can be mid-flight.
 func sweepTempFiles(lp string) {
-	for _, pat := range []string{".base-*", ".cfg-*"} {
+	for _, pat := range []string{".base-*", ".cfg-*", ".idx-*"} {
 		matches, _ := filepath.Glob(filepath.Join(lp, pat))
 		for _, m := range matches {
 			os.Remove(m)
@@ -1013,7 +1017,16 @@ func readJournal(path string) (ops []journalRec, tornAt int64, err error) {
 	r := bufio.NewReaderSize(f, 64*1024)
 	var off int64 // end of the last intact (newline-terminated, parseable) record
 	for {
-		line, rerr := r.ReadBytes('\n')
+		line, rerr := readBoundedLine(r, maxLine)
+		if rerr == errJournalLineTooLong {
+			// Every writer size-checks before appending, so an oversize
+			// record is corruption by definition. Treat it exactly like an
+			// unparseable one — keep the prefix that replayed cleanly and
+			// let the caller truncate — instead of failing openList, which
+			// would skip the WHOLE list: harsher than the quarantine an
+			// merely unparseable journal gets, for a strictly worse file.
+			return ops, off, nil
+		}
 		if rerr != nil {
 			if rerr == io.EOF {
 				if len(line) > 0 {
@@ -1023,9 +1036,7 @@ func readJournal(path string) (ops []journalRec, tornAt int64, err error) {
 			}
 			return nil, -1, fmt.Errorf("%s: %w", filepath.Base(path), rerr)
 		}
-		if len(line) > maxLine {
-			return nil, -1, fmt.Errorf("%s: line longer than %d bytes", filepath.Base(path), maxLine)
-		}
+
 		body := line[:len(line)-1] // strip '\n'
 		if len(body) > 0 {
 			var rec journalRec
@@ -1035,6 +1046,29 @@ func readJournal(path string) (ops []journalRec, tornAt int64, err error) {
 			ops = append(ops, rec)
 		}
 		off += int64(len(line))
+	}
+}
+
+var errJournalLineTooLong = errors.New("journal record exceeds the line bound")
+
+// readBoundedLine reads one newline-terminated record without materializing
+// more than max bytes. ReadBytes would slurp first and let the caller judge
+// afterwards, so a journal whose tail is one enormous newline-less blob (a
+// truncated write, a corrupted file) was read whole at Open purely to be
+// thrown away. Returns io.EOF alongside a final unterminated record, as
+// ReadBytes does.
+func readBoundedLine(r *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, rerr := r.ReadSlice('\n')
+		if len(line)+len(chunk) > max {
+			return nil, errJournalLineTooLong
+		}
+		line = append(line, chunk...) // chunk is valid only until the next read
+		if rerr == bufio.ErrBufferFull {
+			continue
+		}
+		return line, rerr
 	}
 }
 

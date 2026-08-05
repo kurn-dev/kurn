@@ -1,13 +1,20 @@
 # kurn
 
-**In-memory search that shows its work.**
+**Fuzzy lookup, next to your code.**
 
-General fast list lookup: a Go library for fuzzy (character-ngram) and exact
-matching of a query string against large in-memory lists — person names,
-merchants, domains, SKUs — plus a small HTTP service (`kurnd`) that serves
-a directory of such lists. Every answer carries the content-addressed
+kurn is an in-memory engine for matching short strings — product names,
+customers, domains, denylists, any list you have. Typo-tolerant
+(character-ngram, IDF-weighted, scored 0–100) or exact, it runs as a Go
+library inside your service or as a sidecar (`kurnd`) beside it, so there is
+no search cluster to maintain. Every answer carries the content-addressed
 version of the data it was computed against: same query, same version, same
 result — byte for byte, on any machine, forever.
+
+A common shape: your database stays the system of record, a query exports the
+rows worth matching, `kurn build` turns them into a content-addressed bundle,
+and every instance answers lookups from its own copy. The database then sees
+one query per refresh instead of one per lookup — independent of how much
+traffic you serve or how many instances you run.
 
 kurn is built on measured algorithm choices: the character 2+3-gram
 roaring-bitmap inverted index, the IDF-scored pigeonhole candidate scan,
@@ -218,42 +225,43 @@ func main() {
 
 ## Performance
 
-Measured at 10M keys (person-name preset, grams 2+3, threshold 0.6, Apple M1
-Pro) — full tables, methodology, and the caveats that qualify every one of
-these numbers are in [bench/README.md](bench/README.md):
+Every figure comes from `cmd/kurn bench`. Latency depends on corpus size, so
+each one names its corpus and its machine; full tables, methodology and the
+caveats that qualify them are in [bench/README.md](bench/README.md).
 
-- **Memory**: ~114 B/key end-to-end for a list (of which ≈69 B/key is the
-  postings index, the rest the ID→ordinal map); HeapAlloc-delta estimates.
-- **Latency**: scale-dependent. At real-list scale — 148,837 entries, the
-  five public sanctions/exclusion lists — p50 0.91 ms and 6,022 q/s on a
-  4 vCPU server (8 concurrent clients). At 10M synthetic keys on a 16 GB
-  laptop: p50 13.2 ms / p99 30.5 ms, single-threaded QPS 71 (the scan
-  dominates at that scale; Lookup scales with cores). Latency drops as the
-  threshold rises.
-- **Recall**: 0.940 overall right-entity recall at 0.6 (0.975 at 0.45, at
-  ~3× the latency) on self-generated synthetic perturbations — an easier
-  corpus than real-world name data, so the *shape* (per-category floors,
-  threshold trade-off) is the transferable claim, not the level. First
-  ground-truth run (OFAC SDN aliases, indexed as shipped): 1.000 at 0.6 —
-  see bench/README.md.
-- **Exact mode** (measured at 2M keys, identifier preset,
-  `go run ./cmd/kurn bench -n 2000000 -sample 500 -seed 42 -mode exact`):
-  - **Memory**: 133.0 B/key end-to-end (packed postings + key arena; was
-    192.9 B/key before the rework, −31%).
-  - **Latency**: p50 0 µs / p99 4 µs per query, single-threaded QPS 925k.
-- **Cold open**: both list modes reopen via a serialized index artifact
-  (`base.idx`), skipping the index rebuild. The artifact is saved on
-  Replace/Compact and is a pure cache: any load failure — including an
-  analyzer-config change, detected via the recorded analyzer digest —
-  falls back to a full rebuild.
+**Fuzzy (ngram) lists**, person-name preset, grams 2+3, threshold 0.6:
+
+| corpus | machine | p50 | throughput |
+|---|---|---|---|
+| 148,837 entries (five public screening lists) | 4 vCPU server | 0.91 ms | 6,022 q/s, 8 clients |
+| 10M synthetic keys | M1 Pro laptop | 13.2 ms | 71 q/s, single-threaded |
+
+- **Memory**: ~114 B/key end-to-end (≈69 B/key postings, the rest the
+  ID→ordinal map; HeapAlloc-delta estimates). The five public lists serve in
+  about 126 MB.
+- **Recall**: 0.940 overall right-entity recall at threshold 0.6, and 0.975
+  at 0.45 for roughly 3× the latency — measured on synthetic perturbations,
+  which are an easier corpus than real-world name data, so the *shape*
+  (per-class floors, threshold trade-off) is the transferable claim rather
+  than the level. On real ground truth (OFAC SDN aliases, indexed the way
+  screening lists actually ship): 1.000.
+
+**Exact lists**, identifier preset, 2M keys: 133 B/key, p99 4 µs, 925k
+queries/s single-threaded.
+
+**Cold open**: both modes reopen from the serialized index artifact
+(`base.idx`) instead of rebuilding — 0.91 s at 1M keys, against 5.5 s for a
+full rebuild. The artifact is a pure cache: any load failure, including an
+analyzer change detected through its recorded digest, falls back to a
+rebuild. Recovery time is open time.
 
 ## Ingestion: mapping, dry-run, bundles
 
-Real feeds (OFAC XML, CSV exports, NDJSON dumps) load through a
-declarative **mapping** instead of custom code — dot-paths, per-instance
-equals-only filters, multi-path joins (see
-[docs/examples/ofac.mapping.json](docs/examples/ofac.mapping.json),
-which reproduces the hand-rolled OFAC extractor exactly):
+Any feed — a database export, a CSV, an XML publication, an NDJSON dump —
+loads through a declarative **mapping** instead of custom code: dot-paths,
+per-instance equals-only filters, multi-path joins. The examples in
+[docs/examples/](docs/examples/) map the major public screening lists;
+the same file shape maps a `SELECT` from your own tables:
 
 ```sh
 # 1. Gate: what would this feed become? (CI-able: exits 1 over the rate)

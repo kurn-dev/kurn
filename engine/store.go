@@ -491,8 +491,13 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 	// contents are indeterminate) instead of serving a config-less dir or —
 	// worse — the OLD config over wiped data (silent revert). Removed only
 	// after the new config is durably in place.
+	// The marker must reach the disk BEFORE the wipe, not merely the page
+	// cache: on power loss the removes can persist while an unsynced marker
+	// does not, leaving exactly the old-config-over-wiped-data state the
+	// marker exists to prevent. writeFileAtomic fsyncs the file and the
+	// directory entry, so once it returns a crash cannot lose the bracket.
 	mp := filepath.Join(lp, markerFile)
-	if err := os.WriteFile(mp, []byte("create/replace in progress\n"), 0o644); err != nil {
+	if err := writeFileAtomic(mp, []byte("create/replace in progress\n")); err != nil {
 		return nil, err
 	}
 	// PUT-replace semantics: prior snapshot/journal are gone.

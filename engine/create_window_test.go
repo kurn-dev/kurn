@@ -138,3 +138,59 @@ func TestCreateListLeavesNoMarker(t *testing.T) {
 		t.Fatal("marker present after successful CreateList")
 	}
 }
+
+// The marker brackets the wipe, so it must be on disk BEFORE the first
+// destructive step — otherwise a crash inside the window leaves the old
+// config over wiped data, the exact silent revert the marker prevents.
+//
+// fsync itself is not observable in-process, so this pins the half that is:
+// the ordering. The wipe is forced to fail (a data file replaced by a
+// non-empty directory, which os.Remove refuses with ENOTEMPTY) and the
+// marker must already be present when it does — then Open must skip the
+// list rather than serve its stale config.
+func TestCreateListMarkerPrecedesWipe(t *testing.T) {
+	dir := t.TempDir()
+	st, err := engine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("codes", exactCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Replace("codes", []engine.Entry{{ID: "c1", Keys: []string{"AA-1"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make the base file undeletable: a directory with a child in it.
+	base := filepath.Join(dir, "codes", "base.jsonl")
+	if err := os.Remove(base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "blocker"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The replace must fail in the wipe, after the marker is written.
+	if _, err := st.CreateList("codes", exactCfg()); err == nil {
+		t.Fatal("CreateList succeeded despite an undeletable base file")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "codes", ".creating")); err != nil {
+		t.Fatalf("marker absent after a failed wipe — the window is unbracketed: %v", err)
+	}
+
+	// With the marker down, a reopen refuses to serve the indeterminate list
+	// instead of falling back to its previous config.
+	st2, err := engine.Open(dir)
+	if err != nil {
+		t.Fatalf("interrupted create blocked the whole store: %v", err)
+	}
+	if _, ok := st2.List("codes"); ok {
+		t.Fatal("list with a live marker was served")
+	}
+	if len(st2.Skipped) != 1 || st2.Skipped[0].List != "codes" {
+		t.Fatalf("Skipped = %+v, want one entry for codes", st2.Skipped)
+	}
+}

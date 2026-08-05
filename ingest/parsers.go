@@ -8,19 +8,36 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // parseNDJSON: one JSON object per line, 1 MiB line bound (the engine's),
-// blank lines skipped but counted for record numbering.
+// blank lines skipped but counted for record numbering. An oversize line
+// is a bad record like any other — bufio.Scanner could not express that
+// (ErrTooLong ends the scan, and names no record), so the line reader
+// below drains past it instead.
 func parseNDJSON(r io.Reader, m *Mapping, handle func(any, int) error) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), MaxRecordBytes)
+	br := bufio.NewReaderSize(r, 64*1024)
 	recNo := 0
-	for sc.Scan() {
+	for {
+		line, over, err := readRecordLine(br, MaxRecordBytes)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		recNo++
-		line := bytes.TrimSpace(sc.Bytes())
+		if over {
+			if herr := handle(badDoc{fmt.Errorf("record exceeds the %d-byte bound", MaxRecordBytes)}, recNo); herr != nil {
+				return herr
+			}
+			continue
+		}
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
@@ -37,13 +54,37 @@ func parseNDJSON(r io.Reader, m *Mapping, handle func(any, int) error) error {
 			return err
 		}
 	}
-	if err := sc.Err(); err != nil {
-		if err == bufio.ErrTooLong {
-			return fmt.Errorf("ingest: record exceeds the %d-byte bound", MaxRecordBytes)
+}
+
+// readRecordLine reads one newline-terminated record. A line past max is
+// never held: the excess is drained to the terminator, so the stream stays
+// positioned at the next record and the caller can report the oversize one
+// by number and carry on. io.EOF means no bytes remain — a final line with
+// no trailing newline is returned normally first.
+func readRecordLine(br *bufio.Reader, max int) (line []byte, over bool, err error) {
+	for {
+		chunk, rerr := br.ReadSlice('\n')
+		switch {
+		case over: // already past the bound: drain, keep nothing
+		case len(line)+len(chunk) > max:
+			over, line = true, nil
+		default:
+			line = append(line, chunk...) // chunk is valid only until the next read
 		}
-		return err
+		switch rerr {
+		case bufio.ErrBufferFull:
+			continue
+		case io.EOF:
+			if len(line) == 0 && !over {
+				return nil, false, io.EOF
+			}
+			return line, over, nil
+		case nil:
+			return line, over, nil
+		default:
+			return nil, false, rerr
+		}
 	}
-	return nil
 }
 
 // badDoc marks a record that failed to decode; mapRecord turns it into a
@@ -51,10 +92,21 @@ func parseNDJSON(r io.Reader, m *Mapping, handle func(any, int) error) error {
 // records alike.
 type badDoc struct{ err error }
 
+// maxCSVInputPerRecord is the memory backstop for csv.Reader, which
+// materializes a whole record before returning it: without a ceiling one
+// unterminated quote turns a 10 GB feed into a 10 GB allocation, and the
+// package's "a 10 GB input never resides in memory" promise is only true
+// for well-formed input. Deliberately far above MaxRecordBytes — a row
+// between the two bounds is a bad record the run can skip, and only a row
+// past this one is fatal, because a record that never ends leaves nowhere
+// to resynchronize to.
+const maxCSVInputPerRecord = 16 * MaxRecordBytes
+
 // parseCSV: header row names the columns; each row becomes a
 // map[string]string doc. Paths are column names verbatim.
 func parseCSV(r io.Reader, m *Mapping, handle func(any, int) error) error {
-	cr := csv.NewReader(r)
+	lr := &recordLimitReader{r: r, max: maxCSVInputPerRecord}
+	cr := csv.NewReader(lr)
 	cr.FieldsPerRecord = -1 // ragged rows surface as missing fields, not reader errors
 	if m.Delimiter != "" {
 		cr.Comma = []rune(m.Delimiter)[0]
@@ -63,15 +115,45 @@ func parseCSV(r io.Reader, m *Mapping, handle func(any, int) error) error {
 	if err != nil {
 		return fmt.Errorf("ingest: csv header: %w", err)
 	}
+	// A repeated column name would make the doc keep only the last one,
+	// so every path naming it silently reads a different column than the
+	// mapping's author looked at.
+	seen := make(map[string]bool, len(header))
+	for _, col := range header {
+		if col == "" {
+			continue // trailing commas name nothing; no path can address them
+		}
+		if seen[col] {
+			return fmt.Errorf("ingest: csv header repeats column %q — a mapping path naming it would read only the last one", col)
+		}
+		seen[col] = true
+	}
 	recNo := 0
 	for {
+		lr.mark(cr.InputOffset())
 		row, err := cr.Read()
 		if err == io.EOF {
 			return nil
 		}
 		recNo++
 		if err != nil {
+			if errors.Is(err, errCSVRecordTooBig) {
+				return fmt.Errorf("ingest: csv record %d: %w", recNo, err)
+			}
 			if herr := handle(badDoc{err}, recNo); herr != nil {
+				return herr
+			}
+			continue
+		}
+		// Extra fields have no column name, so the mapping cannot reach
+		// them: keeping the row would drop data with nothing to count it
+		// against. Only DATA is loss — a trailing comma yields an extra
+		// empty field and is waved through, since exported CSVs are full
+		// of them and an empty field carries nothing to lose.
+		// FieldsPerRecord is -1 by design for the opposite case (missing
+		// trailing fields are legitimately absent).
+		if extra := extraData(row, len(header)); extra > 0 {
+			if herr := handle(badDoc{fmt.Errorf("row carries %d field(s) past the %d the header names, and an unnamed column cannot be mapped", extra, len(header))}, recNo); herr != nil {
 				return herr
 			}
 			continue
@@ -94,6 +176,42 @@ func parseCSV(r io.Reader, m *Mapping, handle func(any, int) error) error {
 			return err
 		}
 	}
+}
+
+// extraData counts non-empty fields past the header's width.
+func extraData(row []string, width int) int {
+	n := 0
+	for _, f := range row[min(len(row), width):] {
+		if strings.TrimSpace(f) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+var errCSVRecordTooBig = fmt.Errorf("record exceeds the %d-byte input ceiling (unterminated quote?)", maxCSVInputPerRecord)
+
+// recordLimitReader caps how much INPUT one csv record may consume. The
+// caller marks each record's starting input offset; the reader refuses to
+// feed the parser more than max bytes past it. The parser's offset lags
+// the bytes delivered by at most one bufio buffer, which is noise against
+// a 16 MiB ceiling.
+type recordLimitReader struct {
+	r         io.Reader
+	max       int64
+	delivered int64
+	start     int64
+}
+
+func (l *recordLimitReader) mark(off int64) { l.start = off }
+
+func (l *recordLimitReader) Read(p []byte) (int, error) {
+	if l.delivered-l.start > l.max {
+		return 0, errCSVRecordTooBig
+	}
+	n, err := l.r.Read(p)
+	l.delivered += int64(n)
+	return n, err
 }
 
 // parseXML: token-walks the stream, decoding one record element subtree
@@ -169,8 +287,12 @@ func decodeXMLNode(dec *xml.Decoder, limit int64) (*xnode, error) {
 			top.children[t.Name.Local] = append(top.children[t.Name.Local], child)
 			stack = append(stack, child)
 		case xml.CharData:
-			top.text += string(t)
+			// Appending to the string would be O(n^2) in the token count:
+			// ~80k one-char CDATA sections fit inside a legal 1 MiB record
+			// and cost seconds of CPU each. Accumulate, materialize once.
+			top.buf = append(top.buf, t...)
 		case xml.EndElement:
+			top.text, top.buf = string(top.buf), nil
 			stack = stack[:len(stack)-1]
 			if len(stack) == 0 {
 				return root, nil

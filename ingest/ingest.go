@@ -6,6 +6,12 @@
 //
 // Parsers are stdlib-only and streaming: a 10 GB input never resides in
 // memory — records are decoded one at a time and yielded as they parse.
+// The claim is enforced, not assumed: every format bounds one record, and
+// an oversize one is a bad record the run can skip (SkipBad) rather than
+// something that ends the run or, worse, materializes. The single
+// exception is a CSV record that never terminates — there is no next
+// record to resume at, so it is fatal at a ceiling well above the record
+// bound.
 package ingest
 
 import (
@@ -21,6 +27,9 @@ import (
 
 // MaxRecordBytes bounds one source record, matching the engine's journal/
 // base line bound: an entry the store would refuse must fail at ingest.
+// It is enforced twice, because the two sizes differ: on the source
+// record as parsed, and again on the entry as serialized (checkEntrySize)
+// — JSON escaping can expand a legal record past the bound.
 const MaxRecordBytes = 1 << 20
 
 // Mapping declares how one feed becomes one list.
@@ -210,6 +219,9 @@ func Parse(m *Mapping, r io.Reader, opts Options, yield func(engine.Entry) error
 	var st Stats
 	handle := func(doc any, recNo int) error {
 		e, filtered, err := m.mapRecord(doc)
+		if err == nil && !filtered {
+			err = checkEntrySize(e)
+		}
 		if err != nil {
 			if st.Bad < opts.SkipBad {
 				st.Bad++
@@ -234,6 +246,34 @@ func Parse(m *Mapping, r io.Reader, opts Options, yield func(engine.Entry) error
 		err = parseXML(r, m, handle)
 	}
 	return st, err
+}
+
+// checkEntrySize enforces MaxRecordBytes on the SERIALIZED entry, which is
+// what the store actually bounds. A record inside the bound can still cross
+// it once mapped: JSON escaping turns one control byte into six (\u0000),
+// so a field of them grows about sixfold. Without this the entry is refused
+// by writeBaseTemp instead — after the whole feed is parsed and resident,
+// naming no record number and skippable by nothing.
+//
+// The sixfold gate keeps json.Marshal off the common path: below it no
+// amount of escaping can reach the bound, and real feed records are three
+// orders of magnitude below it.
+func checkEntrySize(e engine.Entry) error {
+	raw := len(e.ID) + len(e.Payload)
+	for _, k := range e.Keys {
+		raw += len(k) + 3 // quotes and separator
+	}
+	if 6*raw+64 <= MaxRecordBytes {
+		return nil
+	}
+	b, err := json.Marshal(&e)
+	if err != nil {
+		return badRecord{err}
+	}
+	if len(b)+1 > MaxRecordBytes {
+		return badRecord{fmt.Errorf("entry serializes to %d bytes, over the %d-byte bound (json escaping expands control bytes sixfold)", len(b)+1, MaxRecordBytes)}
+	}
+	return nil
 }
 
 // mapRecord applies the mapping to one decoded record. filtered=true means

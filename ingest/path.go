@@ -24,6 +24,7 @@ func splitPath(format, path string) []string {
 type xnode struct {
 	children map[string][]*xnode
 	text     string
+	buf      []byte // character data during decode; folded into text at EndElement
 }
 
 // kids returns the child nodes one segment reaches from n. Arrays

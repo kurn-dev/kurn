@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNDJSONUpsertAndReplace(t *testing.T) {
@@ -318,5 +319,62 @@ func TestNDJSONEnvelopeBoundaryLine(t *testing.T) {
 	// The pending batch is discarded whole: "ok" from line 1 is gone too.
 	if n := entryCount(t, ts, "people"); n != 0 {
 		t.Errorf("entries = %d, want 0 (pending batch discarded)", n)
+	}
+}
+
+// A long append stream resolves its list per batch, so a PUT arriving
+// mid-upload used to redirect the remainder into the freshly created list
+// while the client still got 200 "upserted: N" — one upload silently split
+// across two generations of a name. The stream now pins the generation it
+// started on and stops with 409.
+func TestNDJSONAppendRefusesGenerationChange(t *testing.T) {
+	ts := newTS(t)
+	cfg := `{"analyzer":{"preset":"person-name"},"match":{"mode":"ngram"}}`
+	do(t, "PUT", ts.URL+"/v1/lists/people", cfg)
+
+	// Body is a pipe so the test can act between the first and second batch.
+	pr, pw := io.Pipe()
+	const batch = 10000 // ndjsonBatch
+	go func() {
+		for i := 0; i < batch; i++ {
+			fmt.Fprintf(pw, `{"id":"a%d","keys":["Alpha Number%d"]}`+"\n", i, i)
+		}
+		// Wait until that first batch is durable, then swap the generation
+		// underneath the still-open stream.
+		for {
+			resp, body := do(t, "GET", ts.URL+"/v1/lists/people", "")
+			if resp.StatusCode == 200 && strings.Contains(string(body), `"entries":10000`) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		do(t, "PUT", ts.URL+"/v1/lists/people", cfg) // recreate: new generation
+		for i := 0; i < batch; i++ {
+			fmt.Fprintf(pw, `{"id":"b%d","keys":["Bravo Number%d"]}`+"\n", i, i)
+		}
+		pw.Close()
+	}()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/lists/people/entries", pr)
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (generation changed mid-stream): %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "was replaced while the write was in flight") {
+		t.Fatalf("409 does not explain the conflict: %s", body)
+	}
+
+	// The decisive property: nothing from this upload leaked into the new
+	// generation. The PUT wiped the list, so it must be empty.
+	_, lists := do(t, "GET", ts.URL+"/v1/lists/people", "")
+	if !strings.Contains(string(lists), `"entries":0`) {
+		t.Fatalf("post-PUT list is not empty — stream bled across generations: %s", lists)
 	}
 }

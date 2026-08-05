@@ -452,6 +452,16 @@ func (s *srv) upsertNDJSON(w http.ResponseWriter, r *http.Request, name string, 
 		applied int            // append mode: entries durably applied so far
 		lineNo  int
 	)
+	// Append mode applies in batches, and each batch would otherwise resolve
+	// the list by NAME again — so a PUT or reload arriving mid-stream would
+	// silently land the remainder of this upload in the new list while the
+	// client is told the whole upload succeeded. Pin the generation here and
+	// refuse to cross it (409); already-applied batches stay applied and are
+	// reported, as with any other mid-stream failure.
+	var gen *engine.List
+	if !replace {
+		gen, _ = st.List(name)
+	}
 	// fail writes the single error response: replace mode applied nothing, so
 	// it's a plain error envelope; append mode reports the partial success.
 	fail := func(status int, msg string) {
@@ -476,7 +486,7 @@ func (s *srv) upsertNDJSON(w http.ResponseWriter, r *http.Request, name string, 
 			fail(http.StatusForbidden, msg)
 			return false
 		}
-		if err := st.Upsert(name, acc); err != nil {
+		if err := st.UpsertGen(name, gen, acc); err != nil {
 			fail(storeErrStatus(err), err.Error())
 			return false
 		}
@@ -888,6 +898,12 @@ func storeErrStatus(err error) int {
 	var tooLarge *engine.EntryTooLargeError
 	if errors.As(err, &tooLarge) {
 		return http.StatusBadRequest
+	}
+	var replaced *engine.ListReplacedError
+	if errors.As(err, &replaced) {
+		// Not the client's fault and not retryable against this generation:
+		// the list they addressed no longer exists in the form they addressed.
+		return http.StatusConflict
 	}
 	var overflow *exact.KeyOverflowError
 	if errors.As(err, &overflow) {

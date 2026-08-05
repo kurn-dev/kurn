@@ -540,7 +540,11 @@ func (st *Store) Upsert(name string, entries []Entry) error {
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
-	l := ls.l.Load()
+	return st.upsertLocked(name, ls, ls.l.Load(), entries)
+}
+
+// upsertLocked is the shared body of Upsert and UpsertGen; ls.lock is held.
+func (st *Store) upsertLocked(name string, ls *listState, l *List, entries []Entry) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, err := l.prepareUpsertLocked(entries)
@@ -558,6 +562,41 @@ func (st *Store) Upsert(name string, entries []Entry) error {
 	l.commitOverlayLockedAt(b, jpos)
 	st.maybeAutoCompact(name, ls, l)
 	return nil
+}
+
+// ListReplacedError reports that a list was recreated (PUT) or reloaded
+// while a caller held a reference to an earlier generation of it. Streaming
+// callers use it to stop rather than let the rest of one upload land in a
+// list that was swapped underneath them.
+type ListReplacedError struct{ Name string }
+
+func (e *ListReplacedError) Error() string {
+	return fmt.Sprintf("store: list %q was replaced while the write was in flight", e.Name)
+}
+
+// UpsertGen is Upsert, refused with *ListReplacedError unless the named list
+// is still the generation the caller captured. A multi-batch stream resolves
+// the list by NAME on every batch, so a concurrent CreateList or ReloadList
+// would otherwise silently land the remainder of one upload in a different
+// list while the client is told its whole upload succeeded. The check runs
+// under the same lock as the write, so the generation cannot change between
+// the two.
+//
+// Whole-content replacement of the SAME generation (Store.Replace) is not a
+// generation change and is not refused: concurrent writers to one list are
+// last-writer-wins, as they are for any other mutation.
+func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
+	ls, err := st.get(name)
+	if err != nil {
+		return err
+	}
+	ls.lock.Lock()
+	defer ls.lock.Unlock()
+	l := ls.l.Load()
+	if gen != nil && l != gen {
+		return &ListReplacedError{Name: name}
+	}
+	return st.upsertLocked(name, ls, l, entries)
 }
 
 // Delete journals the delete then applies it. Same prepare-first ordering

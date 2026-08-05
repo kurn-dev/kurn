@@ -233,12 +233,16 @@ caveats that qualify them are in [bench/README.md](bench/README.md).
 
 | corpus | machine | p50 | throughput |
 |---|---|---|---|
-| 148,837 entries (five public screening lists) | 4 vCPU server | 0.91 ms | 6,022 q/s, 8 clients |
+| 148,837 entries (five public lists) | 4 vCPU server | 0.64 ms | 5,034 q/s, 8 clients |
 | 10M synthetic keys | M1 Pro laptop | 13.2 ms | 71 q/s, single-threaded |
 
+The first row is the median of three runs in one session; p50 moves about
+±15% between runs on shared vCPUs.
+
 - **Memory**: ~114 B/key end-to-end (≈69 B/key postings, the rest the
-  ID→ordinal map; HeapAlloc-delta estimates). The five public lists serve in
-  about 126 MB.
+  ID→ordinal map; HeapAlloc-delta estimates). Process RSS is larger, since
+  entries and payloads are resident too: the five public lists index in about
+  22 MB and settle at about 128 MB resident.
 - **Recall**: 0.940 overall right-entity recall at threshold 0.6, and 0.975
   at 0.45 for roughly 3× the latency — measured on synthetic perturbations,
   which are an easier corpus than real-world name data, so the *shape*

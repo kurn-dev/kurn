@@ -93,6 +93,15 @@ carries operational logging — the streams are separable by fd):
 - Keyless (LB/scraper-facing): `GET /livez`, `GET /readyz` (503 body
   enumerates failures: tenant, list, probe, reason), `GET /metrics`,
   `GET /healthz`.
+- **The platform must keep those four off any network a tenant can reach.**
+  Keyless and tenant-labelled together make them a roster: `/metrics`
+  names every tenant along with its list count, live key count, query and
+  mutation totals, queue depth and 429s — §2's billing basis, readable by
+  anyone who can reach the port — and a `/readyz` failure adds the list
+  name and the golden probe's query string. kurnd cannot enforce this,
+  since the endpoints exist to answer before any key is presented, so the
+  boundary is the platform's to draw: a management interface, or a proxy
+  that filters these paths out of tenant traffic.
 - Keyed: everything under `/v1/`.
 - Signals: `SIGHUP` = tenants-file reload. Anything else (fsync mode,
   budgets, list configs) is restart-applied; kill -9 is a legal stop

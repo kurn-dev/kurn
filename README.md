@@ -314,6 +314,15 @@ above).
   (deletion is a deliberate manual act).
 - `/readyz` failures and `/metrics` series carry a `tenant` label;
   `/livez`, `/readyz`, `/metrics`, `/healthz` remain keyless.
+- **Those four endpoints must not be reachable by tenants or from an
+  untrusted network.** Keyless plus tenant-labelled means they enumerate
+  the roster: `/metrics` publishes every tenant's name, list count, live
+  key count, query and mutation totals, queue depth and 429s — the billing
+  contract, so one tenant could read another's volumes — and a `/readyz`
+  failure names the tenant, the list, and the golden probe's query string.
+  Bind them to a management interface or filter them at the proxy. This is
+  a deployment requirement rather than a default because the endpoints
+  exist to be scraped by a control plane.
 - Capacity quotas are enforced: `max_lists` at list creation (PUT-replace
   of an existing list is not a new list) and `max_total_keys` — live raw
   keys summed across the tenant's lists — at entry admission, with 403s

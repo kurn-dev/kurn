@@ -59,8 +59,11 @@ import (
 // files are per-list. Queries were always lock-free (List snapshots).
 type Store struct {
 	dir   string
-	mu    sync.RWMutex // guards the lists map only; never held across IO
+	mu    sync.RWMutex // guards the lists map and closed; never held across IO
 	lists map[string]*listState
+
+	closed bool           // set by Close: no further mutations, no new background work
+	bg     sync.WaitGroup // background auto-compactions in flight
 
 	// OnArtifactError, if set, observes non-fatal base.idx save failures
 	// (see Compact/Replace: the artifact is a pure cache, so a failed save
@@ -461,6 +464,9 @@ func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) b
 // wipe hasn't started; once data files are wiped the in-memory swap is
 // unconditional, matching disk.
 func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
+	if err := st.mutable(); err != nil {
+		return nil, err
+	}
 	if !listNameRE.MatchString(name) {
 		return nil, &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
 	}
@@ -538,6 +544,9 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 // the prepare succeeded). The per-list lock plus l.mu span
 // prepare+append+commit, so journal order always matches memory order.
 func (st *Store) Upsert(name string, entries []Entry) error {
+	if err := st.mutable(); err != nil {
+		return err
+	}
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -590,6 +599,9 @@ func (e *ListReplacedError) Error() string {
 // generation change and is not refused: concurrent writers to one list are
 // last-writer-wins, as they are for any other mutation.
 func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
+	if err := st.mutable(); err != nil {
+		return err
+	}
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -606,6 +618,9 @@ func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
 // Delete journals the delete then applies it. Same prepare-first ordering
 // rationale as Upsert.
 func (st *Store) Delete(name string, id string) error {
+	if err := st.mutable(); err != nil {
+		return err
+	}
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -637,6 +652,9 @@ func (st *Store) Delete(name string, id string) error {
 // as it was. A list new to this store (bundle shipped into a fresh dir)
 // is added; the name is validated (it became a directory).
 func (st *Store) ReloadList(name string) (*List, error) {
+	if err := st.mutable(); err != nil {
+		return nil, err
+	}
 	if !listNameRE.MatchString(name) {
 		return nil, &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
 	}
@@ -685,7 +703,7 @@ func (st *Store) maybeAutoCompact(name string, ls *listState, l *List) {
 	if !ls.autoCompacting.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	if !st.spawnBG(func() {
 		defer ls.autoCompacting.Store(false)
 		cur := ls.l.Load()
 		if cur == nil {
@@ -695,7 +713,9 @@ func (st *Store) maybeAutoCompact(name string, ls *listState, l *List) {
 			return
 		}
 		st.Compact(name) // error: overlay stays over threshold; next mutation re-triggers
-	}()
+	}) {
+		ls.autoCompacting.Store(false)
+	}
 }
 
 // Compact folds the overlay into a new base: prepare (memory-invisible),
@@ -729,6 +749,9 @@ func (st *Store) maybeAutoCompact(name string, ls *listState, l *List) {
 //     a failed save must not fail an otherwise-durable compact. The caller
 //     still gets nil; OnArtifactError (if set) observes the error.
 func (st *Store) Compact(name string) error {
+	if err := st.mutable(); err != nil {
+		return err
+	}
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -778,6 +801,9 @@ func (st *Store) Compact(name string) error {
 //     (6) means an artifact failure can never leave old memory serving a
 //     replaced on-disk list.
 func (st *Store) Replace(name string, entries []Entry) error {
+	if err := st.mutable(); err != nil {
+		return err
+	}
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -850,6 +876,76 @@ func (st *Store) saveArtifact(l *List, lp string, ng *ngram.Index, ex *exact.Ind
 
 // List returns the named list. Never blocks on mutation locks: safe to call
 // on the query path while any list (including this one) is being compacted.
+// ErrStoreClosed is returned by every mutation once Close has run.
+var ErrStoreClosed = errors.New("store: closed")
+
+// mutable refuses mutations on a closed store.
+func (st *Store) mutable() error {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	if st.closed {
+		return ErrStoreClosed
+	}
+	return nil
+}
+
+// spawnBG starts background work unless the store is closed. Registering
+// under the lock that Close sets `closed` under is what makes Close's wait
+// exhaustive: no goroutine can be added after Close decides to wait.
+func (st *Store) spawnBG(f func()) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.closed {
+		return false
+	}
+	st.bg.Add(1)
+	go func() {
+		defer st.bg.Done()
+		f()
+	}()
+	return true
+}
+
+// Close releases a store's claim on its data directory: it refuses further
+// mutations and returns only once nothing of this store's will ever write
+// there again. Reads keep working — in-flight queries hold live *List
+// objects and must be allowed to finish — and nothing on disk is touched,
+// so a later Open of the same directory sees exactly the acknowledged
+// state.
+//
+// It exists because two *Store on one directory silently destroy data: the
+// abandoned one's auto-compaction folds ITS view of the list and truncates
+// the journal, discarding operations the other store has already
+// acknowledged. Anything that stops using a store while the directory may
+// be reopened — kurnd dropping a tenant from its registry, then the
+// operator adding it back — must Close it first.
+//
+// Close is idempotent and safe to call concurrently with anything else.
+func (st *Store) Close() error {
+	st.mu.Lock()
+	if st.closed {
+		st.mu.Unlock()
+		return nil
+	}
+	st.closed = true
+	lists := make([]*listState, 0, len(st.lists))
+	for _, ls := range st.lists {
+		lists = append(lists, ls)
+	}
+	st.mu.Unlock()
+
+	// Background compactions registered before the flag went up.
+	st.bg.Wait()
+	// And mutations already past the guard: each holds its list's lock for
+	// its whole prepare-journal-commit span, so taking every lock in turn
+	// waits them out. Nothing else is held here, so nothing can deadlock.
+	for _, ls := range lists {
+		ls.lock.Lock()
+		ls.lock.Unlock() //nolint:staticcheck // draining, not guarding
+	}
+	return nil
+}
+
 func (st *Store) List(name string) (*List, bool) {
 	st.mu.RLock()
 	ls := st.lists[name]

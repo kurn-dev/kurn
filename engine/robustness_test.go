@@ -5,12 +5,15 @@ package engine_test
 // materializing it, and list config values nothing validated.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kurn-dev/kurn/engine"
 )
@@ -194,4 +197,99 @@ func TestListConfigRejectsOutOfRangeMatchDefaults(t *testing.T) {
 			t.Fatalf("valid config refused (%+v): %v", cfg.Match, err)
 		}
 	}
+}
+
+// Two *engine.Store on one data directory silently destroy data: the
+// abandoned one's auto-compaction folds ITS view and truncates the
+// journal, discarding operations the other store already acknowledged.
+// kurnd could produce exactly that by dropping a tenant and adding it
+// back (the store object outlived the registry entry), so a store must be
+// able to release its claim on a directory.
+func TestCloseEndsAllWritesToTheDirectory(t *testing.T) {
+	dir := t.TempDir()
+	st, err := engine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := robustList()
+	cfg.OverlayAutoCompact = 4 // compact early and often
+	if _, err := st.CreateList("people", cfg); err != nil {
+		t.Fatal(err)
+	}
+	// Enough mutations that auto-compactions are in flight at Close.
+	for i := 0; i < 400; i++ {
+		if err := st.Upsert("people", []engine.Entry{
+			{ID: fmt.Sprintf("e%d", i), Keys: []string{fmt.Sprintf("Person Number%d", i)}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Whatever is on disk when Close returns is final: a compaction still
+	// running would rewrite base.jsonl and truncate the journal under the
+	// store that reopens the directory next.
+	snapshot := dirFingerprint(t, filepath.Join(dir, "people"))
+	time.Sleep(250 * time.Millisecond)
+	if after := dirFingerprint(t, filepath.Join(dir, "people")); after != snapshot {
+		t.Fatalf("the directory changed after Close returned:\n before %s\n after  %s", snapshot, after)
+	}
+
+	// And the closed store refuses every mutation, so an in-flight request
+	// holding it cannot write to a directory another store now owns.
+	e := []engine.Entry{{ID: "x", Keys: []string{"Anna Smith"}}}
+	for name, err := range map[string]error{
+		"Upsert":     st.Upsert("people", e),
+		"Replace":    st.Replace("people", e),
+		"Delete":     st.Delete("people", "e1"),
+		"Compact":    st.Compact("people"),
+		"CreateList": errOf(st.CreateList("other", robustList())),
+		"ReloadList": errOf(st.ReloadList("people")),
+	} {
+		if !errors.Is(err, engine.ErrStoreClosed) {
+			t.Errorf("%s on a closed store: err = %v, want ErrStoreClosed", name, err)
+		}
+	}
+
+	// Reads still work: in-flight queries must be allowed to finish.
+	if _, ok := st.List("people"); !ok {
+		t.Error("Close broke reads on live *List objects")
+	}
+
+	// The reopened store sees exactly the acknowledged state.
+	st2, err := engine.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, ok := st2.List("people")
+	if !ok {
+		t.Fatal("reopen lost the list")
+	}
+	if entries, _, _ := l.Stats(); entries != 400 {
+		t.Fatalf("reopened with %d entries, want the 400 acknowledged", entries)
+	}
+}
+
+func errOf[T any](_ T, err error) error { return err }
+
+// dirFingerprint renders every file's name and size, which is what a
+// compaction changes: a new base and a truncated journal.
+func dirFingerprint(t *testing.T, dir string) string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []string
+	for _, e := range ents {
+		fi, err := e.Info()
+		if err != nil {
+			continue // raced with nothing, but a vanished file is itself a change
+		}
+		parts = append(parts, fmt.Sprintf("%s:%d", e.Name(), fi.Size()))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " ")
 }

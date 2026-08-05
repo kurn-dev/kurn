@@ -135,8 +135,20 @@ func main() {
 			// gone (in-flight requests finish on the old registry's live
 			// objects), so the reference is the only thing pinning the
 			// indexes in RAM. Data stays on disk.
+			//
+			// Close first, and not just to be tidy: dropping the reference
+			// alone leaves the store's auto-compaction running against a
+			// directory that a re-add — remove tenant, SIGHUP, add it back,
+			// SIGHUP — reopens under a second *engine.Store. The abandoned
+			// compactor then folds ITS stale view and truncates the journal,
+			// destroying operations the new store already acknowledged.
+			// Close returns only once nothing of the old store will write
+			// there again, so the reopen is safe by the time it can happen.
 			for name := range opened {
 				if _, ok := specs[name]; !ok {
+					if cerr := opened[name].Close(); cerr != nil {
+						log.Printf("kurn: tenant %s: closing dropped store: %v", name, cerr)
+					}
 					delete(opened, name)
 				}
 			}

@@ -50,6 +50,15 @@ func parseNDJSON(r io.Reader, m *Mapping, handle func(any, int) error) error {
 			}
 			continue
 		}
+		// A line is ONE record. Decode stops at the first complete value, so
+		// anything after it was being dropped without a word — two objects
+		// on one line silently became one.
+		if rest, _ := io.ReadAll(dec.Buffered()); len(bytes.TrimSpace(rest)) > 0 {
+			if herr := handle(badDoc{fmt.Errorf("trailing content after the record on this line (one JSON object per line)")}, recNo); herr != nil {
+				return herr
+			}
+			continue
+		}
 		if err := handle(doc, recNo); err != nil {
 			return err
 		}

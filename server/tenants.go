@@ -136,6 +136,24 @@ func (v *Server) SetTenants(ts map[string]TenantRuntime) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	// Two PRIVATE tenants pointing at one store share a namespace silently:
+	// each would see the other's lists under its own name, read them, and
+	// overwrite them, with isolation reported as intact everywhere. kurnd
+	// cannot produce it (one Open per tenant directory), but the library API
+	// takes the stores from its caller and had no opinion about it.
+	// shared_reads is the deliberate version of the same aliasing and is
+	// assigned below, so only stores passed IN are checked here.
+	byStore := make(map[*engine.Store]string, len(ts))
+	for _, name := range names {
+		rt := ts[name]
+		if rt.Store == nil {
+			continue
+		}
+		if other, dup := byStore[rt.Store]; dup {
+			return fmt.Errorf("tenants: %s and %s declare the same store — their lists would silently share one namespace", other, name)
+		}
+		byStore[rt.Store] = name
+	}
 	for _, name := range names {
 		rt := ts[name]
 		if rt.Spec.SharedReads {

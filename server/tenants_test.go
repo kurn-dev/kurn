@@ -215,3 +215,24 @@ func TestReadyzNamesTenant(t *testing.T) {
 		t.Fatalf("failure does not name the tenant: %s", body)
 	}
 }
+
+// Two private tenants pointing at one store share a namespace silently:
+// each sees the other's lists under its own name, reads them, and can
+// overwrite them, while every isolation report still looks intact.
+func TestSetTenantsRefusesASharedStore(t *testing.T) {
+	st, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := server.NewServer(nil, server.Config{})
+	err = web.SetTenants(map[string]server.TenantRuntime{
+		"acme": {Spec: server.TenantSpec{KeyDigests: []string{digestOf("key-acme")}}, Store: st},
+		"beta": {Spec: server.TenantSpec{KeyDigests: []string{digestOf("key-beta")}}, Store: st},
+	})
+	if err == nil {
+		t.Fatal("two tenants were allowed to share one store")
+	}
+	if !strings.Contains(err.Error(), "same store") {
+		t.Fatalf("error does not explain the aliasing: %v", err)
+	}
+}

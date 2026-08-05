@@ -15,6 +15,7 @@
 package ingest
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -246,6 +247,7 @@ func Parse(m *Mapping, r io.Reader, opts Options, yield func(engine.Entry) error
 		return yield(e)
 	}
 	var err error
+	r = skipBOM(r)
 	switch m.Format {
 	case "ndjson":
 		err = parseNDJSON(r, m, handle)
@@ -283,6 +285,20 @@ func checkEntrySize(e engine.Entry) error {
 		return badRecord{fmt.Errorf("entry serializes to %d bytes, over the %d-byte bound (json escaping expands control bytes sixfold)", len(b)+1, MaxRecordBytes)}
 	}
 	return nil
+}
+
+// skipBOM drops a leading UTF-8 byte-order mark. Every spreadsheet that
+// exports "CSV UTF-8" writes one, and it lands on the first header cell:
+// the column becomes "\ufeffid", every mapping path naming id misses, and
+// the whole feed fails as "missing id" — or, with -skip-bad, converts
+// silently into counted-bad records. Nothing downstream wants a BOM, and
+// XML/JSON tolerate its absence, so it is stripped for all three formats.
+func skipBOM(r io.Reader) io.Reader {
+	br := bufio.NewReader(r)
+	if b, err := br.Peek(3); err == nil && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
+		br.Discard(3)
+	}
+	return br
 }
 
 // mapRecord applies the mapping to one decoded record. filtered=true means

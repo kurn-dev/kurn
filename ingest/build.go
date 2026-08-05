@@ -212,6 +212,16 @@ func writeDelta(prevPath, nextPath, outPath string) (*DeltaStats, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A half-written delta must not survive the error that produced it: the
+	// next build refuses an output dir that "already contains a bundle", so
+	// the leftover blocks exactly the retry this failure invites.
+	ok := false
+	defer func() {
+		out.Close()
+		if !ok {
+			os.Remove(outPath)
+		}
+	}()
 	w := bufio.NewWriterSize(out, 1<<20)
 	enc := json.NewEncoder(w)
 	ds := &DeltaStats{}
@@ -249,7 +259,11 @@ func writeDelta(prevPath, nextPath, outPath string) (*DeltaStats, error) {
 		out.Close()
 		return nil, err
 	}
-	return ds, out.Close()
+	if err := out.Close(); err != nil {
+		return nil, err
+	}
+	ok = true
+	return ds, nil
 }
 
 // eachBaseLine streams base.jsonl lines with their entry IDs.

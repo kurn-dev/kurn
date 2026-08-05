@@ -2,6 +2,7 @@ package exact_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/kurn-dev/kurn/engine/exact"
@@ -73,5 +74,29 @@ func TestFinishRejectsOverlongRun(t *testing.T) {
 	}
 	if ko.Key != "hot" || ko.Count != 1<<20 || ko.Cap != 1<<20-1 {
 		t.Errorf("KeyOverflowError = %+v, want Key=hot Count=%d Cap=%d", ko, 1<<20, 1<<20-1)
+	}
+}
+
+// Restore rejects the maximum ordinal because ord+1 wraps numOrds to 0;
+// Finish did not, though Add takes an arbitrary ordinal and only documents
+// the ascending contract. The result was an index reporting NumOrds 0 while
+// Lookup still returned that ordinal, so a caller's NumOrds-vs-entry-count
+// check passed and then indexed out of bounds.
+func TestFinishRejectsSuccessorlessOrdinal(t *testing.T) {
+	b := exact.NewBuilder()
+	b.Add(^uint32(0), []string{"anna"})
+	idx, err := b.Finish()
+	if err == nil {
+		t.Fatalf("Finish accepted the maximum ordinal: NumOrds = %d, Lookup = %v",
+			idx.NumOrds(), idx.Lookup("anna"))
+	}
+	if !strings.Contains(err.Error(), "successor") {
+		t.Fatalf("error does not explain the problem: %v", err)
+	}
+	// One below the maximum is legal and must stay legal.
+	b2 := exact.NewBuilder()
+	b2.Add(^uint32(0)-1, []string{"anna"})
+	if _, err := b2.Finish(); err != nil {
+		t.Fatalf("Finish refused a representable ordinal: %v", err)
 	}
 }

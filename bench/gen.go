@@ -139,6 +139,9 @@ func perturb(r *rand.Rand, s, cat string) string {
 		// swapping equal runes is a no-op that would silently turn this case
 		// into EXACT and inflate the category's recall.
 		i := letterPos(r, rs)
+		if i < 0 {
+			return s
+		}
 		var cand []int
 		for j := range rs {
 			if rs[j] != ' ' && rs[j] != rs[i] && j != i+1 && i != j+1 {
@@ -156,9 +159,22 @@ func perturb(r *rand.Rand, s, cat string) string {
 	case "SPACE_INSERT":
 		// Split inside a token: a position adjacent to an existing space
 		// normalizes back to the original key (no perturbation at all).
-		i := 1 + r.Intn(len(rs)-1)
-		for rs[i] == ' ' || rs[i-1] == ' ' {
-			i = 1 + r.Intn(len(rs)-1)
+		// Reject-sample as before — the draw sequence is part of what a seed
+		// reproduces — but bounded: Corpus is exported and takes arbitrary
+		// input, and "a b c" offers no such position at all, which spun the
+		// sampler forever. Only inputs that never terminated reach the
+		// fallback, so every corpus that generated before generates
+		// identically.
+		i, ok := 0, false
+		for att := 0; att < maxSampleAttempts; att++ {
+			j := 1 + r.Intn(len(rs)-1)
+			if rs[j] != ' ' && rs[j-1] != ' ' {
+				i, ok = j, true
+				break
+			}
+		}
+		if !ok {
+			return s // no split position exists; an unperturbed case
 		}
 		return string(rs[:i]) + " " + string(rs[i:])
 	case "FUSED":
@@ -190,8 +206,14 @@ func typo(r *rand.Rand, rs []rune, n int) string {
 	used := make(map[int]bool, n)
 	for k := 0; k < n; k++ {
 		i := letterPos(r, out)
-		for used[i] {
+		if i < 0 {
+			return string(out) // no letters to perturb
+		}
+		for att := 0; used[i] && att < maxSampleAttempts; att++ {
 			i = letterPos(r, out)
+		}
+		if used[i] {
+			return string(out) // fewer distinct letters than typos requested
 		}
 		used[i] = true
 		c := rune(alphabet[r.Intn(len(alphabet))])
@@ -203,11 +225,24 @@ func typo(r *rand.Rand, rs []rune, n int) string {
 	return string(out)
 }
 
+// maxSampleAttempts bounds every rejection sampler here. Retrying is what
+// preserves the draw sequence a seed reproduces; the bound only decides
+// when to stop, and it is reached only by inputs that never terminated at
+// all (an all-space key, a key with fewer letters than the typo count).
+const maxSampleAttempts = 64
+
+// letterPos returns a random non-space position, or -1 when there is none.
 func letterPos(r *rand.Rand, rs []rune) int {
-	for {
+	for att := 0; att < maxSampleAttempts; att++ {
 		i := r.Intn(len(rs))
 		if rs[i] != ' ' {
 			return i
 		}
 	}
+	for i := range rs { // exhausted: settle it exactly rather than spin
+		if rs[i] != ' ' {
+			return i
+		}
+	}
+	return -1
 }

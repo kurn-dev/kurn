@@ -124,7 +124,17 @@ func (b *Builder) Finish() (*Index, error) {
 		}
 		idx.postings = append(idx.postings, p...)
 		// Add's ascending-ordinal contract makes each run's tail its maximum.
-		if last := p[len(p)-1]; last+1 > idx.numOrds {
+		last := p[len(p)-1]
+		if last == ^uint32(0) {
+			// Same guard as Restore, and reachable the same way: Add takes
+			// an arbitrary ordinal and only documents the contract. last+1
+			// wraps to 0, so numOrds would report an EMPTY index while
+			// Lookup still returns this ordinal — every caller's
+			// NumOrds-vs-entry-count check then passes and indexes out of
+			// bounds.
+			return nil, fmt.Errorf("exact: key %q holds ordinal %d, which has no successor", k, last)
+		}
+		if last+1 > idx.numOrds {
 			idx.numOrds = last + 1
 		}
 		n := copy(idx.arena[off:], k)

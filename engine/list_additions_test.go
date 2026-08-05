@@ -211,3 +211,50 @@ func TestLiveEntries(t *testing.T) {
 		t.Fatalf("overlay must win over base: %+v", got[0])
 	}
 }
+
+// A List's validated config must be unreachable through caller-held slices:
+// flipping l.Config().Match.Grams[0] to -1 through the shared backing array
+// used to panic the next query's gram iteration with index-out-of-range,
+// and concurrent mutation was an ordinary data race. Both aliasing
+// directions are pinned — the config given to NewList and the view Config
+// returns.
+func TestConfigIsDetachedFromCallers(t *testing.T) {
+	cfg := engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true, Threshold: 0.6, TopK: 100},
+		Golden:   []engine.GoldenProbe{{Q: "marcus chen", ExpectID: "p1"}},
+	}
+	l, err := engine.NewList("people", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Replace([]engine.Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+	query := func(when string) {
+		t.Helper()
+		if c := l.Query("marcus chen", engine.QueryOpts{}); len(c) != 1 || c[0].EntryID != "p1" {
+			t.Fatalf("%s: query broken: %+v", when, c)
+		}
+	}
+	query("baseline")
+
+	// Direction 1: the caller keeps mutating the config it passed in.
+	cfg.Match.Grams[0] = -1
+	cfg.Analyzer.Steps[0] = "strip_punctuation"
+	cfg.Golden[0].Q = "someone else"
+	query("after mutating the NewList argument")
+
+	// Direction 2: the caller mutates the view Config returns.
+	view := l.Config()
+	view.Match.Grams[0] = -1
+	view.Analyzer.Steps[0] = "strip_punctuation"
+	view.Golden[0].ExpectID = "intruder"
+	query("after mutating the Config() view")
+
+	// The list still reports its real configuration.
+	got := l.Config()
+	if got.Match.Grams[0] != 2 || got.Analyzer.Steps[0] != "lowercase" || got.Golden[0].ExpectID != "p1" {
+		t.Fatalf("config leaked caller mutations: %+v", got)
+	}
+}

@@ -2,7 +2,10 @@
 // with fast fuzzy (char-ngram) or exact matching.
 package engine
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"slices"
+)
 
 // Entry is one list record: caller-assigned ID, one or more searchable keys
 // (name + aliases, variants…), and an opaque payload returned verbatim.
@@ -75,4 +78,16 @@ type ListConfig struct {
 	// in the README). Ignored by library-managed lists (no Store, no disk to
 	// fold onto).
 	OverlayAutoCompact int `json:"overlay_auto_compact,omitempty"`
+}
+
+// clone returns a copy sharing no mutable state with the receiver. Three
+// fields are slice-backed (analyzer steps, gram sizes, golden probes —
+// GoldenProbe itself is all scalars); everything else copies by value.
+// NewList clones on the way in and Config on the way out, so a list's
+// validated config can never be reached through a caller-held slice.
+func (c ListConfig) clone() ListConfig {
+	c.Analyzer.Steps = slices.Clone(c.Analyzer.Steps)
+	c.Match.Grams = slices.Clone(c.Match.Grams)
+	c.Golden = slices.Clone(c.Golden)
+	return c
 }

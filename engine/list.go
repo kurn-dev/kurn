@@ -106,6 +106,12 @@ type List struct {
 const maxListTopK = 1 << 20
 
 func NewList(name string, cfg ListConfig) (*List, error) {
+	// Sever every slice aliased with the caller FIRST: the config is
+	// validated once and then trusted for the list's lifetime, so a caller
+	// mutating its own ListConfig afterwards (or the view Config returns)
+	// must not be able to reach past validation — a Grams entry flipped to
+	// -1 through a shared backing array panicked gram iteration mid-query.
+	cfg = cfg.clone()
 	an, err := ResolveAnalyzer(cfg.Analyzer)
 	if err != nil {
 		return nil, err
@@ -185,8 +191,13 @@ func ResolveAnalyzer(cfg AnalyzerConfig) (analyzer.Analyzer, error) {
 	return analyzer.New(cfg.Steps)
 }
 
-func (l *List) Name() string       { return l.name }
-func (l *List) Config() ListConfig { return l.cfg }
+func (l *List) Name() string { return l.name }
+
+// Config returns the list's resolved configuration as a detached copy:
+// slice-backed fields are cloned in both directions (see NewList), so
+// neither mutating the returned value nor the caller's original can alter
+// — or race with — the immutable config live queries read.
+func (l *List) Config() ListConfig { return l.cfg.clone() }
 
 // buildSegment analyzes and indexes entries (ordinal = slice position).
 func (l *List) buildSegment(entries []Entry) (*segment, error) {

@@ -65,8 +65,8 @@ func TestCompactPersistFailureLeavesMemoryUntouched(t *testing.T) {
 	if _, ov, _ := l.Stats(); ov != 0 {
 		t.Fatalf("post-compact overlay = %d, want 0", ov)
 	}
-	if v := l.Version(); !strings.HasSuffix(v, "@2+j0") || v == vBefore {
-		t.Fatalf("post-compact version %q, want content stamp @2+j0", v)
+	if v := l.Version(); !strings.Contains(v, "@2+j0+c") || v == vBefore {
+		t.Fatalf("post-compact version %q, want content stamp @2+j0+c…", v)
 	}
 	if c := l.Query("bb-2", engine.QueryOpts{}); len(c) != 1 || c[0].EntryID != "c2" {
 		t.Fatalf("folded entry missing: %+v", c)

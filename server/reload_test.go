@@ -91,8 +91,13 @@ func TestReloadPublish(t *testing.T) {
 	if err := json.Unmarshal(body, &rr); err != nil {
 		t.Fatal(err)
 	}
-	if rr.Entries != 2 || !strings.HasPrefix(rr.Version, man1.VersionID+"@") {
-		t.Fatalf("reload response: %+v, want version prefix %s", rr, man1.VersionID)
+	if rr.Entries != 2 || !strings.HasPrefix(rr.Version, man1.SHA256+"@") {
+		t.Fatalf("reload response: %+v, want the stamp's base half to be the manifest sha256 %s", rr, man1.SHA256)
+	}
+	// The manifest's short version_id keeps its join property: a prefix of
+	// the stamp.
+	if !strings.HasPrefix(rr.Version, man1.VersionID) {
+		t.Fatalf("version %q does not start with version_id %s", rr.Version, man1.VersionID)
 	}
 	if len(rr.Golden) != 1 || !rr.Golden[0].OK {
 		t.Fatalf("golden results: %+v", rr.Golden)
@@ -131,8 +136,8 @@ func TestReloadPublish(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("reload v2: %d %s", resp.StatusCode, body)
 	}
-	if err := json.Unmarshal(body, &rr); err != nil || !strings.HasPrefix(rr.Version, man2.VersionID+"@") {
-		t.Fatalf("v2 version: %+v want %s", rr, man2.VersionID)
+	if err := json.Unmarshal(body, &rr); err != nil || !strings.HasPrefix(rr.Version, man2.SHA256+"@") {
+		t.Fatalf("v2 version: %+v want base half %s", rr, man2.SHA256)
 	}
 	// New content live, old gone.
 	_, body = do(t, "POST", ts.URL+"/v1/query", `{"q":"aa-9","lists":["codes"]}`)

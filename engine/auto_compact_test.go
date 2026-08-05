@@ -56,8 +56,8 @@ func TestOverlayAutoCompactTriggers(t *testing.T) {
 	if e, _, tomb := l.Stats(); e != 3 || tomb != 0 {
 		t.Fatalf("post-fold stats: entries %d tombstones %d, want 3, 0", e, tomb)
 	}
-	if v := l.Version(); !strings.HasSuffix(v, "@3+j0") {
-		t.Fatalf("post-fold version %q, want content stamp @3+j0", v)
+	if v := l.Version(); !strings.Contains(v, "@3+j0+c") {
+		t.Fatalf("post-fold version %q, want content stamp @3+j0+c…", v)
 	}
 	// All three entries survive the fold and are queryable.
 	for _, q := range []string{"aa-1", "bb-2", "cc-3"} {

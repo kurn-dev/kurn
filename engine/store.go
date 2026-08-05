@@ -418,6 +418,10 @@ func (st *Store) openList(name string) (*List, error) {
 				return nil, err
 			}
 		}
+	} else {
+		// No base: the virgin snapshot must still stamp the full form, or
+		// an empty created list would change stamps across a restart.
+		l.stampFresh()
 	}
 
 	// Journal replay: one batch, no re-append.
@@ -621,6 +625,7 @@ func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string
 	}
 	l.SetBaseID("empty") // store-managed: content-addressed stamps from the start
 	l.setJournalHash(newJournalHash())
+	l.stampFresh()            // the virgin snapshot carries the full form, config digest included
 	ls.journalDamaged = false // the journal file was removed above: rebuilt wholesale
 	ls.l.Store(l)
 	// Captured under ls.lock: the version this create committed, not
@@ -1468,10 +1473,12 @@ func writeBaseTemp(dir string, entries []Entry) (path, id string, err error) {
 }
 
 // AnalyzerSpecDigest is the identity of an analyzer's canonical step spec:
-// sha256, 12 hex chars (same style as baseIDFromHash). Artifacts record it
-// at save time so installWithArtifact can verify that index keys and future
-// query strings are normalized by the same analyzer; a mismatch — or a
-// pre-digest artifact ("" digest) — forces a full rebuild.
+// the complete sha256 in hex (same rationale as baseIDFromHash — a
+// truncated digest invites deliberate collisions, and a collision here
+// silently installs a stale index). Artifacts record it at save time so
+// installWithArtifact can verify that index keys and future query strings
+// are normalized by the same analyzer; a mismatch — or a pre-digest /
+// short-digest artifact — forces a full rebuild.
 //
 // Each step is length-prefixed into the hash: step ARGUMENTS contain commas
 // ("strip_words:mr,mrs"), so any separator-join would make distinct specs
@@ -1486,14 +1493,21 @@ func AnalyzerSpecDigest(a analyzer.Analyzer) string {
 		h.Write(lb[:])
 		h.Write([]byte(s))
 	}
-	return hex.EncodeToString(h.Sum(nil))[:12]
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-// baseIDFromHash renders a base content hash as the version-stamp identity:
-// 12 hex chars (48 bits) — collision-safe for version comparison across a
-// handful of list generations, short enough to read in logs.
+// baseIDFromHash renders a content hash as a version-stamp identity: the
+// COMPLETE sha256, not a prefix. The stamp is presented as evidence that
+// verifies itself (an archived base.jsonl or journal re-hashes to its
+// stamp), and evidence must survive an adversarial publisher: a truncated
+// prefix turns that claim into a birthday problem — 48 bits fell to ~2^24
+// deliberate-collision work. Log readability does not justify weakening
+// identity; readers may display prefixes, the stamp itself carries it all.
+// (Bundle manifests keep their 12-hex version_id as a display/join key: it
+// remains a prefix of this full hash, and the manifest carries the full
+// sha256 alongside.)
 func baseIDFromHash(h hash.Hash) string {
-	return hex.EncodeToString(h.Sum(nil))[:12]
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // newJournalHash starts the running hash of a journal's byte prefix (the

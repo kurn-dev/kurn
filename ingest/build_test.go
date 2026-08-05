@@ -70,8 +70,13 @@ func TestBuildBundleAndVersionIdentity(t *testing.T) {
 	if !ok {
 		t.Fatal("bundle list missing")
 	}
-	if !strings.HasPrefix(l.Version(), man.VersionID+"@") {
-		t.Fatalf("node version %q does not carry manifest version_id %q", l.Version(), man.VersionID)
+	// The stamp's base half is the manifest's full sha256; the short
+	// version_id keeps its join property as a prefix of both.
+	if !strings.HasPrefix(l.Version(), man.SHA256+"@") {
+		t.Fatalf("node version %q does not carry the manifest sha256 %q", l.Version(), man.SHA256)
+	}
+	if !strings.HasPrefix(l.Version(), man.VersionID) {
+		t.Fatalf("node version %q does not start with version_id %q", l.Version(), man.VersionID)
 	}
 	if c := l.Query("anna smith", engine.QueryOpts{}); len(c) != 1 || c[0].EntryID != "a" {
 		t.Fatalf("bundle content wrong: %+v", c)

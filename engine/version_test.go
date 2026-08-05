@@ -14,10 +14,11 @@ import (
 	"github.com/kurn-dev/kurn/engine"
 )
 
-// Store version stamps: "<baseID>@<entries>+j0" for an empty journal, or
-// "+j<bytes>.<contentHash>" once mutations are journaled — the byte position
-// is replay depth, the hash is the identity.
-var storeVersionRE = regexp.MustCompile(`^([0-9a-f]{12}|empty)@\d+\+j(0|[1-9]\d*\.[0-9a-f]{12})$`)
+// Store version stamps: "<baseID>@<entries>+j0+c<cfg>" for an empty
+// journal, or "+j<bytes>.<journalHash>+c<cfg>" once mutations are journaled
+// — the byte position is replay depth, the hashes (full sha256: base
+// content, journal content, resolved configuration) are the identity.
+var storeVersionRE = regexp.MustCompile(`^([0-9a-f]{64}|empty)@\d+\+j(0|[1-9]\d*\.[0-9a-f]{64})\+c[0-9a-f]{64}$`)
 
 func openVersion(t *testing.T, dir, list string) string {
 	t.Helper()
@@ -234,4 +235,85 @@ func journalSize(t *testing.T, dir string) int64 {
 		t.Fatal(err)
 	}
 	return fi.Size()
+}
+
+// A stamp identifies WHICH data answered — but data bytes are interpreted
+// through a configuration, and byte-identical bases under different modes,
+// analyzers, or defaults answer differently. Two such lists must never
+// share a version; two lists with identical data AND identical resolved
+// config must (determinism is the other half of the same claim).
+func TestSameDataDifferentConfigGetDistinctVersions(t *testing.T) {
+	entries := []engine.Entry{{ID: "e1", Keys: []string{"alpha"}}}
+	mk := func(cfg engine.ListConfig) (*engine.List, string) {
+		t.Helper()
+		dir := t.TempDir()
+		st, err := engine.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.CreateList("codes", cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Replace("codes", append([]engine.Entry(nil), entries...)); err != nil {
+			t.Fatal(err)
+		}
+		l, _ := st.List("codes")
+		return l, dir
+	}
+	ngramCfg := engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true},
+	}
+	la, dirA := mk(ngramCfg)
+	lb, dirB := mk(exactCfg())
+
+	// Validity guard: the data on disk really is byte-identical.
+	ba, err := os.ReadFile(filepath.Join(dirA, "codes", "base.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb, err := os.ReadFile(filepath.Join(dirB, "codes", "base.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ba) != string(bb) {
+		t.Fatal("test setup broke: the two bases are not byte-identical")
+	}
+
+	va, vb := la.Version(), lb.Version()
+	if va == vb {
+		t.Fatalf("ngram and exact lists over identical bytes share version %q", va)
+	}
+	// The configs really do answer differently: a typo'd probe.
+	if got := len(la.Query("alphaa", engine.QueryOpts{})); got != 1 {
+		t.Fatalf("ngram hits = %d, want 1 — the scenario shows nothing", got)
+	}
+	if got := len(lb.Query("alphaa", engine.QueryOpts{})); got != 0 {
+		t.Fatalf("exact hits = %d, want 0 — the scenario shows nothing", got)
+	}
+
+	// Same mode, different analyzer: still distinct.
+	lc, _ := mk(engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "strip_punctuation", "trim"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true},
+	})
+	if lc.Version() == va {
+		t.Fatalf("different analyzer, same version %q", va)
+	}
+	// Same mode and analyzer, different query-time default: still distinct.
+	tweaked := ngramCfg
+	tweaked.Match.TopK = 7
+	ld, _ := mk(tweaked)
+	if ld.Version() == va {
+		t.Fatalf("different topk default, same version %q", va)
+	}
+
+	// Identical config and data: the SAME version (and restart-stable).
+	le, dirE := mk(ngramCfg)
+	if le.Version() != va {
+		t.Fatalf("identical config+data produced %q vs %q — the stamp is not deterministic", le.Version(), va)
+	}
+	if got := openVersion(t, dirE, "codes"); got != va {
+		t.Fatalf("version %q -> %q across restart", va, got)
+	}
 }

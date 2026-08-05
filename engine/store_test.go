@@ -138,7 +138,7 @@ func baseIDOf(t *testing.T, dir, list string) string {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])[:12]
+	return hex.EncodeToString(sum[:])
 }
 
 // rather than rebuilding: base.idx is overwritten with a valid, config-

@@ -2,6 +2,10 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"math"
@@ -76,9 +80,18 @@ type List struct {
 	name string
 	cfg  ListConfig
 	an   analyzer.Analyzer
-	snap atomic.Pointer[snapshot]
-	mu   sync.Mutex // serializes mutations (Replace/Upsert/Delete/Compact)
-	gen  uint64     // snapshot generation; incremented under mu on every store
+
+	// cfgDigest is the identity of the RESOLVED configuration (defaults
+	// applied, analyzer preset expanded to its installed step list) —
+	// immutable, computed once in NewList. Store-managed version stamps
+	// carry it: the same data bytes queried under a different mode,
+	// analyzer, or default answer differently, so a stamp identifying
+	// only the data would let two lists share a version while
+	// contradicting each other.
+	cfgDigest string
+	snap      atomic.Pointer[snapshot]
+	mu        sync.Mutex // serializes mutations (Replace/Upsert/Delete/Compact)
+	gen       uint64     // snapshot generation; incremented under mu on every store
 
 	// baseID is the base content's identity for version stamps (guarded by
 	// mu). The Store sets it to a content hash of base.jsonl (or "empty"),
@@ -183,9 +196,39 @@ func NewList(name string, cfg ListConfig) (*List, error) {
 			return nil, fmt.Errorf("list %s: golden[%d]: min_score %v out of range [0, 100]", name, i, p.MinScore)
 		}
 	}
-	l := &List{name: name, cfg: cfg, an: an, overlaySrc: map[string]Entry{}}
+	l := &List{name: name, cfg: cfg, an: an, cfgDigest: resolvedConfigDigest(cfg, an), overlaySrc: map[string]Entry{}}
 	l.snap.Store(&snapshot{tombstones: map[string]struct{}{}, version: "empty@0"})
 	return l, nil
+}
+
+// resolvedConfigDigest hashes what is actually INSTALLED: the config with
+// defaults applied plus the analyzer's resolved step spec — a preset name
+// hashes as the steps it expanded to, so a stamp made today can be compared
+// with one made after a hypothetical preset redefinition. Domain-separated
+// from the base and journal hashes; every component is length-prefixed
+// (steps contain arbitrary text, and a collision here would let two
+// different configurations share a version stamp — the exact defect the
+// digest exists to prevent).
+func resolvedConfigDigest(cfg ListConfig, an analyzer.Analyzer) string {
+	h := sha256.New()
+	h.Write([]byte("kurn config v1\x00"))
+	var lb [8]byte
+	write := func(b []byte) {
+		binary.BigEndian.PutUint64(lb[:], uint64(len(b)))
+		h.Write(lb[:])
+		h.Write(b)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		// Unreachable: ListConfig is plain data (strings, numbers, bools,
+		// slices of the same). Failing loud beats a silent wrong identity.
+		panic(fmt.Sprintf("engine: marshaling ListConfig for its digest: %v", err))
+	}
+	write(raw)
+	for _, s := range an.Steps() {
+		write([]byte(s))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ResolveAnalyzer turns an AnalyzerConfig (preset or steps) into an Analyzer.
@@ -296,9 +339,20 @@ func (l *List) installBase(seg *segment) {
 // Caller holds l.mu.
 func (l *List) baseStampLocked(n int) string {
 	if l.baseID != "" {
-		return fmt.Sprintf("%s@%d+j0", l.baseID, n)
+		return fmt.Sprintf("%s@%d+j0+c%s", l.baseID, n, l.cfgDigest)
 	}
 	return fmt.Sprintf("gen%d-base@%d", l.gen, n)
+}
+
+// stampFresh restamps a virgin empty list with the content-addressed form.
+// NewList stamps "empty@0" before any Store identity exists; once the Store
+// declares the base identity, the served stamp must carry the full form —
+// including the config digest — and must match what a restart of the same
+// empty list reproduces.
+func (l *List) stampFresh() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.snap.Store(&snapshot{tombstones: map[string]struct{}{}, version: l.baseStampLocked(0)})
 }
 
 // SetBaseID declares the identity of the base content about to be installed
@@ -366,7 +420,7 @@ func (l *List) CommitCompact(b *compactBuild, id string) {
 	l.snap.Store(&snapshot{
 		base:       b.seg,
 		tombstones: map[string]struct{}{},
-		version:    fmt.Sprintf("%s@%d+j0", id, len(b.live)),
+		version:    fmt.Sprintf("%s@%d+j0+c%s", id, len(b.live), l.cfgDigest),
 	})
 	l.overlaySrc = map[string]Entry{}
 }
@@ -606,6 +660,7 @@ func (l *List) commitOverlayLockedAt(b *overlayBuild, jpos int64) {
 		if jpos > 0 {
 			version += "." + baseIDFromHash(l.jhash)
 		}
+		version += "+c" + l.cfgDigest
 	}
 	l.snap.Store(&snapshot{
 		base:       prev.base,
@@ -903,11 +958,14 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 
 // Version returns the snapshot version stamp. Store-managed lists carry the
 // restart-stable content-addressed form
-// "<baseID>@<baseEntries>+j<jbytes>.<jhash>" (baseID = sha256 prefix of
-// base.jsonl, or "empty"; jbytes = journal byte position, replay depth;
-// jhash = sha256 prefix of the journal's exact byte content, omitted for an
-// empty journal): the same disk state always yields the same version, and
-// equal versions identify equal data. Library-managed lists (no Store) keep
+// "<baseID>@<baseEntries>+j<jbytes>[.<jhash>]+c<cfg>" — baseID = sha256 of
+// base.jsonl (or "empty"); jbytes = journal byte position, replay depth;
+// jhash = sha256 of the journal's exact byte content, omitted for an empty
+// journal; cfg = sha256 of the RESOLVED list configuration (see
+// resolvedConfigDigest), because the same data bytes queried under a
+// different mode, analyzer, or default answer differently. The same disk
+// state always yields the same version, and equal versions identify equal
+// data under an equal configuration. Library-managed lists (no Store) keep
 // the process-local "gen…" form — unique within a process, NOT
 // restart-stable.
 func (l *List) Version() string { return l.snap.Load().version }

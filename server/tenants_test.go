@@ -236,3 +236,36 @@ func TestSetTenantsRefusesASharedStore(t *testing.T) {
 		t.Fatalf("error does not explain the aliasing: %v", err)
 	}
 }
+
+// The aliasing that mattered most slipped past a check on the DECLARED
+// pointers: only one tenant named a store, so nothing looked duplicated,
+// and shared_reads resolution then handed the same store to both — with
+// the private tenant holding write access to the namespace every
+// shared-read tenant serves from.
+func TestSetTenantsRefusesPrivateAliasOfTheSharedStore(t *testing.T) {
+	st, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := server.NewServer(st, server.Config{})
+	err = web.SetTenants(map[string]server.TenantRuntime{
+		"private": {Spec: server.TenantSpec{KeyDigests: []string{digestOf("k1")}}, Store: st},
+		"free":    {Spec: server.TenantSpec{KeyDigests: []string{digestOf("k2")}, SharedReads: true}},
+	})
+	if err == nil {
+		t.Fatal("a private tenant was allowed to alias the shared-read store")
+	}
+	if !strings.Contains(err.Error(), "shared_reads") {
+		t.Fatalf("error does not explain the mismatch: %v", err)
+	}
+
+	// Several shared_reads tenants on one store stay legal: they are refused
+	// every mutation, so many readers of one published namespace is the
+	// intended shape, not the bug.
+	if err := web.SetTenants(map[string]server.TenantRuntime{
+		"free1": {Spec: server.TenantSpec{KeyDigests: []string{digestOf("k3")}, SharedReads: true}},
+		"free2": {Spec: server.TenantSpec{KeyDigests: []string{digestOf("k4")}, SharedReads: true}},
+	}); err != nil {
+		t.Fatalf("two shared_reads tenants were refused: %v", err)
+	}
+}

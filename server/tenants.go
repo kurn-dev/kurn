@@ -136,23 +136,50 @@ func (v *Server) SetTenants(ts map[string]TenantRuntime) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	// Two PRIVATE tenants pointing at one store share a namespace silently:
-	// each would see the other's lists under its own name, read them, and
-	// overwrite them, with isolation reported as intact everywhere. kurnd
-	// cannot produce it (one Open per tenant directory), but the library API
-	// takes the stores from its caller and had no opinion about it.
-	// shared_reads is the deliberate version of the same aliasing and is
-	// assigned below, so only stores passed IN are checked here.
-	byStore := make(map[*engine.Store]string, len(ts))
+	// Tenants sharing one store share a namespace: each sees the others'
+	// lists under its own name, reads them, and — unless it is read-only —
+	// overwrites them, with isolation reported as intact everywhere. kurnd
+	// cannot produce that (one Open per tenant directory), but the library
+	// API takes its stores from the caller.
+	//
+	// Validate EFFECTIVE ownership, after shared_reads is resolved to the
+	// node store. Checking the declared pointers first was the bug: a
+	// caller could hand the node store to a PRIVATE tenant and declare a
+	// shared_reads tenant separately, and since only one of the two named a
+	// store, the duplicate check saw nothing — then the second pass gave
+	// both the same store, with the private one holding write access to the
+	// namespace every shared-read tenant serves from.
+	//
+	// Sharing is legitimate for shared_reads tenants and only for them:
+	// they are refused every mutation, so many readers of one published
+	// namespace is the intended free-tier shape.
+	effective := make(map[string]*engine.Store, len(ts))
 	for _, name := range names {
 		rt := ts[name]
-		if rt.Store == nil {
+		if rt.Spec.SharedReads {
+			effective[name] = v.s.st // may be nil; the loop below reports that
 			continue
 		}
-		if other, dup := byStore[rt.Store]; dup {
-			return fmt.Errorf("tenants: %s and %s declare the same store — their lists would silently share one namespace", other, name)
+		if rt.Store != nil && rt.Store == v.s.st {
+			return fmt.Errorf("tenants: %s is not shared_reads but declares the node's shared store — it would hold write access to the namespace shared-read tenants serve from", name)
 		}
-		byStore[rt.Store] = name
+		effective[name] = rt.Store
+	}
+	byStore := make(map[*engine.Store][]string, len(ts))
+	for _, name := range names {
+		if st := effective[name]; st != nil {
+			byStore[st] = append(byStore[st], name)
+		}
+	}
+	for _, owners := range byStore {
+		if len(owners) < 2 {
+			continue
+		}
+		for _, name := range owners {
+			if !ts[name].Spec.SharedReads {
+				return fmt.Errorf("tenants: %s and %s resolve to the same store but %s is not shared_reads — their lists would silently share one namespace", owners[0], owners[len(owners)-1], name)
+			}
+		}
 	}
 	for _, name := range names {
 		rt := ts[name]

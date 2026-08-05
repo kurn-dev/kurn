@@ -62,8 +62,9 @@ type Store struct {
 	mu    sync.RWMutex // guards the lists map and closed; never held across IO
 	lists map[string]*listState
 
-	closed bool           // set by Close: no further mutations, no new background work
-	bg     sync.WaitGroup // background auto-compactions in flight
+	closed    bool           // set by Close: no further mutations, no new work
+	closeDone chan struct{}  // closed when the active Close finishes draining
+	ops       sync.WaitGroup // mutations and background compactions in flight
 
 	// OnArtifactError, if set, observes non-fatal base.idx save failures
 	// (see Compact/Replace: the artifact is a pure cache, so a failed save
@@ -473,9 +474,10 @@ func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) b
 // the repair is a fresh PUT. The nastiest case is the last one, where disk
 // holds a complete and valid new list and only the marker removal failed.
 func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
-	if err := st.mutable(); err != nil {
+	if err := st.beginOp(); err != nil {
 		return nil, err
 	}
+	defer st.endOp()
 	if !listNameRE.MatchString(name) {
 		return nil, &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
 	}
@@ -553,9 +555,10 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 // the prepare succeeded). The per-list lock plus l.mu span
 // prepare+append+commit, so journal order always matches memory order.
 func (st *Store) Upsert(name string, entries []Entry) error {
-	if err := st.mutable(); err != nil {
+	if err := st.beginOp(); err != nil {
 		return err
 	}
+	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -608,9 +611,10 @@ func (e *ListReplacedError) Error() string {
 // generation change and is not refused: concurrent writers to one list are
 // last-writer-wins, as they are for any other mutation.
 func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
-	if err := st.mutable(); err != nil {
+	if err := st.beginOp(); err != nil {
 		return err
 	}
+	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -627,9 +631,10 @@ func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
 // Delete journals the delete then applies it. Same prepare-first ordering
 // rationale as Upsert.
 func (st *Store) Delete(name string, id string) error {
-	if err := st.mutable(); err != nil {
+	if err := st.beginOp(); err != nil {
 		return err
 	}
+	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -661,9 +666,10 @@ func (st *Store) Delete(name string, id string) error {
 // as it was. A list new to this store (bundle shipped into a fresh dir)
 // is added; the name is validated (it became a directory).
 func (st *Store) ReloadList(name string) (*List, error) {
-	if err := st.mutable(); err != nil {
+	if err := st.beginOp(); err != nil {
 		return nil, err
 	}
+	defer st.endOp()
 	if !listNameRE.MatchString(name) {
 		return nil, &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
 	}
@@ -758,9 +764,10 @@ func (st *Store) maybeAutoCompact(name string, ls *listState, l *List) {
 //     a failed save must not fail an otherwise-durable compact. The caller
 //     still gets nil; OnArtifactError (if set) observes the error.
 func (st *Store) Compact(name string) error {
-	if err := st.mutable(); err != nil {
+	if err := st.beginOp(); err != nil {
 		return err
 	}
+	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -810,9 +817,10 @@ func (st *Store) Compact(name string) error {
 //     (6) means an artifact failure can never leave old memory serving a
 //     replaced on-disk list.
 func (st *Store) Replace(name string, entries []Entry) error {
-	if err := st.mutable(); err != nil {
+	if err := st.beginOp(); err != nil {
 		return err
 	}
+	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
 		return err
@@ -888,28 +896,47 @@ func (st *Store) saveArtifact(l *List, lp string, ng *ngram.Index, ex *exact.Ind
 // ErrStoreClosed is returned by every mutation once Close has run.
 var ErrStoreClosed = errors.New("store: closed")
 
-// mutable refuses mutations on a closed store.
-func (st *Store) mutable() error {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
+// beginOp admits one mutation, or refuses it once the store is closed. The
+// caller must endOp when it finishes.
+//
+// Registration happens under the same lock that Close sets `closed` under,
+// and — this is the part that matters — it happens BEFORE the mutation
+// resolves its list or takes any per-list lock. An earlier version merely
+// checked a flag here and let Close sweep the per-list locks afterwards,
+// which proved nothing: a mutation that had passed the check but not yet
+// reached its lock was invisible to the sweep, and wrote after Close
+// returned. Holding a WaitGroup slot across the whole mutation makes the
+// wait exhaustive by construction instead of by argument.
+func (st *Store) beginOp() error {
+	st.mu.Lock()
 	if st.closed {
+		st.mu.Unlock()
 		return ErrStoreClosed
+	}
+	st.ops.Add(1)
+	st.mu.Unlock()
+	if testHookAdmitted != nil {
+		testHookAdmitted()
 	}
 	return nil
 }
 
-// spawnBG starts background work unless the store is closed. Registering
-// under the lock that Close sets `closed` under is what makes Close's wait
-// exhaustive: no goroutine can be added after Close decides to wait.
+// testHookAdmitted runs after a mutation is admitted and before it resolves
+// its list or takes any lock — precisely the window Close must cover, and
+// the one an earlier implementation left open. Tests set it; it is nil in
+// every other build and library code never assigns it.
+var testHookAdmitted func()
+
+func (st *Store) endOp() { st.ops.Done() }
+
+// spawnBG starts background work unless the store is closed, on the same
+// counter and under the same rule as beginOp.
 func (st *Store) spawnBG(f func()) bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.closed {
+	if err := st.beginOp(); err != nil {
 		return false
 	}
-	st.bg.Add(1)
 	go func() {
-		defer st.bg.Done()
+		defer st.endOp()
 		f()
 	}()
 	return true
@@ -933,25 +960,24 @@ func (st *Store) spawnBG(f func()) bool {
 func (st *Store) Close() error {
 	st.mu.Lock()
 	if st.closed {
+		// A second caller must not mistake "someone is closing" for "the
+		// directory is released" — it waits for the active drain, so every
+		// caller's return means the same thing.
+		done := st.closeDone
 		st.mu.Unlock()
+		<-done
 		return nil
 	}
 	st.closed = true
-	lists := make([]*listState, 0, len(st.lists))
-	for _, ls := range st.lists {
-		lists = append(lists, ls)
-	}
+	st.closeDone = make(chan struct{})
+	done := st.closeDone
 	st.mu.Unlock()
 
-	// Background compactions registered before the flag went up.
-	st.bg.Wait()
-	// And mutations already past the guard: each holds its list's lock for
-	// its whole prepare-journal-commit span, so taking every lock in turn
-	// waits them out. Nothing else is held here, so nothing can deadlock.
-	for _, ls := range lists {
-		ls.lock.Lock()
-		ls.lock.Unlock() //nolint:staticcheck // draining, not guarding
-	}
+	// Every mutation and background compaction holds a counter slot from
+	// before it touches a list until after its last write, and none can be
+	// admitted once closed is set — so this wait is the whole guarantee.
+	st.ops.Wait()
+	close(done)
 	return nil
 }
 

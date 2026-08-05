@@ -267,7 +267,8 @@ func (s *srv) createList(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusForbidden, msg)
 		return
 	}
-	if _, err := s.stOf(r.Context()).CreateList(name, cfg); err != nil {
+	_, cv, err := s.stOf(r.Context()).CreateListVersioned(name, cfg)
+	if err != nil {
 		// Caller input (bad name, bad preset/steps, bad match mode) is a
 		// typed engine.ConfigError → 400. Everything else CreateList can
 		// return is a store IO fault (mkdir/remove/config write) → 500.
@@ -280,7 +281,7 @@ func (s *srv) createList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reg.creates.Add(1)
-	s.auditMut(r.Context(), s.stOf(r.Context()), "create", name, 0, false)
+	s.auditMut(r.Context(), "create", name, 0, cv, false)
 	writeJSON(w, http.StatusOK, map[string]string{"list": name})
 }
 
@@ -410,21 +411,23 @@ func (s *srv) upsertEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if replace {
-		if err := st.Replace(name, entries); err != nil {
+		v, err := st.ReplaceVersioned(name, entries)
+		if err != nil {
 			mapStoreError(w, err)
 			return
 		}
 		s.reg.replaces.Add(1)
-		s.auditMut(r.Context(), st, "replace", name, len(entries), false)
+		s.auditMut(r.Context(), "replace", name, len(entries), v, false)
 		writeJSON(w, http.StatusOK, mutationResp(mustList(st, name), "replaced", len(entries)))
 		return
 	}
-	if err := st.Upsert(name, entries); err != nil {
+	v, err := st.UpsertVersioned(name, entries)
+	if err != nil {
 		mapStoreError(w, err)
 		return
 	}
 	s.reg.upserts.Add(1)
-	s.auditMut(r.Context(), st, "upsert", name, len(entries), false)
+	s.auditMut(r.Context(), "upsert", name, len(entries), v, false)
 	writeJSON(w, http.StatusOK, mutationResp(mustList(st, name), "upserted", len(entries)))
 }
 
@@ -459,6 +462,7 @@ func (s *srv) upsertNDJSON(w http.ResponseWriter, r *http.Request, name string, 
 	var (
 		acc     []engine.Entry // replace: everything; append: current batch
 		applied int            // append mode: entries durably applied so far
+		lastVer string         // version committed by the most recent batch
 		lineNo  int
 	)
 	// Append mode applies in batches, and each batch would otherwise resolve
@@ -480,8 +484,9 @@ func (s *srv) upsertNDJSON(w http.ResponseWriter, r *http.Request, name string, 
 		}
 		if applied > 0 {
 			// Partial success is durable (journaled batches were
-			// acknowledged) — it must reach the audit stream too.
-			s.auditMut(r.Context(), st, "upsert", name, applied, true)
+			// acknowledged) — it must reach the audit stream too, stamped
+			// with the last batch's committed version.
+			s.auditMut(r.Context(), "upsert", name, applied, lastVer, true)
 		}
 		writeJSON(w, status, map[string]any{"error": msg, "applied": applied})
 	}
@@ -495,10 +500,12 @@ func (s *srv) upsertNDJSON(w http.ResponseWriter, r *http.Request, name string, 
 			fail(http.StatusForbidden, msg)
 			return false
 		}
-		if err := st.UpsertGen(name, gen, acc); err != nil {
+		v, err := st.UpsertGenVersioned(name, gen, acc)
+		if err != nil {
 			fail(storeErrStatus(err), err.Error())
 			return false
 		}
+		lastVer = v
 		applied += len(acc)
 		acc = acc[:0]
 		return true
@@ -541,12 +548,13 @@ func (s *srv) upsertNDJSON(w http.ResponseWriter, r *http.Request, name string, 
 			fail(http.StatusForbidden, msg)
 			return
 		}
-		if err := st.Replace(name, acc); err != nil {
+		v, err := st.ReplaceVersioned(name, acc)
+		if err != nil {
 			mapStoreError(w, err)
 			return
 		}
 		s.reg.replaces.Add(1)
-		s.auditMut(r.Context(), st, "replace", name, len(acc), false)
+		s.auditMut(r.Context(), "replace", name, len(acc), v, false)
 		writeJSON(w, http.StatusOK, mutationResp(mustList(st, name), "replaced", len(acc)))
 		return
 	}
@@ -559,7 +567,7 @@ func (s *srv) upsertNDJSON(w http.ResponseWriter, r *http.Request, name string, 
 	// number the platform bills on; the global family answers ops-shaped
 	// questions and need not match.
 	s.reg.upserts.Add(1)
-	s.auditMut(r.Context(), st, "upsert", name, applied, false)
+	s.auditMut(r.Context(), "upsert", name, applied, lastVer, false)
 	writeJSON(w, http.StatusOK, mutationResp(mustList(st, name), "upserted", applied))
 }
 
@@ -572,12 +580,13 @@ func (s *srv) deleteEntry(w http.ResponseWriter, r *http.Request) {
 	}
 	// Deleting an ID that isn't live is a no-op in the engine; the delete is
 	// still journaled and acknowledged (idempotent tombstone semantics).
-	if err := st.Delete(name, id); err != nil {
+	v, err := st.DeleteVersioned(name, id)
+	if err != nil {
 		mapStoreError(w, err)
 		return
 	}
 	s.reg.deletes.Add(1)
-	s.auditMut(r.Context(), st, "delete", name, 1, false)
+	s.auditMut(r.Context(), "delete", name, 1, v, false)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
@@ -589,13 +598,14 @@ func (s *srv) compact(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusNotFound, fmt.Sprintf("unknown list %q", name))
 		return
 	}
-	if err := st.Compact(name); err != nil {
+	v, err := st.CompactVersioned(name)
+	if err != nil {
 		mapStoreError(w, err)
 		return
 	}
 	s.reg.compacts.Add(1)
 	e, _, _ := l.Stats()
-	s.auditMut(r.Context(), st, "compact", name, e, false)
+	s.auditMut(r.Context(), "compact", name, e, v, false)
 	// l's snapshot was swapped in place by Compact: statsOf reads fresh state.
 	writeJSON(w, http.StatusOK, statsOf(l))
 }
@@ -610,7 +620,7 @@ func (s *srv) compact(w http.ResponseWriter, r *http.Request) {
 func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("list")
 	st := s.stOf(r.Context())
-	l, err := st.ReloadList(name)
+	l, rv, err := st.ReloadListVersioned(name)
 	if err != nil {
 		var cfgErr *engine.ConfigError
 		if errors.As(err, &cfgErr) {
@@ -622,7 +632,7 @@ func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 	}
 	s.ready.Store(nil) // readiness must re-evaluate the swapped list
 	s.reg.replaces.Add(1)
-	s.auditMut(r.Context(), st, "reload", name, func() int { e, _, _ := l.Stats(); return e }(), false)
+	s.auditMut(r.Context(), "reload", name, func() int { e, _, _ := l.Stats(); return e }(), rv, false)
 
 	type goldenResult struct {
 		Q      string `json:"q"`
@@ -809,7 +819,10 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 			lopts.TopK = effK
 		}
 		lstart := time.Now()
-		cands := l.QueryCtx(ctx, req.Q, lopts)
+		// Candidates and version from ONE snapshot: reading l.Version()
+		// separately here let a mutation that landed mid-query stamp this
+		// answer with data it never saw.
+		cands, ver := l.QueryVersioned(ctx, req.Q, lopts)
 		s.reg.observeQuery(tenantName(ctx), name, time.Since(lstart), len(cands) > 0)
 		for _, c := range cands {
 			out = append(out, respCand{
@@ -820,7 +833,7 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 				Payload: c.Payload,
 			})
 		}
-		versions[name] = l.Version()
+		versions[name] = ver
 	}
 	// Merge: score desc, entry_id asc; stable so full ties keep request
 	// list order.

@@ -735,10 +735,37 @@ func (l *List) Query(q string, opts QueryOpts) []Candidate {
 // ctx.Err(). The exact path takes no checks: its work is bounded by the
 // probe-level count and the topK collection cap, microseconds at any scale.
 func (l *List) QueryCtx(ctx context.Context, q string, opts QueryOpts) []Candidate {
+	c, _ := l.QueryVersioned(ctx, q, opts)
+	return c
+}
+
+// testHookQuerySnapshot runs after QueryVersioned has loaded its snapshot
+// and before the query executes — the window in which a concurrent mutation
+// must NOT be able to change which version the answer is attributed to.
+// Tests set it; it is nil in every other build.
+var testHookQuerySnapshot func()
+
+// QueryVersioned is QueryCtx additionally returning the version stamp of
+// the snapshot that produced the candidates. Candidates and version come
+// from ONE atomic snapshot load: an answer's version is its evidence, and
+// reading Version() separately after the query would let a concurrent
+// mutation stamp one snapshot's candidates with another snapshot's
+// identity. Callers recording versions (audit, response envelopes) must use
+// this instead of a separate Version() call.
+func (l *List) QueryVersioned(ctx context.Context, q string, opts QueryOpts) ([]Candidate, string) {
+	s := l.snap.Load()
+	if testHookQuerySnapshot != nil {
+		testHookQuerySnapshot()
+	}
+	return l.querySnap(ctx, s, q, opts), s.version
+}
+
+// querySnap runs a query against one already-loaded snapshot (see
+// QueryVersioned for why the load happens exactly once).
+func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryOpts) []Candidate {
 	if ctx.Err() != nil {
 		return nil
 	}
-	s := l.snap.Load()
 	aq := l.an.Normalize(q)
 	if aq == "" {
 		return nil

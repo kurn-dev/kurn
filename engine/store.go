@@ -508,12 +508,20 @@ func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) b
 // the repair is a fresh PUT. The nastiest case is the last one, where disk
 // holds a complete and valid new list and only the marker removal failed.
 func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
+	l, _, err := st.CreateListVersioned(name, cfg)
+	return l, err
+}
+
+// CreateListVersioned is CreateList returning the fresh list's version
+// stamp, captured under the creation lock (see UpsertVersioned for why a
+// later Version() lookup is not evidence of THIS operation).
+func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string, error) {
 	if err := st.beginOp(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer st.endOp()
 	if !listNameRE.MatchString(name) {
-		return nil, &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
+		return nil, "", &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
 	}
 	// Resolve a preset to its explicit step list BEFORE the config is
 	// persisted: config.json is the authority on reopen, so a future edit to
@@ -526,7 +534,7 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 	}
 	l, err := NewList(name, cfg) // validates config, applies defaults
 	if err != nil {
-		return nil, &ConfigError{err}
+		return nil, "", &ConfigError{err}
 	}
 	st.mu.Lock()
 	ls := st.lists[name]
@@ -539,7 +547,7 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 	defer ls.lock.Unlock()
 	lp := st.listPath(name)
 	if err := os.MkdirAll(lp, 0o755); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Marker brackets the non-atomic wipe+config window: if the process dies
 	// anywhere inside it, the surviving marker makes Open skip the dir (its
@@ -553,31 +561,33 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 	// directory entry, so once it returns a crash cannot lose the bracket.
 	mp := filepath.Join(lp, markerFile)
 	if err := writeFileAtomic(mp, []byte("create/replace in progress\n")); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// PUT-replace semantics: prior snapshot/journal are gone.
 	for _, f := range []string{baseFile, idxFile, journalFile} {
 		if err := os.Remove(filepath.Join(lp, f)); err != nil && !os.IsNotExist(err) {
-			return nil, err
+			return nil, "", err
 		}
 	}
 	raw, err := json.Marshal(l.Config()) // resolved config (defaults applied)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := writeFileAtomic(filepath.Join(lp, configFile), append(raw, '\n')); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := os.Remove(mp); err != nil {
 		// Disk state is complete but the marker survives: without this remove
 		// the next Open would skip the list, so surface the failure now.
-		return nil, fmt.Errorf("store: clearing %s: %w", markerFile, err)
+		return nil, "", fmt.Errorf("store: clearing %s: %w", markerFile, err)
 	}
 	l.SetBaseID("empty") // store-managed: content-addressed stamps from the start
 	l.setJournalHash(newJournalHash())
 	ls.journalDamaged = false // the journal file was removed above: rebuilt wholesale
 	ls.l.Store(l)
-	return l, nil
+	// Captured under ls.lock: the version this create committed, not
+	// whatever a later mutation may have installed by audit time.
+	return l, l.snap.Load().version, nil
 }
 
 // Upsert journals the entries then applies them to the in-memory list. The
@@ -591,13 +601,23 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 // the prepare succeeded). The per-list lock plus l.mu span
 // prepare+append+commit, so journal order always matches memory order.
 func (st *Store) Upsert(name string, entries []Entry) error {
+	_, err := st.UpsertVersioned(name, entries)
+	return err
+}
+
+// UpsertVersioned is Upsert additionally returning the committed version
+// stamp, captured under the same locks that committed the mutation. An
+// audit record pairing this mutation with a version looked up AFTERWARDS
+// can be stamped with a LATER mutation's version; this return is the only
+// race-free way to know which version an acknowledged mutation produced.
+func (st *Store) UpsertVersioned(name string, entries []Entry) (string, error) {
 	if err := st.beginOp(); err != nil {
-		return err
+		return "", err
 	}
 	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
@@ -605,12 +625,13 @@ func (st *Store) Upsert(name string, entries []Entry) error {
 }
 
 // upsertLocked is the shared body of Upsert and UpsertGen; ls.lock is held.
-func (st *Store) upsertLocked(name string, ls *listState, l *List, entries []Entry) error {
+// Returns the committed version (see UpsertVersioned).
+func (st *Store) upsertLocked(name string, ls *listState, l *List, entries []Entry) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, err := l.prepareUpsertLocked(entries)
 	if err != nil {
-		return err
+		return "", err
 	}
 	recs := make([]journalRec, len(entries))
 	for i := range entries {
@@ -618,11 +639,11 @@ func (st *Store) upsertLocked(name string, ls *listState, l *List, entries []Ent
 	}
 	jpos, err := st.appendJournal(ls, l, filepath.Join(st.listPath(name), journalFile), recs)
 	if err != nil {
-		return err
+		return "", err
 	}
 	l.commitOverlayLockedAt(b, jpos)
 	st.maybeAutoCompact(name, ls, l)
-	return nil
+	return l.snap.Load().version, nil
 }
 
 // ListReplacedError reports that a list was recreated (PUT) or reloaded
@@ -647,19 +668,27 @@ func (e *ListReplacedError) Error() string {
 // generation change and is not refused: concurrent writers to one list are
 // last-writer-wins, as they are for any other mutation.
 func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
+	_, err := st.UpsertGenVersioned(name, gen, entries)
+	return err
+}
+
+// UpsertGenVersioned is UpsertGen returning the committed version stamp
+// (see UpsertVersioned). A streaming caller audits with the LAST batch's
+// version — the one covering everything it acknowledged.
+func (st *Store) UpsertGenVersioned(name string, gen *List, entries []Entry) (string, error) {
 	if err := st.beginOp(); err != nil {
-		return err
+		return "", err
 	}
 	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
 	l := ls.l.Load()
 	if gen != nil && l != gen {
-		return &ListReplacedError{Name: name}
+		return "", &ListReplacedError{Name: name}
 	}
 	return st.upsertLocked(name, ls, l, entries)
 }
@@ -667,13 +696,20 @@ func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
 // Delete journals the delete then applies it. Same prepare-first ordering
 // rationale as Upsert.
 func (st *Store) Delete(name string, id string) error {
+	_, err := st.DeleteVersioned(name, id)
+	return err
+}
+
+// DeleteVersioned is Delete returning the committed version stamp (see
+// UpsertVersioned).
+func (st *Store) DeleteVersioned(name string, id string) (string, error) {
 	if err := st.beginOp(); err != nil {
-		return err
+		return "", err
 	}
 	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
@@ -682,15 +718,15 @@ func (st *Store) Delete(name string, id string) error {
 	defer l.mu.Unlock()
 	b, err := l.prepareDeleteLocked(id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	jpos, err := st.appendJournal(ls, l, filepath.Join(st.listPath(name), journalFile), []journalRec{{Op: "delete", ID: id}})
 	if err != nil {
-		return err
+		return "", err
 	}
 	l.commitOverlayLockedAt(b, jpos)
 	st.maybeAutoCompact(name, ls, l)
-	return nil
+	return l.snap.Load().version, nil
 }
 
 // ReloadList re-opens the named list from its on-disk dir — the publish
@@ -702,12 +738,20 @@ func (st *Store) Delete(name string, id string) error {
 // as it was. A list new to this store (bundle shipped into a fresh dir)
 // is added; the name is validated (it became a directory).
 func (st *Store) ReloadList(name string) (*List, error) {
+	l, _, err := st.ReloadListVersioned(name)
+	return l, err
+}
+
+// ReloadListVersioned is ReloadList returning the reloaded list's version
+// stamp, captured under the reload lock (see UpsertVersioned for why a
+// later Version() lookup is not evidence of THIS operation).
+func (st *Store) ReloadListVersioned(name string) (*List, string, error) {
 	if err := st.beginOp(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer st.endOp()
 	if !listNameRE.MatchString(name) {
-		return nil, &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
+		return nil, "", &ConfigError{fmt.Errorf("store: invalid list name %q", name)}
 	}
 	st.mu.Lock()
 	ls := st.lists[name]
@@ -723,16 +767,16 @@ func (st *Store) ReloadList(name string) (*List, error) {
 	// it would serve content the bundle's manifest doesn't describe.
 	// Refuse rather than replay or silently delete acknowledged mutations.
 	if fi, err := os.Stat(filepath.Join(st.listPath(name), journalFile)); err == nil && fi.Size() > 0 {
-		return nil, fmt.Errorf("store: %s has a non-empty %s — a bundle replaces all content; the shipper must remove the journal (ship discipline, platform contract §5)", name, journalFile)
+		return nil, "", fmt.Errorf("store: %s has a non-empty %s — a bundle replaces all content; the shipper must remove the journal (ship discipline, platform contract §5)", name, journalFile)
 	}
 	sweepTempFiles(st.listPath(name))
 	l, err := st.openList(name)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ls.journalDamaged = false // openList re-read/re-hashed whatever is on disk
 	ls.l.Store(l)
-	return l, nil
+	return l, l.snap.Load().version, nil
 }
 
 // maybeAutoCompact schedules a background fold when the list's configured
@@ -801,34 +845,41 @@ func (st *Store) maybeAutoCompact(name string, ls *listState, l *List) {
 //     a failed save must not fail an otherwise-durable compact. The caller
 //     still gets nil; OnArtifactError (if set) observes the error.
 func (st *Store) Compact(name string) error {
+	_, err := st.CompactVersioned(name)
+	return err
+}
+
+// CompactVersioned is Compact returning the committed version stamp (see
+// UpsertVersioned).
+func (st *Store) CompactVersioned(name string) (string, error) {
 	if err := st.beginOp(); err != nil {
-		return err
+		return "", err
 	}
 	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
 	l := ls.l.Load()
 	b, err := l.PrepareCompact()
 	if err != nil {
-		return err
+		return "", err
 	}
 	lp := st.listPath(name)
 	id, err := st.persistBase(lp, b.live)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil && !os.IsNotExist(err) {
-		return err // a missing journal is already empty
+		return "", err // a missing journal is already empty
 	}
 	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
 	ls.journalDamaged = false
 	l.CommitCompact(b, id)
 	st.saveArtifact(l, lp, b.seg.ng, b.seg.ex)
-	return nil
+	return l.snap.Load().version, nil
 }
 
 // Replace swaps the whole list content: new base + empty journal on disk,
@@ -856,13 +907,20 @@ func (st *Store) Compact(name string) error {
 //     (6) means an artifact failure can never leave old memory serving a
 //     replaced on-disk list.
 func (st *Store) Replace(name string, entries []Entry) error {
+	_, err := st.ReplaceVersioned(name, entries)
+	return err
+}
+
+// ReplaceVersioned is Replace returning the committed version stamp (see
+// UpsertVersioned).
+func (st *Store) ReplaceVersioned(name string, entries []Entry) (string, error) {
 	if err := st.beginOp(); err != nil {
-		return err
+		return "", err
 	}
 	defer st.endOp()
 	ls, err := st.get(name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
@@ -871,22 +929,22 @@ func (st *Store) Replace(name string, entries []Entry) error {
 	if err != nil {
 		// Unbuildable base (exact-mode hot key): nothing persisted, nothing
 		// installed — the list is exactly as before.
-		return err
+		return "", err
 	}
 	lp := st.listPath(name)
 	id, err := st.persistBase(lp, entries)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Truncate(filepath.Join(lp, journalFile), 0); err != nil && !os.IsNotExist(err) {
-		return err
+		return "", err
 	}
 	l.setJournalHash(newJournalHash()) // truncated: the running hash restarts with the file
 	ls.journalDamaged = false
 	l.SetBaseID(id) // before install: the base stamp carries the new hash
 	l.installBase(seg)
 	st.saveArtifact(l, lp, seg.ng, seg.ex)
-	return nil
+	return l.snap.Load().version, nil
 }
 
 // persistBase writes entries to a temp file, then removes any base.idx (the

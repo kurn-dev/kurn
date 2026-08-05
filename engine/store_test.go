@@ -141,6 +141,31 @@ func baseIDOf(t *testing.T, dir, list string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// assertArtifactFastPathsAfterHeal proves a fallback rewrite is the promised
+// one-time cost: a second Open must load, not replace, the healed artifact.
+func assertArtifactFastPathsAfterHeal(t *testing.T, dir, list string) {
+	t.Helper()
+	path := filepath.Join(dir, list, "base.idx")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := engine.Open(dir)
+	if err != nil {
+		t.Fatalf("open after artifact heal: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close after artifact heal: %v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("second Open rewrote the healed artifact instead of fast-pathing it")
+	}
+}
+
 // rather than rebuilding: base.idx is overwritten with a valid, config-
 // matching index built from DIFFERENT keys, and after restart queries follow
 // the doctored index, not base.jsonl's keys.
@@ -197,6 +222,10 @@ func TestStoreCorruptArtifactFallsBack(t *testing.T) {
 	if e, o, tb := l.Stats(); e != 2 || o != 0 || tb != 0 {
 		t.Fatalf("fallback stats %d,%d,%d", e, o, tb)
 	}
+	if _, _, _, err := artifact.Load(idxPath); err != nil {
+		t.Fatalf("fallback did not heal base.idx: %v", err)
+	}
+	assertArtifactFastPathsAfterHeal(t, dir, "people")
 }
 
 // TestStoreConfigChangeRebuilds: index-time config edited on disk (grams)
@@ -475,6 +504,10 @@ func TestStoreExactCorruptArtifactFallsBack(t *testing.T) {
 	if e, o, tb := l.Stats(); e != 2 || o != 0 || tb != 0 {
 		t.Fatalf("fallback stats %d,%d,%d", e, o, tb)
 	}
+	if _, _, _, err := artifact.LoadExact(idxPath); err != nil {
+		t.Fatalf("fallback did not heal exact base.idx: %v", err)
+	}
+	assertArtifactFastPathsAfterHeal(t, dir, "codes")
 }
 
 // TestStoreExactMismatchedArtifactFallsBack: a valid exact artifact whose

@@ -18,6 +18,66 @@ func internalPersonCfg() ListConfig {
 	}
 }
 
+// A marker write can fail only after rename (the directory fsync). In that
+// case .creating is already visible, so restart skips the list while this
+// process still has its old snapshot. The error must quarantine mutations;
+// pre-rename write failures deliberately do not.
+func TestCreateMarkerPublicationFailureQuarantines(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	syncAtomicWriteDir = func(string) error { return errors.New("injected marker directory sync failure") }
+	if _, err := st.CreateList("people", internalPersonCfg()); err == nil {
+		syncAtomicWriteDir = syncDir
+		t.Fatal("create with published-marker sync failure reported success")
+	}
+	syncAtomicWriteDir = syncDir
+
+	l, _ := st.List("people")
+	if c := l.Query("marcus chen", QueryOpts{}); len(c) != 1 {
+		t.Fatalf("old acknowledged snapshot stopped serving: %+v", c)
+	}
+	if err := st.Upsert("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("append after marker publication failure: %v, want ErrListDamaged", err)
+	}
+	if got := st.DamagedLists(); len(got) != 1 || got[0].List != "people" {
+		t.Fatalf("damaged list not reported: %+v", got)
+	}
+
+	if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+		t.Fatalf("re-create repair: %v", err)
+	}
+}
+
+// The first-ever-create form leaves a nil List placeholder. It still has to
+// appear in DamagedLists so readiness cache keys can observe it immediately.
+func TestFirstCreateMarkerPublicationFailureIsReported(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncAtomicWriteDir = func(string) error { return errors.New("injected marker directory sync failure") }
+	defer func() { syncAtomicWriteDir = syncDir }()
+	if _, err := st.CreateList("people", internalPersonCfg()); err == nil {
+		t.Fatal("first create with published-marker sync failure reported success")
+	}
+	if _, ok := st.List("people"); ok {
+		t.Fatal("failed first create exposed a List")
+	}
+	if got := st.DamagedLists(); len(got) != 1 || got[0].List != "people" {
+		t.Fatalf("nil-placeholder damage not reported: %+v", got)
+	}
+}
+
 // TestAppendJournalPartialWriteRolledBack: a journal append that fails midway
 // must truncate the file back to its pre-append size, so the fragment cannot
 // glue onto the NEXT acknowledged append (which the following restart's
@@ -508,8 +568,9 @@ func TestCreateListPostWipeFailureQuarantinesMutations(t *testing.T) {
 // re-create rebuilds the whole declaration.
 func TestCreateDamageRefusesReplaceAndCompactRepairs(t *testing.T) {
 	ngramCfg := ListConfig{
-		Analyzer: AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
-		Match:    MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true},
+		Analyzer:           AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:              MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true},
+		OverlayAutoCompact: 1,
 	}
 	exactCfg := ListConfig{
 		Analyzer: AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
@@ -526,6 +587,18 @@ func TestCreateDamageRefusesReplaceAndCompactRepairs(t *testing.T) {
 	if err := st.Replace("codes", []Entry{{ID: "e1", Keys: []string{"alpha"}}}); err != nil {
 		t.Fatal(err)
 	}
+	// Build an over-threshold overlay without letting the normal mutation
+	// tail schedule its fold yet; after the failed PUT we explicitly schedule
+	// that same auto-compact and prove it cannot clear create damage.
+	ls, err := st.get("codes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ls.autoCompacting.Store(true)
+	if err := st.Upsert("codes", []Entry{{ID: "e2", Keys: []string{"beta"}}}); err != nil {
+		t.Fatal(err)
+	}
+	ls.autoCompacting.Store(false)
 
 	// The PUT to exact mode dies after its destructive window began — the
 	// exact config may already be on disk under the surviving marker.
@@ -551,6 +624,20 @@ func TestCreateDamageRefusesReplaceAndCompactRepairs(t *testing.T) {
 	}
 	if err := st.Upsert("codes", []Entry{{ID: "e2", Keys: []string{"beta"}}}); !errors.Is(err, ErrListDamaged) {
 		t.Fatalf("Upsert on create damage: err=%v, want ErrListDamaged", err)
+	}
+	st.maybeAutoCompact("codes", ls, ls.l.Load())
+	deadline := time.Now().Add(2 * time.Second)
+	for ls.autoCompacting.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ls.autoCompacting.Load() {
+		t.Fatal("auto-compact did not finish")
+	}
+	if _, ov, _ := ls.l.Load().Stats(); ov != 1 {
+		t.Fatalf("auto-compact crossed create damage: overlay=%d, want 1", ov)
+	}
+	if err := st.Compact("codes"); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("damage cleared after auto-compact attempt: %v", err)
 	}
 
 	// The real repair: re-create, then load content.

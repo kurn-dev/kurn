@@ -235,6 +235,12 @@ func syncPath(path string) error {
 // (a directory fsync); a seam for the same reason as syncJournalTruncate.
 var syncMarkerRemove = syncDir
 
+// syncAtomicWriteDir makes writeFileAtomic's rename durable. It is a seam
+// for the marker-publication boundary: a failure here happens AFTER rename,
+// so callers must know that the target is already visible even though the
+// operation returned an error.
+var syncAtomicWriteDir = syncDir
+
 // syncJournalTruncate makes a journal truncation power-loss-durable; a seam
 // so tests can pin WHEN it happens (after the truncate, before the in-memory
 // install acknowledges) — real power loss is not reproducible in a test.
@@ -446,6 +452,12 @@ func (st *Store) openList(name string) (*List, error) {
 			if err := l.Replace(entries); err != nil {
 				return nil, err
 			}
+			// Heal the disposable cache after a successful fallback so an
+			// upgrade, missing file, or corrupt artifact costs one rebuild rather
+			// than one rebuild per restart. Saving remains best-effort, exactly as
+			// it is after Replace/Compact: memory is already sound if this fails.
+			s := l.snap.Load()
+			st.saveArtifact(l, st.listPath(name), s.base.ng, s.base.ex)
 		}
 	} else {
 		// No base: the virgin snapshot must still stamp the full form, or
@@ -625,6 +637,13 @@ func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string
 	// directory entry, so once it returns a crash cannot lose the bracket.
 	mp := filepath.Join(lp, markerFile)
 	if err := writeFileAtomic(mp, []byte("create/replace in progress\n")); err != nil {
+		// Pre-rename failures leave the old list coherent. A directory-sync
+		// failure is different: rename already published .creating, so restart
+		// skips this list while this process serves its old memory.
+		var published *atomicWritePublishedError
+		if errors.As(err, &published) {
+			ls.setDamage(damageCreate)
+		}
 		return nil, "", err
 	}
 	// PUT-replace semantics: prior snapshot/journal are gone. From the
@@ -1698,6 +1717,11 @@ func newJournalHash() hash.Hash {
 // writeFileAtomic writes data via temp+rename (config.json), fsyncing the
 // file and then the containing directory — the rename isn't power-loss-
 // durable until the directory entry is flushed.
+type atomicWritePublishedError struct{ err error }
+
+func (e *atomicWritePublishedError) Error() string { return e.err.Error() }
+func (e *atomicWritePublishedError) Unwrap() error { return e.err }
+
 func writeFileAtomic(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".cfg-*")
 	if err != nil {
@@ -1718,5 +1742,8 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(path))
+	if err := syncAtomicWriteDir(filepath.Dir(path)); err != nil {
+		return &atomicWritePublishedError{err: err}
+	}
+	return nil
 }

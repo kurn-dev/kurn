@@ -9,9 +9,12 @@
 // The claim is enforced, not assumed: every format bounds one record, and
 // an oversize one is a bad record the run can skip (SkipBad) rather than
 // something that ends the run or, worse, materializes. The single
-// exception is a CSV record that never terminates — there is no next
-// record to resume at, so it is fatal at a ceiling well above the record
-// bound.
+// exception: a CSV record that consumes more than a hard input ceiling
+// (16x the record bound) is fatal, terminated or not. At that point the
+// parser cannot tell a huge well-formed record from an unterminated
+// quote without unbounded reading, and resynchronizing by guessing at
+// quote state could silently misparse every record after it — a loud
+// stop is the only honest option left.
 package ingest
 
 import (

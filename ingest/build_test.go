@@ -133,3 +133,54 @@ func TestBuildRejectsDuplicateIDs(t *testing.T) {
 		t.Fatalf("duplicate IDs accepted: %v", err)
 	}
 }
+
+// A failed build must leave a directory the retry can use. An earlier
+// version renamed the store files into outDir and then built the delta in
+// place: a delta failure left base.jsonl behind, and the next Build refused
+// the directory as "already contains a bundle" — blocking exactly the retry
+// the failure invited. Everything now stages first, and base.jsonl (the
+// guard's own sentinel) publishes last.
+func TestFailedDeltaLeavesARetryableDirectory(t *testing.T) {
+	d := t.TempDir()
+	mp := &ingest.Mapping{Format: "csv", ID: "id",
+		Keys: []ingest.KeyRule{{Path: "name"}}, List: exactList()}
+	feed := "id,name\n1,Anna\n2,Bob\n"
+
+	// A prev bundle whose base.jsonl is corrupt: fileSHA256 passes over it,
+	// writeDelta's line parse fails — the delta phase, specifically.
+	prev := filepath.Join(d, "prev")
+	if err := os.MkdirAll(prev, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prev, "base.jsonl"), []byte("not json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(d, "out")
+	_, err := ingest.Build(mp, strings.NewReader(feed), out, ingest.BuildOptions{PrevDir: prev})
+	if err == nil {
+		t.Fatal("a corrupt prev bundle produced a delta")
+	}
+
+	// The decisive property: nothing published, so the same directory
+	// works on retry — here with the prev repaired.
+	if _, serr := os.Stat(filepath.Join(out, "base.jsonl")); !os.IsNotExist(serr) {
+		t.Fatalf("base.jsonl left behind by the failed build (stat err: %v)", serr)
+	}
+	if err := os.WriteFile(filepath.Join(prev, "base.jsonl"),
+		[]byte(`{"id":"1","keys":["anna"]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	man, err := ingest.Build(mp, strings.NewReader(feed), out, ingest.BuildOptions{PrevDir: prev})
+	if err != nil {
+		t.Fatalf("retry after a failed delta was refused: %v", err)
+	}
+	if man.Entries != 2 || man.Delta == nil || man.Delta.Adds != 1 {
+		t.Fatalf("retry produced a wrong bundle: %+v", man)
+	}
+	for _, f := range []string{"config.json", "base.jsonl", "base.idx", "manifest.json", "delta.jsonl"} {
+		if _, err := os.Stat(filepath.Join(out, f)); err != nil {
+			t.Fatalf("retry bundle missing %s: %v", f, err)
+		}
+	}
+}

@@ -52,8 +52,13 @@ func parseNDJSON(r io.Reader, m *Mapping, handle func(any, int) error) error {
 		}
 		// A line is ONE record. Decode stops at the first complete value, so
 		// anything after it was being dropped without a word — two objects
-		// on one line silently became one.
-		if rest, _ := io.ReadAll(dec.Buffered()); len(bytes.TrimSpace(rest)) > 0 {
+		// on one line silently became one. The whole line is in memory, so
+		// slice from the decoder's input offset: an earlier version asked
+		// dec.Buffered(), which holds only the decoder's READ-AHEAD — a
+		// second object beyond that buffer (say, past 10,000 spaces) sat in
+		// the unread remainder and was dropped exactly as silently as
+		// before the check existed.
+		if rest := line[dec.InputOffset():]; len(bytes.TrimSpace(rest)) > 0 {
 			if herr := handle(badDoc{fmt.Errorf("trailing content after the record on this line (one JSON object per line)")}, recNo); herr != nil {
 				return herr
 			}
@@ -106,9 +111,11 @@ type badDoc struct{ err error }
 // unterminated quote turns a 10 GB feed into a 10 GB allocation, and the
 // package's "a 10 GB input never resides in memory" promise is only true
 // for well-formed input. Deliberately far above MaxRecordBytes — a row
-// between the two bounds is a bad record the run can skip, and only a row
-// past this one is fatal, because a record that never ends leaves nowhere
-// to resynchronize to.
+// between the two bounds is a bad record the run can skip; only a row
+// past this one is fatal (see the package doc: SkipBad cannot apply,
+// because the parser cannot resynchronize past the ceiling without
+// guessing at quote state, and a wrong guess silently misparses the rest
+// of the feed).
 const maxCSVInputPerRecord = 16 * MaxRecordBytes
 
 // parseCSV: header row names the columns; each row becomes a
@@ -198,7 +205,7 @@ func extraData(row []string, width int) int {
 	return n
 }
 
-var errCSVRecordTooBig = fmt.Errorf("record exceeds the %d-byte input ceiling (unterminated quote?)", maxCSVInputPerRecord)
+var errCSVRecordTooBig = fmt.Errorf("record consumed over %d bytes of input — a huge well-formed row and an unterminated quote are indistinguishable here, so this is fatal regardless of -skip-bad; if the row is real data, it is %dx over the %d-byte record bound and needs a different transport than CSV", maxCSVInputPerRecord, maxCSVInputPerRecord/MaxRecordBytes, MaxRecordBytes)
 
 // recordLimitReader caps how much INPUT one csv record may consume. The
 // caller marks each record's starting input offset; the reader refuses to

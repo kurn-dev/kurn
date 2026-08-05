@@ -34,8 +34,27 @@ func TestBOMIsStripped(t *testing.T) {
 // A line is one record: Decode stops at the first complete value, so a
 // second object on the same line was dropped without a word.
 func TestNDJSONTrailingContentIsABadRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gap  string
+	}{
+		{"adjacent", " "},
+		// Far beyond the json.Decoder read-ahead: the first version of this
+		// check consulted dec.Buffered() and passed with a one-space gap
+		// while a distant second object was still silently dropped. The
+		// gap must exceed the decoder's buffer for this case to mean
+		// anything.
+		{"beyond read-ahead", strings.Repeat(" ", 64*1024)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testNDJSONTrailing(t, tc.gap)
+		})
+	}
+}
+
+func testNDJSONTrailing(t *testing.T, gap string) {
 	in := `{"id":"1","name":"Anna"}` + "\n" +
-		`{"id":"2","name":"Bob"} {"id":"3","name":"Clara"}` + "\n"
+		`{"id":"2","name":"Bob"}` + gap + `{"id":"3","name":"Clara"}` + "\n"
 
 	_, _, err := collect(t, idKeyMapping("ndjson"), in, ingest.Options{})
 	if err == nil {

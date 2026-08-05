@@ -158,8 +158,8 @@ func TestCSVUnterminatedRecordHitsTheInputCeiling(t *testing.T) {
 	if err == nil {
 		t.Fatal("an endless CSV record was accepted")
 	}
-	if !strings.Contains(err.Error(), "input ceiling") {
-		t.Fatalf("error does not name the ceiling: %v", err)
+	if !strings.Contains(err.Error(), "fatal regardless of -skip-bad") {
+		t.Fatalf("error does not state the contract: %v", err)
 	}
 	// Bounded, not merely terminated: 16 MiB ceiling plus reader slack.
 	if src.n > 24*1024*1024 {
@@ -169,6 +169,33 @@ func TestCSVUnterminatedRecordHitsTheInputCeiling(t *testing.T) {
 	// resynchronize to, so continuing would mean guessing.
 	if strings.Contains(err.Error(), "raise -skip-bad") {
 		t.Fatalf("an unresynchronizable record was offered as skippable: %v", err)
+	}
+}
+
+// The decided contract for the ceiling (follow-up review F5): a row past
+// it is fatal even when well-formed, because the parser cannot tell it
+// from an unterminated quote without unbounded reading, and a guessed
+// resynchronization could silently misparse the rest of the feed. Rows
+// between the 1 MiB record bound and the ceiling stay skippable.
+func TestCSVWellFormedRowPastCeilingIsFatalByContract(t *testing.T) {
+	in := "id,name\n1," + strings.Repeat("x", 17<<20) + "\n2,Bob\n"
+	_, _, err := collect(t, idKeyMapping("csv"), in, ingest.Options{SkipBad: 5})
+	if err == nil {
+		t.Fatal("a row past the input ceiling was accepted")
+	}
+	if !strings.Contains(err.Error(), "fatal regardless of -skip-bad") {
+		t.Fatalf("error does not state the contract: %v", err)
+	}
+
+	// The boundary the contract turns on: a row OVER the record bound but
+	// UNDER the ceiling is an ordinary skippable bad record.
+	in2 := "id,name\n1," + strings.Repeat("x", 2<<20) + "\n2,Bob\n"
+	entries, st, err := collect(t, idKeyMapping("csv"), in2, ingest.Options{SkipBad: 1})
+	if err != nil {
+		t.Fatalf("a between-bounds row aborted the run: %v", err)
+	}
+	if st.Bad != 1 || len(entries) != 1 || entries[0].ID != "2" {
+		t.Fatalf("Bad = %d, entries = %+v, want 1 bad and entry 2", st.Bad, entries)
 	}
 }
 

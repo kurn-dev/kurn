@@ -127,13 +127,14 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 	l, _ := st.List("bundle")
 	keyCount := l.KeyCount()
 
-	for _, f := range []string{"config.json", "base.jsonl", "base.idx"} {
-		if err := os.Rename(filepath.Join(tmp, "bundle", f), filepath.Join(outDir, f)); err != nil {
-			return nil, fmt.Errorf("ingest: assembling bundle: %w", err)
-		}
-	}
-
-	sum, err := fileSHA256(filepath.Join(outDir, "base.jsonl"))
+	// EVERY output — delta and manifest included — is assembled inside the
+	// staging dir before anything reaches outDir. An earlier version
+	// renamed the store files out first and built the delta in place, so a
+	// delta failure left config.json/base.jsonl/base.idx behind, and the
+	// next Build refused the directory as "already contains a bundle": the
+	// failure blocked exactly the retry it invited.
+	stage := filepath.Join(tmp, "bundle")
+	sum, err := fileSHA256(filepath.Join(stage, "base.jsonl"))
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +149,7 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 	}
 	man.Analyzer = engine.AnalyzerSpecDigest(an)
 
+	files := []string{"config.json", "base.idx", "manifest.json"}
 	if opts.PrevDir != "" {
 		prevSum, err := fileSHA256(filepath.Join(opts.PrevDir, "base.jsonl"))
 		if err != nil {
@@ -155,19 +157,30 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 		}
 		man.PrevSHA256 = prevSum
 		ds, err := writeDelta(filepath.Join(opts.PrevDir, "base.jsonl"),
-			filepath.Join(outDir, "base.jsonl"), filepath.Join(outDir, "delta.jsonl"))
+			filepath.Join(stage, "base.jsonl"), filepath.Join(stage, "delta.jsonl"))
 		if err != nil {
 			return nil, err
 		}
 		man.Delta = ds
+		files = append(files, "delta.jsonl")
 	}
 
 	raw, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(outDir, "manifest.json"), append(raw, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(stage, "manifest.json"), append(raw, '\n'), 0o644); err != nil {
 		return nil, err
+	}
+
+	// Publish. Renames within one filesystem; base.jsonl goes LAST because
+	// it is the file the already-contains-a-bundle guard checks, so until
+	// it lands the directory still reads as retryable, and a crash between
+	// renames leaves leftovers a retry simply overwrites.
+	for _, f := range append(files, "base.jsonl") {
+		if err := os.Rename(filepath.Join(stage, f), filepath.Join(outDir, f)); err != nil {
+			return nil, fmt.Errorf("ingest: publishing bundle: %w", err)
+		}
 	}
 	return man, nil
 }

@@ -420,6 +420,11 @@ func TestReplacePostPublicationFailureQuarantinesMutations(t *testing.T) {
 	if err := st.Delete("people", "p1"); !errors.Is(err, ErrListDamaged) {
 		t.Fatalf("delete after post-publication failure: err=%v, want ErrListDamaged", err)
 	}
+	// The journal looks empty in the current namespace, but its truncation
+	// was not durably synced. Reload must not bless that view as repaired.
+	if _, err := st.ReloadList("people"); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("reload after post-publication failure: err=%v, want ErrListDamaged", err)
+	}
 
 	// A destructive retry repairs, and the repaired list is fully usable.
 	if err := st.Replace("people", []Entry{{ID: "p2", Keys: []string{"Dana Kovak"}}}); err != nil {
@@ -494,9 +499,9 @@ func TestCreateListPostWipeFailureQuarantinesMutations(t *testing.T) {
 }
 
 // TestCreateDamageRefusesReplaceAndCompactRepairs — a failed PUT-recreate
-// can leave the NEW declaration's config.json (and always the .creating
-// marker) on disk while old memory serves the old configuration. The
-// advertised Replace/Compact "repairs" rewrote only base+journal and then
+// can leave the NEW declaration's config.json and either a present or
+// not-durably-removed .creating marker while old memory serves the old
+// configuration. The advertised Reload/Replace/Compact "repairs" then
 // cleared the damage: live memory answered ngram-typo queries that a
 // restart — loading the exact-mode config — did not, under different
 // versions. Those repairs must refuse create damage; only a successful
@@ -531,7 +536,13 @@ func TestCreateDamageRefusesReplaceAndCompactRepairs(t *testing.T) {
 	}
 	syncMarkerRemove = syncDir
 
-	// Replace and Compact used to acknowledge a "repair" here.
+	// Reload, Replace, and Compact used to acknowledge a "repair" here.
+	// In the injected late failure, os.Remove(.creating) already succeeded:
+	// Reload therefore sees a currently marker-free exact-mode directory,
+	// but its absence was not durably synced and must not clear quarantine.
+	if _, err := st.ReloadList("codes"); !errors.Is(err, ErrListDamaged) {
+		t.Fatalf("ReloadList on create damage: err=%v, want ErrListDamaged", err)
+	}
 	if err := st.Replace("codes", []Entry{{ID: "e1", Keys: []string{"alpha"}}}); !errors.Is(err, ErrListDamaged) {
 		t.Fatalf("Replace on create damage: err=%v, want ErrListDamaged", err)
 	}

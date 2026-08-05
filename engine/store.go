@@ -272,10 +272,11 @@ type listState struct {
 	// serves and hashes. The KIND decides which repairs count: content
 	// damage is repaired by anything that rebuilds base+journal wholesale,
 	// while create damage — a failed PUT window that may have installed a
-	// DIFFERENT config.json and always leaves the .creating marker behind
-	// — is repaired only by a successful re-create. Replace and Compact
-	// rewrite base and journal but neither restores config.json nor
-	// removes the marker, so letting them clear create damage produced a
+	// DIFFERENT config.json and may leave the .creating marker present or
+	// removed without a durable directory sync — is repaired only by a
+	// successful re-create. Reload only reopens the current disk view;
+	// Replace and Compact rewrite base and journal but not the whole
+	// declaration. Letting any of them clear create damage produced a
 	// "repaired" list whose memory and restart interpreted the same base
 	// under different configurations. Append-path mutations are refused
 	// while any damage stands; queries keep serving the last acknowledged
@@ -294,15 +295,14 @@ const (
 	// damageContent: base/journal bytes are unverifiable (failed append
 	// rollback, or a Replace/Compact that failed after publishing its new
 	// base) while config.json still matches the served List. Repaired by
-	// any successful destructive rebuild: Replace, Compact, re-create, or
-	// reload.
+	// any successful destructive rebuild: Replace, Compact, or re-create.
 	damageContent
 	// damageCreate: a PUT-recreate failed inside its destructive window.
 	// The directory may hold the NEW declaration's config.json while
-	// memory serves the OLD list, and the fsynced .creating marker
-	// survives, so a restart skips the directory entirely. Only a
-	// successful re-create repairs; Replace/Compact must refuse rather
-	// than acknowledge a "repair" that leaves config and marker behind.
+	// memory serves the OLD list. The fsynced .creating marker may survive,
+	// or its removal may be visible but not durable, so a restart can skip
+	// the directory. Only a successful re-create repairs; Reload, Replace,
+	// and Compact must refuse rather than acknowledge a partial repair.
 	damageCreate
 )
 
@@ -846,6 +846,16 @@ func (st *Store) ReloadListVersioned(name string) (*List, string, error) {
 	st.mu.Unlock()
 	ls.lock.Lock()
 	defer ls.lock.Unlock()
+	// Damage can arise specifically because a namespace update is visible
+	// now but failed its durability sync: .creating may appear absent after
+	// failed Create, or a journal may appear empty after failed truncation.
+	// openList would accept that current view, but clearing damage here could
+	// report the list healthy immediately before a crash resurrects the old
+	// entry. Require the cause-specific destructive repair, which republishes
+	// and syncs the complete state rather than merely reopening it.
+	if ls.getDamage() != damageNone {
+		return nil, "", ls.damageErr()
+	}
 	// Fail-safe (review finding): a bundle replaces ALL list content, so a
 	// leftover journal means the ship discipline was violated — replaying
 	// it would serve content the bundle's manifest doesn't describe.
@@ -1371,11 +1381,12 @@ var fileTruncate = (*os.File).Truncate
 // rebuild — Replace, Compact, or re-create. Create damage (a PUT window
 // that died after its wipe began) is repaired ONLY by a successful
 // re-create: the directory may hold the new declaration's config while
-// memory serves the old list, and the .creating marker survives, so
-// Replace and Compact refuse rather than acknowledge a partial repair.
-// Reload is not a repair in either case — it refuses non-empty journals
-// by ship discipline and marker-bearing directories outright. Match with
-// errors.Is.
+// memory serves the old list, and the .creating marker may remain or
+// have an undurable removal, so Reload, Replace, and Compact refuse
+// rather than acknowledge a partial repair.
+// Reload is not a repair in either case: current namespace state may look
+// coherent precisely because a failed sync did not make it durable, so it
+// refuses damaged state before reopening the directory. Match with errors.Is.
 var ErrListDamaged = errors.New("store: list left in an unverifiable disk/memory state by a failed operation")
 
 func (ls *listState) setDamage(k damageKind) { ls.damage.Store(uint32(k)) }
@@ -1385,7 +1396,7 @@ func (ls *listState) getDamage() damageKind  { return damageKind(ls.damage.Load(
 // whose text names the repair that will actually work.
 func (ls *listState) damageErr() error {
 	if ls.getDamage() == damageCreate {
-		return fmt.Errorf("%w: a create/replace of the list died mid-window (its directory may carry the new declaration and the .creating marker); only a successful PUT re-create repairs it", ErrListDamaged)
+		return fmt.Errorf("%w: a create/replace of the list died mid-window (its directory may carry the new declaration and a present or not-durably-removed .creating marker); only a successful PUT re-create repairs it", ErrListDamaged)
 	}
 	return fmt.Errorf("%w: a successful replace, compact, or re-create repairs it", ErrListDamaged)
 }
@@ -1409,7 +1420,7 @@ func (ls *listState) damageErr() error {
 // (a glued-on fragment would make torn-tail repair silently drop the NEXT
 // acknowledged append). If the rollback itself fails the invariant is
 // unrecoverable in place: the list is marked damaged and further
-// appends are refused until Replace/Compact/ReloadList rebuild the file.
+// appends are refused until Replace, Compact, or re-create rebuilds the file.
 //
 // Returns the journal byte position just past the appended records — the
 // replay-depth half of the version stamp.

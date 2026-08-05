@@ -163,7 +163,7 @@ func (s *srv) metrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	fmt.Fprintf(w, "# HELP kurn_list_entries Live entries in the list (base, pre-tombstone).\n# TYPE kurn_list_entries gauge\n")
+	fmt.Fprintf(w, "# HELP kurn_list_entries Live entries in the list (base minus tombstones, plus overlay).\n# TYPE kurn_list_entries gauge\n")
 	for _, u := range units {
 		e, _, _ := u.l.Stats()
 		fmt.Fprintf(w, "kurn_list_entries%s %d\n", gaugeLabels(u.tenant, u.l.Name()), e)

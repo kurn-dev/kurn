@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -122,7 +123,11 @@ func NewList(name string, cfg ListConfig) (*List, error) {
 	// writes on purpose. Unvalidated, a hand-edited config.json loaded
 	// straight into the maximal-scan, unlimited-collection shape, and a
 	// near-MaxInt topk overflowed segK (topK + len(masked)) negative.
-	if cfg.Match.Threshold < 0 || cfg.Match.Threshold > 1 {
+	// NaN slips through ordinary range comparisons (every one is false), so
+	// it must be named: a NaN threshold would make every score comparison
+	// false downstream — no floor, silently. HTTP JSON cannot express NaN;
+	// this is the direct-library and config-decoder boundary.
+	if math.IsNaN(cfg.Match.Threshold) || cfg.Match.Threshold < 0 || cfg.Match.Threshold > 1 {
 		return nil, fmt.Errorf("list %s: match threshold %v out of range [0, 1] (0 means the mode default; the no-floor sentinel is per-query, not per-list)", name, cfg.Match.Threshold)
 	}
 	if cfg.Match.TopK < 0 || cfg.Match.TopK > maxListTopK {
@@ -174,7 +179,7 @@ func NewList(name string, cfg ListConfig) (*List, error) {
 			return nil, fmt.Errorf("list %s: golden[%d]: one of expect_id or absent is required", name, i)
 		case p.Absent && p.MinScore != 0:
 			return nil, fmt.Errorf("list %s: golden[%d]: min_score requires expect_id", name, i)
-		case p.MinScore < 0 || p.MinScore > 100:
+		case math.IsNaN(p.MinScore) || p.MinScore < 0 || p.MinScore > 100:
 			return nil, fmt.Errorf("list %s: golden[%d]: min_score %v out of range [0, 100]", name, i, p.MinScore)
 		}
 	}

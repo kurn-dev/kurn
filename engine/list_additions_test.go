@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"math"
 	"testing"
 
 	"github.com/kurn-dev/kurn/engine"
@@ -256,5 +257,32 @@ func TestConfigIsDetachedFromCallers(t *testing.T) {
 	got := l.Config()
 	if got.Match.Grams[0] != 2 || got.Analyzer.Steps[0] != "lowercase" || got.Golden[0].ExpectID != "p1" {
 		t.Fatalf("config leaked caller mutations: %+v", got)
+	}
+}
+
+// NaN passes every ordinary range comparison, so an explicit rejection is
+// the only thing between a NaN threshold and a silently floorless list
+// (every downstream score comparison false). Same for golden min_score.
+func TestNonFiniteConfigRejected(t *testing.T) {
+	nan := math.NaN()
+	if _, err := engine.NewList("codes", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Threshold: nan},
+	}); err == nil {
+		t.Error("NaN threshold accepted")
+	}
+	if _, err := engine.NewList("codes", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase"}},
+		Match:    engine.MatchConfig{Mode: "exact"},
+		Golden:   []engine.GoldenProbe{{Q: "x", ExpectID: "p1", MinScore: nan}},
+	}); err == nil {
+		t.Error("NaN golden min_score accepted")
+	}
+	// Infinities were already caught by the range comparisons; pin that.
+	if _, err := engine.NewList("codes", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Threshold: math.Inf(1)},
+	}); err == nil {
+		t.Error("+Inf threshold accepted")
 	}
 }

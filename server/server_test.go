@@ -542,3 +542,26 @@ func TestListTopKDefaultRespectedAndClamped(t *testing.T) {
 		t.Fatalf("explicit topk=7 got %d candidates", len(qr.Candidates))
 	}
 }
+
+// A JSON body is exactly one value. Decoder.More only peeks for another
+// VALUE, so a trailing lone "}" or "]" — the classic doubled/truncated
+// paste — was accepted silently; the check must reject ANY trailing token.
+func TestBodyTrailingTokenRejected(t *testing.T) {
+	ts := newTS(t)
+	for _, body := range []string{
+		`{"analyzer":{"steps":["lowercase"]},"match":{"mode":"exact"}}}`,
+		`{"analyzer":{"steps":["lowercase"]},"match":{"mode":"exact"}}]`,
+		`{"analyzer":{"steps":["lowercase"]},"match":{"mode":"exact"}}{}`,
+	} {
+		resp, rbody := do(t, "PUT", ts.URL+"/v1/lists/codes", body)
+		if resp.StatusCode != 400 {
+			t.Errorf("trailing token accepted (%d): body %q -> %s", resp.StatusCode, body, rbody)
+		}
+	}
+	// The clean body still works, whitespace included.
+	resp, _ := do(t, "PUT", ts.URL+"/v1/lists/codes",
+		`{"analyzer":{"steps":["lowercase"]},"match":{"mode":"exact"}}`+"\n  ")
+	if resp.StatusCode != 200 {
+		t.Fatalf("clean body refused: %d", resp.StatusCode)
+	}
+}

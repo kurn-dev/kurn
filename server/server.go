@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"mime"
@@ -969,7 +970,11 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 		jsonError(w, http.StatusBadRequest, "malformed JSON body: "+err.Error())
 		return false
 	}
-	if dec.More() {
+	// Exactly one value: Token() must hit clean EOF. More() was not enough —
+	// it peeks for another VALUE, so a trailing lone "}" or "]" (a paste
+	// artifact that often means the caller truncated or doubled the body)
+	// slipped through unreported.
+	if _, err := dec.Token(); err != io.EOF {
 		jsonError(w, http.StatusBadRequest, "malformed JSON body: trailing data")
 		return false
 	}

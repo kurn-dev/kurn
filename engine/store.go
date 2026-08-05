@@ -100,8 +100,10 @@ type Store struct {
 	// (default 2ms when zero).
 	JournalFsyncInterval time.Duration
 
-	fsyncOnce sync.Once     // starts the group-commit goroutine lazily
-	fsyncCh   chan fsyncReq // requests to the committer (FsyncInterval only)
+	fsyncOnce    sync.Once     // starts the group-commit goroutine lazily
+	fsyncCh      chan fsyncReq // requests to the committer (FsyncInterval only)
+	fsyncStop    chan struct{} // closed by Close: the committer must exit
+	fsyncStopped chan struct{} // closed by the committer as it returns
 
 	// Skipped lists the list dirs Open could not serve (interrupted
 	// create/replace marker, missing/corrupt config, unreadable base — or a
@@ -151,16 +153,20 @@ type fsyncReq struct {
 
 // groupCommit blocks until the committer has fsynced path (group commit):
 // the acknowledgment that follows is then durable. The committer goroutine
-// is started lazily and lives for the Store's process lifetime — one idle
-// goroutine per interval-mode store, no Close required.
+// is started lazily and runs until Store.Close stops it — every request
+// (including this blocking wait) happens inside a beginOp/endOp slot, so
+// once Close's drain returns no request can be in flight or ever arrive,
+// and the committer can exit without stranding a waiter.
 func (st *Store) groupCommit(path string) error {
 	st.fsyncOnce.Do(func() {
 		st.fsyncCh = make(chan fsyncReq)
+		st.fsyncStop = make(chan struct{})
+		st.fsyncStopped = make(chan struct{})
 		interval := st.JournalFsyncInterval
 		if interval <= 0 {
 			interval = 2 * time.Millisecond
 		}
-		go fsyncCommitter(st.fsyncCh, interval)
+		go fsyncCommitter(st.fsyncCh, st.fsyncStop, st.fsyncStopped, interval)
 	})
 	req := fsyncReq{path: path, done: make(chan error, 1)}
 	st.fsyncCh <- req
@@ -171,8 +177,23 @@ func (st *Store) groupCommit(path string) error {
 // timer; when it fires, every distinct file is fsynced once and all waiters
 // are released. fsync flushes the FILE (inode), not a particular fd, so
 // opening a fresh fd here durably covers the writer's already-closed one.
-func fsyncCommitter(ch chan fsyncReq, interval time.Duration) {
+// On stop it flushes anything pending (defensively — Close only stops the
+// committer after the operation drain, when pending must be empty), closes
+// stopped, and returns; before the stop signal existed every retired
+// interval-mode store leaked one committer goroutine for the process
+// lifetime.
+func fsyncCommitter(ch chan fsyncReq, stop <-chan struct{}, stopped chan<- struct{}, interval time.Duration) {
+	defer close(stopped)
 	pending := map[string][]chan error{}
+	flush := func() {
+		for path, waiters := range pending {
+			err := syncPath(path)
+			for _, done := range waiters {
+				done <- err
+			}
+		}
+		pending = map[string][]chan error{}
+	}
 	var timer *time.Timer
 	var fire <-chan time.Time
 	for {
@@ -184,15 +205,15 @@ func fsyncCommitter(ch chan fsyncReq, interval time.Duration) {
 				fire = timer.C
 			}
 		case <-fire:
-			for path, waiters := range pending {
-				err := syncPath(path)
-				for _, done := range waiters {
-					done <- err
-				}
-			}
-			pending = map[string][]chan error{}
+			flush()
 			timer = nil
 			fire = nil
+		case <-stop:
+			if timer != nil {
+				timer.Stop()
+			}
+			flush()
+			return
 		}
 	}
 }
@@ -1120,6 +1141,16 @@ func (st *Store) Close() error {
 	// before it touches a list until after its last write, and none can be
 	// admitted once closed is set — so this wait is the whole guarantee.
 	st.ops.Wait()
+	// The interval-mode group committer (if it ever started) can now stop:
+	// every groupCommit wait ran inside an ops slot, so after the drain no
+	// request is in flight and none can arrive. Reading fsyncCh here is
+	// race-free for the same reason — it is written inside an ops slot the
+	// drain has waited out. Waiting for the committer's exit makes Close's
+	// contract literal: nothing of this store's runs after it returns.
+	if st.fsyncCh != nil {
+		close(st.fsyncStop)
+		<-st.fsyncStopped
+	}
 	close(done)
 	return nil
 }

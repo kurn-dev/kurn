@@ -4,6 +4,7 @@ package engine
 // exact interleaving rather than hoping to hit it.
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -66,5 +67,54 @@ func TestCloseWaitsForAnAlreadyAdmittedMutation(t *testing.T) {
 	}
 	if !wrote.Load() {
 		t.Fatal("Close returned before the mutation finished writing")
+	}
+}
+
+// TestCloseStopsTheGroupCommitter: an interval-mode store's group-commit
+// goroutine must exit when the store closes. It used to live for the
+// process lifetime, so every tenant remove/re-add cycle of an
+// interval-fsync store retired one store and leaked one goroutine —
+// indefinitely on a long-lived kurnd. The deterministic pin is the
+// committer's stopped channel, which Close waits on; the goroutine count
+// is the original leak reproduction shape, kept as a secondary check.
+func TestCloseStopsTheGroupCommitter(t *testing.T) {
+	before := runtime.NumGoroutine()
+	for i := 0; i < 20; i++ {
+		st, err := Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.JournalFsync = FsyncInterval
+		if _, err := st.CreateList("people", internalPersonCfg()); err != nil {
+			t.Fatal(err)
+		}
+		// The first interval-fsynced append starts the committer.
+		if err := st.Upsert("people", []Entry{{ID: "p1", Keys: []string{"Marcus Chen"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if st.fsyncCh == nil {
+			t.Fatal("committer never started; the test exercises nothing")
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Close waited for the committer's exit: the channel must already
+		// be closed, with no sleeping or polling involved.
+		select {
+		case <-st.fsyncStopped:
+		default:
+			t.Fatal("committer still running after Close returned")
+		}
+	}
+	// Secondary: the goroutine population returns to baseline (exited
+	// goroutines unwind asynchronously, hence the bounded retry).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n := runtime.NumGoroutine(); n <= before+2 {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("goroutines before=%d after=%d — committers leaked", before, n)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

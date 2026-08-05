@@ -367,7 +367,7 @@ func (l *List) ReplaceWithIndexInfo(entries []Entry, idx *ngram.Index, bi *Index
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
 	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ng: idx}
-	if err := seg.applyBuildInfo(bi, len(entries)); err != nil {
+	if err := seg.applyBuildInfo(bi, len(entries), idx.NumOrds()); err != nil {
 		return fmt.Errorf("list %s: %s", l.name, err)
 	}
 	for i := range entries {
@@ -403,7 +403,7 @@ func (l *List) ReplaceWithExactIndexInfo(entries []Entry, idx *exact.Index, bi *
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
 	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ex: idx}
-	if err := seg.applyBuildInfo(bi, len(entries)); err != nil {
+	if err := seg.applyBuildInfo(bi, len(entries), idx.NumOrds()); err != nil {
 		return fmt.Errorf("list %s: %s", l.name, err)
 	}
 	for i := range entries {
@@ -916,7 +916,7 @@ type IndexBuildInfo struct {
 // applyBuildInfo sets a prebuilt segment's loss counters. With no info the
 // segment claims nothing: reporting zero for something unknown is wrong, but
 // inferring it from the index is wrong in a way that names the wrong repair.
-func (seg *segment) applyBuildInfo(bi *IndexBuildInfo, n int) error {
+func (seg *segment) applyBuildInfo(bi *IndexBuildInfo, n int, ords uint32) error {
 	if bi == nil {
 		return nil
 	}
@@ -926,6 +926,12 @@ func (seg *segment) applyBuildInfo(bi *IndexBuildInfo, n int) error {
 	if bi.Entries < 0 || bi.DroppedKeys < 0 || bi.KeylessEntries < 0 ||
 		bi.KeylessEntries > bi.Entries || bi.Entries > n {
 		return fmt.Errorf("build info %+v is impossible for %d entries", *bi, n)
+	}
+	// And internally consistent with the index itself: postings cannot
+	// name ordinals past the entry count the record claims produced them.
+	// Accepting the contradiction reports reachable entries as unindexed.
+	if int(ords) > bi.Entries {
+		return fmt.Errorf("index has %d ordinals but build info claims %d entries", ords, bi.Entries)
 	}
 	seg.droppedKeys = bi.DroppedKeys
 	seg.keylessEntries = bi.KeylessEntries

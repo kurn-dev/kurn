@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/kurn-dev/kurn/engine"
+	"github.com/kurn-dev/kurn/engine/exact"
 )
 
 func TestBuildStatsCountsAnalyzedAwayKeys(t *testing.T) {
@@ -139,10 +140,45 @@ func TestImpossibleBuildInfoIsRefused(t *testing.T) {
 		"negative everything":  {Entries: -1, DroppedKeys: -2, KeylessEntries: -3},
 		"keyless past entries": {Entries: 2, KeylessEntries: 3},
 		"entries past slice":   {Entries: 5},
+		// Internally contradictory: the index carries ordinals 0 and 1,
+		// so it cannot have come from a one-entry build. Accepting it
+		// reported a reachable entry as unindexed.
+		"ordinals past claimed entries": {Entries: 1},
 	} {
-		l := personList(t)
+		// Install real content first: a rejected call must leave the
+		// serving snapshot and its metrics untouched, not half-applied.
+		l := personList(t, engine.Entry{ID: "keep", Keys: []string{"Elena Vasquez"}})
 		if err := l.ReplaceWithIndexInfo(entries, idx, bi); err == nil {
 			t.Errorf("%s: accepted %+v", name, bi)
+			continue
 		}
+		if n, _, _ := l.Stats(); n != 1 {
+			t.Errorf("%s: rejected call disturbed the snapshot (entries=%d)", name, n)
+		}
+		if c := l.Query("elena vasquez", engine.QueryOpts{}); len(c) != 1 || c[0].EntryID != "keep" {
+			t.Errorf("%s: prior content stopped serving after a rejected install: %+v", name, c)
+		}
+		if u := l.UnindexedEntries(); u != 0 {
+			t.Errorf("%s: rejected call left a loss metric behind (unindexed=%d)", name, u)
+		}
+	}
+
+	// Exact mode enforces the same relationship.
+	eb := exact.NewBuilder()
+	eb.Add(0, []string{"aa"})
+	eb.Add(1, []string{"bb"})
+	eidx, err := eb.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	el, err := engine.NewList("codes", engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "trim"}},
+		Match:    engine.MatchConfig{Mode: "exact"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := el.ReplaceWithExactIndexInfo(entries, eidx, &engine.IndexBuildInfo{Entries: 1}); err == nil {
+		t.Error("exact: accepted an index with ordinals past its claimed entry count")
 	}
 }

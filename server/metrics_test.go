@@ -61,6 +61,7 @@ func TestMetricsExposition(t *testing.T) {
 	for _, fam := range []string{
 		"kurn_list_entries", "kurn_list_overlay", "kurn_list_tombstones",
 		"kurn_list_dropped_keys", "kurn_list_keyless_entries",
+		"kurn_list_unindexed_entries",
 		"kurn_queries_total", "kurn_query_hits_total",
 		"kurn_query_duration_seconds", "kurn_mutations_total",
 	} {
@@ -95,5 +96,53 @@ func TestMetricsExposition(t *testing.T) {
 	// Sum is present and non-negative (sub-µs exact queries may round low).
 	if !strings.Contains(text, fmt.Sprintf(`kurn_query_duration_seconds_sum{list=%q}`, "codes")) {
 		t.Error("histogram _sum missing")
+	}
+}
+
+// All six per-list gauges of one scrape describe one known list state —
+// entries, overlay, tombstones, dropped keys, keyless entries, and
+// unindexed entries each carry the value the crafted state pins.
+func TestMetricsGaugesMatchKnownStatus(t *testing.T) {
+	ts := newTS(t)
+	do(t, "PUT", ts.URL+"/v1/lists/codes", `{"analyzer":{"steps":["lowercase","trim"]},"match":{"mode":"exact"}}`)
+	// Base after compact: c1 findable; c2's only key trims to "" — one
+	// dropped key, one keyless entry.
+	do(t, "POST", ts.URL+"/v1/lists/codes/entries", `[{"id":"c1","keys":["AA-1"]},{"id":"c2","keys":[" "]}]`)
+	do(t, "POST", ts.URL+"/v1/lists/codes/compact", "")
+	// One tombstone in base, one overlay entry on top.
+	do(t, "DELETE", ts.URL+"/v1/lists/codes/entries/c1", "")
+	do(t, "POST", ts.URL+"/v1/lists/codes/entries", `[{"id":"c3","keys":["BB-2"]}]`)
+
+	_, body := do(t, "GET", ts.URL+"/metrics", "")
+	text := string(body)
+	gauge := func(fam string) uint64 {
+		t.Helper()
+		line := fam + `{list="codes"}`
+		for _, l := range strings.Split(text, "\n") {
+			if strings.HasPrefix(l, line+" ") {
+				v, err := strconv.ParseUint(strings.Fields(l)[1], 10, 64)
+				if err != nil {
+					t.Fatalf("parse %q: %v", l, err)
+				}
+				return v
+			}
+		}
+		t.Fatalf("gauge %q missing:\n%s", line, text)
+		return 0
+	}
+	for _, g := range []struct {
+		fam  string
+		want uint64
+	}{
+		{"kurn_list_entries", 2},    // base 2 - tombstone 1 + overlay 1
+		{"kurn_list_overlay", 1},    // c3
+		{"kurn_list_tombstones", 1}, // c1
+		{"kurn_list_dropped_keys", 1},
+		{"kurn_list_keyless_entries", 1},
+		{"kurn_list_unindexed_entries", 0},
+	} {
+		if v := gauge(g.fam); v != g.want {
+			t.Errorf("%s = %d, want %d", g.fam, v, g.want)
+		}
 	}
 }

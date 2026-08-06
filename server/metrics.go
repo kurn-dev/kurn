@@ -8,6 +8,7 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"sync"
@@ -143,55 +144,67 @@ func gaugeLabels(tenant, list string) string {
 	return mkey{tenant, list}.labels()
 }
 
-// metrics renders the exposition. Gauges come fresh from the store (they
-// ARE the current state); counters/histograms from the registry.
-func (s *srv) metrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+// gaugeUnit is one list's captured scrape state: its labels plus one
+// immutable Status() snapshot. Rendering works from these values alone, so
+// all six gauges of a list report the same snapshot generation — a unit
+// holds no *engine.List a renderer could accidentally reload from.
+type gaugeUnit struct {
+	tenant string
+	list   string
+	st     engine.ListStatus
+}
 
-	// Stable order: tenants sorted (tenantStores is name-sorted), lists
-	// sorted within each; gauges then counters then histogram.
-	type unit struct {
-		tenant string
-		l      *engine.List
-	}
-	var units []unit
+// gaugeUnits captures one Status() per list: tenants in name order
+// (tenantStores is name-sorted), lists sorted within each.
+func (s *srv) gaugeUnits() []gaugeUnit {
+	var units []gaugeUnit
 	for _, ts := range s.tenantStores() {
 		lists := ts.st.Lists()
 		sort.Slice(lists, func(a, b int) bool { return lists[a].Name() < lists[b].Name() })
 		for _, l := range lists {
-			units = append(units, unit{ts.name, l})
+			units = append(units, gaugeUnit{ts.name, l.Name(), l.Status()})
 		}
 	}
+	return units
+}
 
+// writeListGauges renders the six per-list gauge families from captured
+// units.
+func writeListGauges(w io.Writer, units []gaugeUnit) {
 	fmt.Fprintf(w, "# HELP kurn_list_entries Live entries in the list (base minus tombstones, plus overlay).\n# TYPE kurn_list_entries gauge\n")
 	for _, u := range units {
-		e, _, _ := u.l.Stats()
-		fmt.Fprintf(w, "kurn_list_entries%s %d\n", gaugeLabels(u.tenant, u.l.Name()), e)
+		fmt.Fprintf(w, "kurn_list_entries%s %d\n", gaugeLabels(u.tenant, u.list), u.st.Entries)
 	}
 	fmt.Fprintf(w, "# HELP kurn_list_overlay Overlay entries awaiting compaction.\n# TYPE kurn_list_overlay gauge\n")
 	for _, u := range units {
-		_, ov, _ := u.l.Stats()
-		fmt.Fprintf(w, "kurn_list_overlay%s %d\n", gaugeLabels(u.tenant, u.l.Name()), ov)
+		fmt.Fprintf(w, "kurn_list_overlay%s %d\n", gaugeLabels(u.tenant, u.list), u.st.Overlay)
 	}
 	fmt.Fprintf(w, "# HELP kurn_list_tombstones Tombstoned base entries.\n# TYPE kurn_list_tombstones gauge\n")
 	for _, u := range units {
-		_, _, tomb := u.l.Stats()
-		fmt.Fprintf(w, "kurn_list_tombstones%s %d\n", gaugeLabels(u.tenant, u.l.Name()), tomb)
+		fmt.Fprintf(w, "kurn_list_tombstones%s %d\n", gaugeLabels(u.tenant, u.list), u.st.Tombstones)
 	}
 	fmt.Fprintf(w, "# HELP kurn_list_dropped_keys Keys the analyzer collapsed to empty (never indexed).\n# TYPE kurn_list_dropped_keys gauge\n")
 	for _, u := range units {
-		d, _ := u.l.BuildStats()
-		fmt.Fprintf(w, "kurn_list_dropped_keys%s %d\n", gaugeLabels(u.tenant, u.l.Name()), d)
+		fmt.Fprintf(w, "kurn_list_dropped_keys%s %d\n", gaugeLabels(u.tenant, u.list), u.st.DroppedKeys)
 	}
 	fmt.Fprintf(w, "# HELP kurn_list_keyless_entries Entries with no indexable key (counted in entries, unfindable).\n# TYPE kurn_list_keyless_entries gauge\n")
 	for _, u := range units {
-		_, k := u.l.BuildStats()
-		fmt.Fprintf(w, "kurn_list_keyless_entries%s %d\n", gaugeLabels(u.tenant, u.l.Name()), k)
+		fmt.Fprintf(w, "kurn_list_keyless_entries%s %d\n", gaugeLabels(u.tenant, u.list), u.st.KeylessEntries)
 	}
 	fmt.Fprintf(w, "# HELP kurn_list_unindexed_entries Entries the installed index does not reach (stale base.idx; counted in entries, unfindable).\n# TYPE kurn_list_unindexed_entries gauge\n")
 	for _, u := range units {
-		fmt.Fprintf(w, "kurn_list_unindexed_entries%s %d\n", gaugeLabels(u.tenant, u.l.Name()), u.l.UnindexedEntries())
+		fmt.Fprintf(w, "kurn_list_unindexed_entries%s %d\n", gaugeLabels(u.tenant, u.list), u.st.UnindexedEntries)
 	}
+}
+
+// metrics renders the exposition. Gauges come from one Status() capture per
+// list taken at scrape start (a mutation mid-scrape cannot make one list's
+// gauges disagree); counters/histograms from the registry.
+func (s *srv) metrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	// Stable order: gauges then counters then histogram.
+	writeListGauges(w, s.gaugeUnits())
 
 	m := s.reg
 	m.mu.RLock()

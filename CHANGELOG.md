@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (v0.2.2)
+## v0.2.2 — 2026-08-06
 
 ### Manifests bind the complete resolved configuration
 

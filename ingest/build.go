@@ -40,6 +40,10 @@ type Manifest struct {
 	// (threshold, topK, grams, fallback, golden probes, compaction
 	// policy…), not just mode and analyzer. It binds the config when the
 	// manifest is trusted; it does not authenticate the manifest itself.
+	// The omitempty is deliberate: this shared type also represents v1,
+	// and the tag preserves a true v1 JSON shape when an old manifest is
+	// decoded and re-encoded. It cannot weaken v2 — Build always supplies
+	// the field, and loaders refuse v2 when the decoded value is empty.
 	ConfigSHA256 string `json:"config_sha256,omitempty"`
 	Entries      int    `json:"entries"`
 	Keys         int64  `json:"keys"`

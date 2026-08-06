@@ -43,7 +43,7 @@ func TestBuildBundleAndVersionIdentity(t *testing.T) {
 			t.Fatalf("bundle missing %s: %v", f, err)
 		}
 	}
-	if man.Entries != 3 || man.Keys != 3 || man.Mode != "exact" || man.V != 1 {
+	if man.Entries != 3 || man.Keys != 3 || man.Mode != "exact" || man.V != 2 {
 		t.Fatalf("manifest: %+v", man)
 	}
 	if len(man.SHA256) != 64 || man.VersionID != man.SHA256[:12] {
@@ -51,6 +51,9 @@ func TestBuildBundleAndVersionIdentity(t *testing.T) {
 	}
 	if man.Analyzer == "" {
 		t.Fatal("analyzer digest missing")
+	}
+	if len(man.ConfigSHA256) != 64 {
+		t.Fatalf("v2 manifest must carry the full resolved-config digest: %+v", man)
 	}
 
 	// THE identity property: dropped into a store as a list dir, the node
@@ -74,6 +77,14 @@ func TestBuildBundleAndVersionIdentity(t *testing.T) {
 	// version_id keeps its join property as a prefix of both.
 	if !strings.HasPrefix(l.Version(), man.SHA256+"@") {
 		t.Fatalf("node version %q does not carry the manifest sha256 %q", l.Version(), man.SHA256)
+	}
+	// The config half of the identity: the manifest's config_sha256 IS the
+	// loaded list's resolved-config digest, the "+c" half of the stamp.
+	if l.ConfigDigest() != man.ConfigSHA256 {
+		t.Fatalf("loaded config digest %q != manifest config_sha256 %q", l.ConfigDigest(), man.ConfigSHA256)
+	}
+	if !strings.HasSuffix(l.Version(), "+c"+man.ConfigSHA256) {
+		t.Fatalf("node version %q does not end with the manifest's config digest", l.Version())
 	}
 	if !strings.HasPrefix(l.Version(), man.VersionID) {
 		t.Fatalf("node version %q does not start with version_id %q", l.Version(), man.VersionID)

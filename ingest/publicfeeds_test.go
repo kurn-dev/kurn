@@ -210,6 +210,9 @@ func TestLEIERealFeed(t *testing.T) {
 	if !strings.HasPrefix(l.Version(), man.VersionID) {
 		t.Fatalf("display prefix: stamp %q vs manifest version_id %s", l.Version(), man.VersionID)
 	}
+	if !strings.HasSuffix(l.Version(), "+c"+man.ConfigSHA256) {
+		t.Fatalf("provenance: stamp %q does not carry manifest config_sha256 %s", l.Version(), man.ConfigSHA256)
+	}
 }
 
 func TestSAMRealFeed(t *testing.T) {

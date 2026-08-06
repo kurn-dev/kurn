@@ -23,16 +23,28 @@ import (
 
 // Manifest describes a built bundle.
 type Manifest struct {
-	V         int    `json:"v"` // manifest format version (1)
+	// V is the manifest format version. v2 adds the required
+	// config_sha256; v1 manifests (which lack it) predate the field and
+	// are grandfathered by loaders under their original mode+analyzer
+	// checks.
+	V         int    `json:"v"`
 	SHA256    string `json:"sha256"`
 	Collapsed int    `json:"collapsed,omitempty"` // byte-identical duplicate records collapsed
 	VersionID string `json:"version_id"`          // 12-hex display prefix of SHA256; never a semantic key
 	Analyzer  string `json:"analyzer"`            // analyzer spec digest (also inside base.idx)
 	Mode      string `json:"mode"`
-	Entries   int    `json:"entries"`
-	Keys      int64  `json:"keys"`
-	Source    string `json:"source,omitempty"`     // caller-provided provenance ref
-	CreatedAt string `json:"created_at,omitempty"` // caller-provided (determinism: never wall clock)
+	// ConfigSHA256 is the digest of the bundle's RESOLVED configuration —
+	// engine List.ConfigDigest(), the "+c" half of the served version
+	// stamp. Required from v2 on: the manifest is the bundle's trust
+	// root, and with it the manifest attests the complete configuration
+	// (threshold, topK, grams, fallback, golden probes, compaction
+	// policy…), not just mode and analyzer. It binds the config when the
+	// manifest is trusted; it does not authenticate the manifest itself.
+	ConfigSHA256 string `json:"config_sha256,omitempty"`
+	Entries      int    `json:"entries"`
+	Keys         int64  `json:"keys"`
+	Source       string `json:"source,omitempty"`     // caller-provided provenance ref
+	CreatedAt    string `json:"created_at,omitempty"` // caller-provided (determinism: never wall clock)
 
 	PrevSHA256 string      `json:"prev_sha256,omitempty"`
 	Delta      *DeltaStats `json:"delta,omitempty"`
@@ -139,8 +151,9 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 		return nil, err
 	}
 	man := &Manifest{
-		V: 1, SHA256: sum, VersionID: sum[:12], Collapsed: collapsed,
-		Mode: m.List.Match.Mode, Entries: len(entries), Keys: keyCount,
+		V: 2, SHA256: sum, VersionID: sum[:12], Collapsed: collapsed,
+		Mode: m.List.Match.Mode, ConfigSHA256: l.ConfigDigest(),
+		Entries: len(entries), Keys: keyCount,
 		Source: opts.Source, CreatedAt: opts.CreatedAt,
 	}
 	an, err := engine.ResolveAnalyzer(m.List.Analyzer)

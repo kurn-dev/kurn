@@ -126,10 +126,22 @@ bundle/
   delta.jsonl      # with a previous bundle: add/update/delete records
 ```
 
-`manifest.json` v1: `{"v":1, "sha256", "version_id" (12-hex prefix),
-"analyzer", "mode", "entries", "keys", "source", "created_at",
-"prev_sha256", "delta":{"adds","updates","deletes"}}`. The manifest's
-`version_id` is a 12-hex display prefix of `sha256`, not a semantic key.
+`manifest.json` v2: `{"v":2, "sha256", "version_id" (12-hex prefix),
+"analyzer", "mode", "config_sha256", "entries", "keys", "source",
+"created_at", "prev_sha256", "delta":{"adds","updates","deletes"}}`.
+`config_sha256` is required from v2 on: the digest of the bundle's
+RESOLVED configuration (the engine's `List.ConfigDigest()`, the `+c` half
+of the served stamp), so the manifest attests the complete configuration —
+threshold, top-K, grams, fallback, golden probes, compaction policy — not
+just mode and analyzer. It binds the configuration when the manifest is
+trusted; it does not authenticate the manifest itself (an adversary who
+can rewrite both `config.json` and the unsigned manifest can recompute the
+digest — authenticity needs an externally authenticated manifest or
+registry). Loaders verify it against the loaded list's own digest, accept
+v1 manifests without the field under the original mode+analyzer checks
+(verifying the field when a v1 manifest carries it anyway), and refuse
+unknown manifest versions. The manifest's `version_id` is a 12-hex display
+prefix of `sha256`, not a semantic key.
 The identity the platform stores is **the complete version stamp reported
 after loading the bundle**. Its base half is the manifest's full `sha256`;
 the whole stamp is

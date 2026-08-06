@@ -1,6 +1,50 @@
 # Changelog
 
-## Unreleased (v0.2.1)
+## Unreleased (v0.2.2)
+
+### Manifests bind the complete resolved configuration
+
+`kurn build` now emits manifest v2 with a required `config_sha256`: the
+digest of the bundle's RESOLVED configuration — the same value the served
+version stamp carries as its `+c` half. v0.2.1 bound the manifest's mode
+and analyzer declarations to `config.json`, which left an acknowledged
+residual: a `config.json` swapped after build in fields those checks
+cannot see (threshold, top-K, grams, fallback, golden probes, compaction
+policy) still loaded cleanly, the stamp's `+c` half merely self-attesting
+the swap. With v2 the manifest — the bundle's trust root — attests the
+complete configuration. The field binds the configuration when the
+manifest is trusted; it does not authenticate the manifest (anyone able
+to rewrite both `config.json` and the unsigned manifest can recompute the
+digest — authenticity needs an external trust anchor). v1 manifests
+remain loadable: consumers grandfather them under the original
+mode+analyzer checks and verify the field only when present.
+
+### Added
+
+- `List.ConfigDigest()` — the resolved-config sha256 the version stamp
+  carries as `+c…`. Builders embed it, verifiers compare it against a
+  loaded list; nobody re-derives the algorithm or parses stamps.
+- Public CI (`.github/workflows/ci.yml`): gofmt gate, `go build`,
+  `go vet`, `go test`, `go test -race` on pushes and pull requests to
+  main. No secrets, no deploy steps.
+
+### Changed
+
+- Admission's per-gram scratch charge raised from 64 B to 200 B. Measured
+  peak allocation of the two per-distinct-gram structures (the dedup-map
+  entry and the 24-byte `gramInfo`, map-bucket and slice growth
+  transients included) is 165–194 B/gram across query shapes; the model's
+  "every term errs upward" contract is now literally true for the gram
+  term instead of compensated by unrelated terms. Flood-shaped queries
+  are charged ~140 KB more per ngram segment at the default 512-rune
+  shape, so scratch budgets admit correspondingly fewer of them at once.
+- `/metrics` per-list gauges (entries, overlay, tombstones, dropped_keys,
+  keyless_entries, unindexed_entries) render from one `Status()` snapshot
+  per list per scrape; a mutation landing mid-scrape can no longer make
+  one list's gauges disagree with each other. Exposition format, ordering
+  and labels are unchanged.
+
+## v0.2.1 — 2026-08-06
 
 ### Version stamps identify data, journal content, AND configuration
 

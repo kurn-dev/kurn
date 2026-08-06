@@ -1020,6 +1020,15 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 // restart-stable.
 func (l *List) Version() string { return l.snap.Load().version }
 
+// ConfigDigest returns the sha256 identity of the RESOLVED configuration —
+// the same value store-managed version stamps carry as their "+c" half
+// (see resolvedConfigDigest). Computed once in NewList from the config
+// with defaults applied and the analyzer preset expanded, so it identifies
+// what is actually installed, not what the caller wrote. Builders embed it
+// in bundle manifests; verifiers compare it against a loaded list's value
+// instead of re-deriving the digest or parsing version strings.
+func (l *List) ConfigDigest() string { return l.cfgDigest }
+
 // scratchPerHitBytes models ONE collected hit across every layer admission
 // can see: the ngram Hit (16 B), the list-layer Candidate (~64 B of ID,
 // score, key and payload headers) with its attribution meta, the server's

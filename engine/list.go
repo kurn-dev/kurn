@@ -1059,11 +1059,21 @@ const (
 	// shape keeps ScratchBytesFor useful for operators sizing a budget while
 	// PrepareQuery still scales for direct-library callers with longer input.
 	scratchDefaultQueryRunes = 512
-	// Per ngram index: roaring iterator batch plus offsets, dedup-map storage,
-	// gramInfo records, sorting and allocator slack. One potential gram per
-	// rune per configured size is the conservative upper shape.
-	scratchQueryFixedBytes   = 16 << 10
-	scratchQueryPerGramBytes = 64
+	// Per ngram index: roaring iterator batch plus offsets, sorting and
+	// allocator slack.
+	scratchQueryFixedBytes = 16 << 10
+	// One DISTINCT query gram costs one entry in the cross-size dedup map
+	// (map[string]struct{} — its keys alias the query string's backing
+	// array, so the cost is bucket slots and map growth, not string data)
+	// plus one 24-byte gramInfo appended to the postings slice. Measured on
+	// the pathological all-grams-distinct, all-grams-known shape (dense CJK
+	// runes so no gram dedups or short-circuits; heap delta of exactly those
+	// two structures with GC off, so bucket and slice growth transients
+	// count): 165–194 B per gram across 128–4096-rune queries and gram-size
+	// sets {2,3}, {3}, {2,3,4}. 200 is the rounded ceiling of that worst
+	// case. One potential gram per rune per configured size is the upper
+	// shape the term multiplies.
+	scratchQueryPerGramBytes = 200
 	scratchQueryPerRuneBytes = 8
 )
 

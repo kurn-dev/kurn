@@ -1,5 +1,7 @@
 # kurn
 
+[![CI](https://github.com/kurn-dev/kurn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kurn-dev/kurn/actions/workflows/ci.yml)
+
 **Fuzzy lookup, next to your code.**
 
 kurn is an in-memory engine for matching short strings — product names,

@@ -29,6 +29,14 @@ low.
    committed, only mappings that parse it.
 5. **Tests first, `-race` always.** `go test ./... -race` green, `go vet`
    clean, `gofmt` clean. New behavior needs a test that fails without it.
+   CI runs exactly this sequence on every push and pull request, so a CI
+   failure always reproduces offline:
+
+       gofmt gate (fails on any gofmt -l output)
+       go build ./...
+       go vet ./...
+       go test -count=1 ./...
+       go test -race -count=1 ./...
 
 ## Practicalities
 

@@ -153,17 +153,12 @@ func TestConfigDigestFieldCoverage(t *testing.T) {
 }
 
 // A preset and its equivalent expanded steps are the same analyzer, and
-// the product path must treat them so: the Store resolves presets to
-// explicit steps BEFORE persisting config.json (a future preset redefinition
-// must never silently re-analyze an existing list), so two store-managed
-// lists configured the two ways share one digest.
-//
-// Direct NewList calls do not currently satisfy that equality: the digest
-// binds the literal ListConfig representation there, preset name included.
-// That divergence between the exported documentation and the primitive is
-// a known follow-up (direct-NewList normalization, with compatibility
-// treatment for already-emitted digests) and is deliberately not pinned
-// in either direction here.
+// every construction path must treat them so: NewList normalizes a
+// preset-shaped analyzer to its resolved steps before the List is
+// built, and the Store resolves presets before persisting config.json
+// (a future preset redefinition must never silently re-analyze an
+// existing list). Both paths therefore yield one resolved configuration
+// and one digest for the two spellings.
 func TestConfigDigestPresetResolutionStability(t *testing.T) {
 	steps, ok := analyzer.PresetSteps("person-name")
 	if !ok {
@@ -193,5 +188,26 @@ func TestConfigDigestPresetResolutionStability(t *testing.T) {
 	}
 	if lp.ConfigDigest() != ls.ConfigDigest() {
 		t.Fatal("store-managed preset and equivalent expanded steps must share a digest")
+	}
+
+	// Direct library construction is the same contract: NewList
+	// normalizes the preset, so Config() and ConfigDigest() both report
+	// the resolved steps form for either spelling.
+	dp, err := engine.NewList("dp", presetCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, err := engine.NewList("ds", stepsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dp.ConfigDigest() != ds.ConfigDigest() {
+		t.Fatal("direct NewList: preset and equivalent steps must share a digest")
+	}
+	if !reflect.DeepEqual(dp.Config(), ds.Config()) {
+		t.Fatal("direct NewList: Config() must return the resolved steps form for both spellings")
+	}
+	if dp.Config().Analyzer.Preset != "" {
+		t.Fatal("Config() must not retain the caller's preset spelling")
 	}
 }

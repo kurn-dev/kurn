@@ -134,6 +134,15 @@ func NewList(name string, cfg ListConfig) (*List, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Normalize a preset-shaped analyzer to its resolved steps: Config and
+	// ConfigDigest identify what is INSTALLED, never the caller's spelling —
+	// a preset and its equivalent explicit steps are the same configuration.
+	// Explicit step lists are never rewritten; literal order and spelling
+	// remain part of the resolved representation. Unknown presets errored
+	// above, so no half-normalized list can be constructed.
+	if cfg.Analyzer.Preset != "" {
+		cfg.Analyzer = AnalyzerConfig{Steps: an.Steps()}
+	}
 	// Threshold/TopK carry a NEGATIVE sentinel per QUERY (see QueryOpts),
 	// never per list: a config is a set of defaults, and "default to no
 	// floor at all" or "default to unlimited" are not defaults anyone

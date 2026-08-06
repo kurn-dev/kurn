@@ -55,3 +55,36 @@ func TestConfigDigestIdentity(t *testing.T) {
 		t.Fatalf("version %q does not end with +c%s", l.Version(), l.ConfigDigest())
 	}
 }
+
+// The digest of a fully explicit resolved configuration must never drift:
+// every persisted bundle, manifest, and platform record in the wild keys
+// on these values. Captured from the v0.2.2 implementation; the preset
+// normalization (v0.3.0) must not move it, because explicit configs are
+// never rewritten.
+func TestConfigDigestExplicitGoldenUnchanged(t *testing.T) {
+	cfg := engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Steps: []string{"lowercase", "fold_diacritics", "strip_punctuation", "strip_words:mr,mrs,ms,dr,prof", "sort_tokens"}},
+		Match:    engine.MatchConfig{Mode: "ngram", Grams: []int{2, 3}, StripSpaces: true, Threshold: 0.6, TopK: 100},
+	}
+	l, err := engine.NewList("golden", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "a44e884c53f256cce53698926d338dfa8a7f1770ced219968985a8fc030f6015"
+	if l.ConfigDigest() != want {
+		t.Fatalf("explicit-config digest moved: %s, want %s", l.ConfigDigest(), want)
+	}
+}
+
+// An unknown preset fails outright — normalization must never produce a
+// half-resolved list.
+func TestConfigDigestUnknownPresetRefused(t *testing.T) {
+	cfg := engine.ListConfig{
+		Analyzer: engine.AnalyzerConfig{Preset: "no-such-preset"},
+		Match:    engine.MatchConfig{Mode: "ngram"},
+	}
+	l, err := engine.NewList("bad", cfg)
+	if err == nil {
+		t.Fatalf("unknown preset produced a list: %+v", l.Config())
+	}
+}

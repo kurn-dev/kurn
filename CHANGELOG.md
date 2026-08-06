@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased (v0.3.0)
+
+### Direct library construction normalizes analyzer presets
+
+`NewList` now resolves a preset-shaped `Analyzer` to its explicit steps
+before the list is constructed — the same normalization the Store has
+always applied before persisting `config.json`. The documented contract
+is now true on every path: `Config()` returns the resolved configuration,
+and `ConfigDigest()` identifies what is installed, never the caller's
+spelling. A preset and its equivalent explicit steps produce equal
+`Config()` and `ConfigDigest()` values.
+
+Caller impact, precisely:
+
+- Direct `NewList` callers passing a preset see `Config()` change from
+  preset form to expanded steps form, and their `ConfigDigest()` value
+  changes once — caller-owned cache keys or persisted identities derived
+  from that digest invalidate on upgrade.
+- Ordinary direct-list `Version()` values are process-local generation
+  strings and do not carry the config digest; they are unaffected.
+- Callers opting into the exported content-addressed base helpers observe
+  the changed digest in a `+c` stamp.
+- Store-managed lists, persisted `config.json` files, bundles, manifests,
+  and platform-served stamps already carry expanded steps and are
+  byte-for-byte unchanged (an exact explicit-config digest golden pins
+  this).
+- Query behavior is unchanged everywhere: preset and explicit forms
+  already ran the same resolved steps, so no normalized key, candidate
+  set, rank, or score moves. This release changes identity only.
+
 ## v0.2.2 — 2026-08-06
 
 ### Manifests bind the complete resolved configuration

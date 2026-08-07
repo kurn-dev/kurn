@@ -82,6 +82,11 @@ maintainer before it runs — prepare and verify locally, then ask.
 
 ## 4. Tag and push (when a tag is warranted)
 
+- The tag candidate's tree must already contain the release's changelog
+  heading: verify with `git show <candidate>:CHANGELOG.md` (a tag message
+  pointing at CHANGELOG.md must not reference a section that does not
+  exist in the tagged tree — once shipped, the tag is not moved to fix
+  it).
 - Annotated tag on the exact reviewed commit, message per convention
   (`vX.Y.Z — <themes>`, body pointing at CHANGELOG.md, breaking/additive
   notes named). Verify the tag object with `git cat-file -p` before

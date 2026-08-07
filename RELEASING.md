@@ -11,7 +11,12 @@ maintainer before it runs — prepare and verify locally, then ask.
   sync with its remote, with no uncommitted changes except the ones this
   release exists to ship.
 - Verify the commit identity *before* committing, per repo convention:
-  `git config user.name` and `git config user.email` in each repo.
+  `git config --get user.name` and `git config --get user.email` in each
+  repo. NEVER write the flag after the key (`git config user.name
+  --global`): in that position Git can treat the invocation as a WRITE
+  and store the literal flag as the identity — this exact slip twice
+  produced `author --global <--global>` commits, and only object-level
+  verification caught them.
   CONTRIBUTING requires DCO sign-off: create commits with
   `git commit -s`.
 - After committing, verify identity from the Git OBJECTS, not from a

@@ -84,6 +84,11 @@ func TestConfigDigestFieldCoverage(t *testing.T) {
 		c.Golden = []engine.GoldenProbe{{Q: "alpha", Absent: true}}
 		return c
 	}
+	filterBase := func() engine.ListConfig {
+		c := ngramBase()
+		c.Filterable = []engine.FilterField{{Name: "program", Path: "program"}}
+		return c
+	}
 	presetBase := func() engine.ListConfig {
 		c := ngramBase()
 		c.Analyzer = engine.AnalyzerConfig{Preset: "person-name"}
@@ -120,6 +125,8 @@ func TestConfigDigestFieldCoverage(t *testing.T) {
 			c.Golden[0] = engine.GoldenProbe{Q: "alpha", ExpectID: "e1"}
 		}},
 		{"overlay_auto_compact", ngramBase, func(c *engine.ListConfig) { c.OverlayAutoCompact = 100 }},
+		{"filterable.name", filterBase, func(c *engine.ListConfig) { c.Filterable[0].Name = "prog" }},
+		{"filterable.path", filterBase, func(c *engine.ListConfig) { c.Filterable[0].Path = "meta.program" }},
 	}
 
 	declared := map[string]bool{}

@@ -675,10 +675,31 @@ func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 // present — "unlimited" is not offered over HTTP (the global merge is always
 // cut, so an uncapped per-list collection would only buy allocation).
 type queryReq struct {
-	Q         string   `json:"q"`
-	Lists     []string `json:"lists"`
-	Threshold *float64 `json:"threshold,omitempty"` // absent = per-list default; else 0..1
-	TopK      *int     `json:"topk,omitempty"`      // absent = per-list default + global 100; else 1..maxTopK
+	Q         string            `json:"q"`
+	Lists     []string          `json:"lists"`
+	Threshold *float64          `json:"threshold,omitempty"` // absent = per-list default; else 0..1
+	TopK      *int              `json:"topk,omitempty"`      // absent = per-list default + global 100; else 1..maxTopK
+	Filter    map[string]string `json:"filter,omitempty"`    // DECLARED logical name -> exact decoded-string value, ANDed; {} == omitted
+
+	// filterDupErr carries a duplicate-name finding from UnmarshalJSON to
+	// runQuery WITHOUT failing the decode: a batch decodes []queryReq in
+	// one pass, and a decode-time error would turn one bad check into a
+	// top-level 400 for the whole batch. runQuery surfaces it per check,
+	// before any list is prepared or admitted.
+	filterDupErr error
+}
+
+// UnmarshalJSON decodes normally, then walks the raw filter member for
+// duplicate logical names — encoding/json's map is last-wins, and a
+// silently collapsed duplicate must be a request error, not a different
+// filter than the client believes it sent.
+func (q *queryReq) UnmarshalJSON(b []byte) error {
+	type plain queryReq // method-free alias: avoids UnmarshalJSON recursion
+	if err := json.Unmarshal(b, (*plain)(q)); err != nil {
+		return err
+	}
+	q.filterDupErr = dupFilterName(b)
+	return nil
 }
 
 type respCand struct {
@@ -692,7 +713,15 @@ type respCand struct {
 type queryResp struct {
 	Candidates []respCand        `json:"candidates"` // always present; [] when empty
 	Versions   map[string]string `json:"versions"`
-	TookUs     int64             `json:"took_us"`
+	// Filter echoes the exact normalized applied filter on every
+	// successful FILTERED query, including an empty result. A client
+	// sending a non-empty filter MUST require exact echo equality: an old
+	// node ignores the unknown request member and omits the echo, and
+	// only that check turns the silent downgrade into a client-side
+	// failure instead of an unfiltered answer read as filtered.
+	// Unfiltered responses omit the member (the old shape, byte-for-byte).
+	Filter map[string]string `json:"filter,omitempty"`
+	TookUs int64             `json:"took_us"`
 }
 
 // query runs q against every named list and merges the results (see
@@ -752,6 +781,29 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 	if req.TopK != nil && (*req.TopK < 1 || *req.TopK > maxTopK) {
 		return queryResp{}, http.StatusBadRequest, fmt.Sprintf("topk %d out of range [1, %d]", *req.TopK, maxTopK)
 	}
+	if req.filterDupErr != nil {
+		return queryResp{}, http.StatusBadRequest, req.filterDupErr.Error()
+	}
+	if len(req.Filter) > maxFilterNames {
+		return queryResp{}, http.StatusBadRequest, fmt.Sprintf("filter has %d names, max %d", len(req.Filter), maxFilterNames)
+	}
+	if len(req.Filter) > 0 {
+		// Sorted iteration: bound errors must name the same offender on
+		// every identical request — map order is nondeterministic.
+		fnames := make([]string, 0, len(req.Filter))
+		for name := range req.Filter {
+			fnames = append(fnames, name)
+		}
+		sort.Strings(fnames)
+		for _, name := range fnames {
+			if utf8.RuneCountInString(name) > maxFilterNameChars {
+				return queryResp{}, http.StatusBadRequest, fmt.Sprintf("filter name %q exceeds %d chars", name, maxFilterNameChars)
+			}
+			if utf8.RuneCountInString(req.Filter[name]) > maxFilterValueChars {
+				return queryResp{}, http.StatusBadRequest, fmt.Sprintf("filter value for %q exceeds %d chars", name, maxFilterValueChars)
+			}
+		}
+	}
 	// Dedupe list names (order-preserving): a duplicated name would run the
 	// same query twice and duplicate every candidate in the merged output.
 	names := make([]string, 0, len(req.Lists))
@@ -810,18 +862,41 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 			opts.Threshold = *req.Threshold
 		}
 	}
-	// Prepare every list's query FIRST: each PreparedQuery pins one
+	// Prepare every list's query FIRST: each prepared query pins one
 	// snapshot together with the cost computed from it, and execution below
 	// runs those exact snapshots. Charging the current snapshot and then
 	// re-loading after the admission wait let a mutation that landed while
 	// the request queued grow the executed work past what was charged.
-	prepared := make([]*engine.PreparedQuery, len(lists))
+	//
+	// A FILTERED request additionally compiles the filter against every
+	// resolved list here, BEFORE any admission: an undeclared logical name
+	// on any list is a request error — nothing may execute and no governor
+	// slice (tenant or global) may be held for a request that was never
+	// valid. The engine error names the field and the list.
+	filtered := len(req.Filter) > 0
+	var prepared []*engine.PreparedQuery
+	var fprepared []*engine.FilteredQuery
 	var cost int64
-	for i, l := range lists {
-		lopts := opts
-		lopts.TopK = listK[i] // the bound admission charges for (always > 0)
-		prepared[i] = l.PrepareQuery(req.Q, lopts)
-		cost += prepared[i].Cost()
+	if filtered {
+		fprepared = make([]*engine.FilteredQuery, len(lists))
+		for i, l := range lists {
+			lopts := opts
+			lopts.TopK = listK[i] // the bound admission charges for (always > 0)
+			fq, ferr := l.PrepareFilteredQuery(req.Q, lopts, req.Filter)
+			if ferr != nil {
+				return queryResp{}, http.StatusBadRequest, ferr.Error()
+			}
+			fprepared[i] = fq
+			cost += fq.Cost()
+		}
+	} else {
+		prepared = make([]*engine.PreparedQuery, len(lists))
+		for i, l := range lists {
+			lopts := opts
+			lopts.TopK = listK[i]
+			prepared[i] = l.PrepareQuery(req.Q, lopts)
+			cost += prepared[i].Cost()
+		}
 	}
 	// Admission: the summed charge across every list the query touches,
 	// including exact-mode candidate materialization. The wait is
@@ -871,7 +946,21 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		// Execute the exact snapshot admission charged for. Candidates and
 		// version come from that one snapshot: a mutation that landed
 		// since prepare affects neither the work nor the evidence.
-		cands, ver := prepared[i].Execute(ctx)
+		var cands []engine.Candidate
+		var ver string
+		if filtered {
+			var xerr error
+			cands, ver, xerr = fprepared[i].Execute(ctx)
+			if xerr != nil {
+				// A stored payload failed strict evaluation: node/data
+				// failure, not a bad request. No partial answer may escape
+				// as a successful clear result; admission unwinds via the
+				// deferred releases above.
+				return queryResp{}, http.StatusInternalServerError, fmt.Sprintf("list %s: %v", name, xerr)
+			}
+		} else {
+			cands, ver = prepared[i].Execute(ctx)
+		}
 		s.reg.observeQuery(tenantName(ctx), name, time.Since(lstart), len(cands) > 0)
 		for _, c := range cands {
 			out = append(out, respCand{
@@ -896,11 +985,18 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 	if len(out) > effK {
 		out = out[:effK]
 	}
-	return queryResp{
+	res := queryResp{
 		Candidates: out,
 		Versions:   versions,
 		TookUs:     time.Since(start).Microseconds(),
-	}, 0, ""
+	}
+	if filtered {
+		// The applied echo is the same normalized name→value map for every
+		// list (it is the request's map, name-sorted at compile); take it
+		// from the first prepared list.
+		res.Filter = fprepared[0].AppliedFilter()
+	}
+	return res, 0, ""
 }
 
 // maxBatchChecks bounds a batch-query request: enough for the multi-value

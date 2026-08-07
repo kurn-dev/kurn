@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased (v0.3.0)
+## v0.4.0 — 2026-08-07
+
+### Query-time payload filters
+
+Lists may declare filterable payload paths under logical names
+(`filterable: [{"name": "program", "path": "program"}]`, at most 8,
+normalized name-sorted, part of resolved-config identity). Queries then
+filter per request: `"filter": {"program": "SDN"}` — exact
+decoded-JSON-string equality, ANDed names, array auto-descent, evaluated
+per score-qualifying candidate BEFORE the top-K cut, so a filtered match
+can never be starved by unfiltered higher scorers. Scores are unchanged
+by filtering.
+
+Fail-closed throughout: an undeclared name is a 400 naming the field and
+list (never a silent clear); duplicate names and a repeated `filter`
+member are 400s; a malformed stored payload aborts the query with an
+error rather than dropping a candidate. Successful non-empty filtered
+responses echo the exact applied filter, including empty results — a
+pre-filter node ignores the member and omits the echo, so clients that
+require echo equality never mistake an old node for an empty list.
+
+Admission charges filtered queries from segment facts (payload bytes and
+paths × ordinals, level-scaled for exact mode) only when a filter is
+present; the unfiltered path is unchanged — no filter, no charge, no
+new behavior. Engine: additive `PrepareFilteredQuery`/`QueryFilteredCtx`
+entry points. CLI: repeatable `-filter name=value` on `kurn query`.
+
+## v0.3.0 — 2026-08-06
 
 ### Direct library construction normalizes analyzer presets
 

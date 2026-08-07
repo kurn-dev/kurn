@@ -265,6 +265,19 @@ const cancelCheckEvery = 4096
 // care check ctx.Err(). With context.Background the checks compile to a
 // nil-channel comparison (free).
 func (i *Index) LookupCtx(ctx context.Context, analyzed string, threshold float64, topK int) []Hit {
+	return i.lookup(ctx, analyzed, threshold, topK, nil)
+}
+
+// LookupFilteredCtx is LookupCtx with a keep predicate applied to the
+// score-qualified stream BEFORE the bounded heap selects (after the floor
+// check, before the Hit is constructed) — the one recall-safe place to
+// remove candidates, since the heap's top-K over a filtered stream is the
+// top-K of that stream.
+func (i *Index) LookupFilteredCtx(ctx context.Context, analyzed string, threshold float64, topK int, keep func(ord uint32) bool) []Hit {
+	return i.lookup(ctx, analyzed, threshold, topK, keep)
+}
+
+func (i *Index) lookup(ctx context.Context, analyzed string, threshold float64, topK int, keep func(ord uint32) bool) []Hit {
 	if i.numOrds == 0 {
 		return nil
 	}
@@ -390,6 +403,9 @@ func (i *Index) LookupCtx(ctx context.Context, analyzed string, threshold float6
 			}
 		}
 		if score < floor {
+			continue
+		}
+		if keep != nil && !keep(ord) {
 			continue
 		}
 		h := Hit{Ord: ord, Score: math.Round(score / maxScore * 100)}

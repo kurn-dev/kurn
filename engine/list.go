@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +39,10 @@ type segment struct {
 	byID    map[string]uint32
 	ng      *ngram.Index // nil in exact mode
 	ex      *exact.Index // nil in ngram mode
+
+	// payloadBytes totals len(Payload) over entries — the segment fact the
+	// admission charge's filter term scales with (CPU-proxy model).
+	payloadBytes int64
 
 	// Build-time loss counters (see List.BuildStats): keys the analyzer
 	// collapsed to "" (dropped from the index), and entries whose keys ALL
@@ -122,6 +127,16 @@ type List struct {
 // the server caps a request at 1000 — and low enough that topK plus the
 // tombstone count cannot overflow the per-segment cut.
 const maxListTopK = 1 << 20
+
+// Filter bounds: maxFilterFields caps a list's declared filterable fields,
+// maxFilterNameRunes/maxFilterPathRunes bound declaration lengths. Query-side
+// name/value bounds live in the server; these guard the configuration
+// surface (and thereby the digest inputs) only.
+const (
+	maxFilterFields    = 8
+	maxFilterNameRunes = 128
+	maxFilterPathRunes = 256
+)
 
 func NewList(name string, cfg ListConfig) (*List, error) {
 	// Sever every slice aliased with the caller FIRST: the config is
@@ -209,6 +224,29 @@ func NewList(name string, cfg ListConfig) (*List, error) {
 			return nil, fmt.Errorf("list %s: golden[%d]: min_score %v out of range [0, 100]", name, i, p.MinScore)
 		}
 	}
+	// Filterable declarations: bounded, well-formed, unique by name, then
+	// normalized to name order so declaration order never moves the config
+	// digest. Dot-paths themselves are compiled at filter prepare time;
+	// here only the surface is bounded.
+	if len(cfg.Filterable) > maxFilterFields {
+		return nil, fmt.Errorf("list %s: filterable has %d fields, max %d", name, len(cfg.Filterable), maxFilterFields)
+	}
+	seen := make(map[string]struct{}, len(cfg.Filterable))
+	for i, f := range cfg.Filterable {
+		switch {
+		case f.Name == "" || f.Path == "":
+			return nil, fmt.Errorf("list %s: filterable[%d]: name and path must be non-empty", name, i)
+		case utf8.RuneCountInString(f.Name) > maxFilterNameRunes:
+			return nil, fmt.Errorf("list %s: filterable[%d]: name exceeds %d chars", name, i, maxFilterNameRunes)
+		case utf8.RuneCountInString(f.Path) > maxFilterPathRunes:
+			return nil, fmt.Errorf("list %s: filterable[%d]: path exceeds %d chars", name, i, maxFilterPathRunes)
+		}
+		if _, dup := seen[f.Name]; dup {
+			return nil, fmt.Errorf("list %s: filterable[%d]: duplicate name %q", name, i, f.Name)
+		}
+		seen[f.Name] = struct{}{}
+	}
+	slices.SortFunc(cfg.Filterable, func(a, b FilterField) int { return strings.Compare(a.Name, b.Name) })
 	l := &List{name: name, cfg: cfg, an: an, cfgDigest: resolvedConfigDigest(cfg, an), overlaySrc: map[string]Entry{}}
 	l.snap.Store(&snapshot{tombstones: map[string]struct{}{}, version: "empty@0"})
 	return l, nil
@@ -273,6 +311,7 @@ func (l *List) buildSegment(entries []Entry) (*segment, error) {
 	for i := range entries {
 		ord := uint32(i)
 		seg.byID[entries[i].ID] = ord
+		seg.payloadBytes += int64(len(entries[i].Payload))
 		keys := make([]string, 0, len(entries[i].Keys))
 		for _, k := range entries[i].Keys {
 			if a := l.an.Normalize(k); a != "" {
@@ -887,18 +926,140 @@ func (p *PreparedQuery) Cost() int64 { return p.cost }
 // returns candidates plus that snapshot's version — the exact state the
 // admission charge was computed from.
 func (p *PreparedQuery) Execute(ctx context.Context) ([]Candidate, string) {
-	return p.l.querySnap(ctx, p.s, p.q, p.opts), p.s.version
+	c, _ := p.l.querySnap(ctx, p.s, p.q, p.opts, nil) // nil filter never errors
+	return c, p.s.version
+}
+
+// FilteredQuery is the prepared form of a filtered query: one pinned
+// snapshot, the filter compiled against this list's declarations, and
+// the admission cost covering the filter work — charge and execution
+// share one snapshot, exactly like PrepareQuery.
+type FilteredQuery struct {
+	l    *List
+	s    *snapshot
+	q    string
+	opts QueryOpts
+	cf   *compiledFilter
+	cost int64
+}
+
+// PrepareFilteredQuery validates and compiles the filter against the
+// list's Filterable declarations — an undeclared name is an error naming
+// it (fail-closed: a typo'd filter must never silently clear a screening
+// answer) — and pins one snapshot with the filtered charge. A nil or
+// empty filter is the ordinary no-filter path: identical behavior and a
+// zero filter charge.
+func (l *List) PrepareFilteredQuery(q string, opts QueryOpts, filter map[string]string) (*FilteredQuery, error) {
+	cf, err := l.compileFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	s := l.snap.Load()
+	topK := l.cfg.Match.TopK
+	if opts.TopK > 0 {
+		topK = opts.TopK
+	} else if opts.TopK < 0 {
+		topK = 0 // sentinel: explicit unlimited (see QueryOpts)
+	}
+	runes := utf8.RuneCountInString(q)
+	if runes < scratchDefaultQueryRunes {
+		runes = scratchDefaultQueryRunes
+	}
+	cost := scratchBytesSnap(s, topK, runes, len(l.cfg.Match.Grams))
+	if cf != nil {
+		levels := 1
+		if l.cfg.Match.Mode == "exact" {
+			levels = len(exactLevels(l.an.Normalize(q), l.cfg.Match.Fallback == "parent_domain"))
+			if levels == 0 {
+				levels = 1
+			}
+		}
+		cost += l.filterChargeSnap(s, len(cf.terms), levels)
+	}
+	return &FilteredQuery{l: l, s: s, q: q, opts: opts, cf: cf, cost: cost}, nil
+}
+
+// Cost is the admission charge for executing THIS prepared filtered query.
+func (p *FilteredQuery) Cost() int64 { return p.cost }
+
+// AppliedFilter returns the normalized applied filter (name → value) for
+// the response echo; nil for the no-filter path.
+func (p *FilteredQuery) AppliedFilter() map[string]string { return p.cf.applied() }
+
+// Execute runs the prepared filtered query against its pinned snapshot.
+// A malformed payload in the evaluated set aborts with an error rather
+// than dropping the candidate — a dropped candidate could manufacture a
+// clear result.
+func (p *FilteredQuery) Execute(ctx context.Context) ([]Candidate, string, error) {
+	c, err := p.l.querySnap(ctx, p.s, p.q, p.opts, p.cf)
+	return c, p.s.version, err
+}
+
+// QueryFilteredCtx is the one-call convenience form of
+// PrepareFilteredQuery + Execute.
+func (l *List) QueryFilteredCtx(ctx context.Context, q string, opts QueryOpts, filter map[string]string) ([]Candidate, string, error) {
+	p, err := l.PrepareFilteredQuery(q, opts, filter)
+	if err != nil {
+		return nil, "", err
+	}
+	return p.Execute(ctx)
+}
+
+// exactCancelCheckEvery is how many walked ordinals the exact path runs
+// between ctx checks once a filter can extend a hot key's run.
+const exactCancelCheckEvery = 4096
+
+// Filter charge constants — CPU-admission proxies, NOT materialized
+// memory (the model's first term of that kind; the scanner allocates ~0,
+// so real memory stays bounded by the ordinary terms and this term
+// throttles concurrency). One traversal per candidate evaluates every
+// term; filterScanPerByte scales with segment payload bytes,
+// filterPerPathOrd with paths × ordinals (× walked levels for exact on
+// both). Calibration from the step-1 matrix (20k entries, 1.5 KB
+// payloads): 1→8 paths moves real work 1.6× and this charge 1.8×;
+// small→large payloads move work 1.4× and the charge 1.7× — the formula
+// grows faster than the work on both dimensions, as "errs upward"
+// requires.
+const (
+	filterScanPerByte = 1
+	filterPerPathOrd  = 192
+)
+
+// filterChargeSnap is the filter term over one already-loaded snapshot,
+// so the charge and the executed snapshot can never belong to different
+// states. levels bounds the exact path's walked levels.
+func (l *List) filterChargeSnap(s *snapshot, nPaths, levels int) int64 {
+	var b int64
+	charge := func(sg *segment) {
+		if sg == nil {
+			return
+		}
+		if sg.ng != nil {
+			b += filterScanPerByte*sg.payloadBytes + filterPerPathOrd*int64(nPaths)*int64(sg.ng.NumOrds())
+		} else if sg.ex != nil {
+			// Exact fallback revisits payloads at every walked level, so
+			// both terms scale with levels.
+			b += filterScanPerByte * sg.payloadBytes * int64(levels)
+			b += filterPerPathOrd * int64(nPaths) * int64(sg.ex.NumOrds()) * int64(levels)
+		}
+	}
+	charge(s.base)
+	charge(s.overlay)
+	return b
 }
 
 // querySnap runs a query against one already-loaded snapshot (see
-// QueryVersioned for why the load happens exactly once).
-func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryOpts) []Candidate {
+// QueryVersioned for why the load happens exactly once). cf is the
+// compiled filter (nil = unfiltered); a malformed payload in the
+// evaluated set is captured and returned as an error — never a dropped
+// candidate.
+func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryOpts, cf *compiledFilter) ([]Candidate, error) {
 	if ctx.Err() != nil {
-		return nil
+		return nil, nil
 	}
 	aq := l.an.Normalize(q)
 	if aq == "" {
-		return nil
+		return nil, nil
 	}
 	thr := l.cfg.Match.Threshold
 	if opts.Threshold > 0 {
@@ -913,12 +1074,27 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 		topK = 0 // sentinel: explicit unlimited (see QueryOpts)
 	}
 
+	var filterErr error
 	var out []Candidate
 	var meta []candMeta // parallel to out: origin segment+ordinal for attribution
-	add := func(seg *segment, masked map[string]struct{}, ord uint32, score float64) {
+	// prechecked marks hits that already passed mask+filter in the ngram
+	// pre-heap predicate; only the exact path evaluates inside add.
+	add := func(seg *segment, masked map[string]struct{}, ord uint32, score float64, prechecked bool) {
 		e := seg.entries[ord]
 		if masked != nil {
 			if _, dead := masked[e.ID]; dead {
+				return
+			}
+		}
+		if cf != nil && !prechecked {
+			ok, err := cf.eval(e.Payload)
+			if err != nil {
+				if filterErr == nil {
+					filterErr = err
+				}
+				return
+			}
+			if !ok {
 				return
 			}
 		}
@@ -930,6 +1106,29 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 	collectNgram := func(seg *segment, masked map[string]struct{}) {
 		if seg == nil || seg.ng == nil {
 			return
+		}
+		// When filtering, the live-mask folds into the pre-heap predicate
+		// (tombstoned entries contribute no evidence), so the heap's cut
+		// needs no masking allowance. Unfiltered keeps the historical
+		// topK+len(masked) widening with post-collection masking, unchanged.
+		var keep func(uint32) bool
+		if cf != nil {
+			keep = func(ord uint32) bool {
+				e := seg.entries[ord]
+				if masked != nil {
+					if _, dead := masked[e.ID]; dead {
+						return false
+					}
+				}
+				ok, err := cf.eval(e.Payload)
+				if err != nil {
+					if filterErr == nil {
+						filterErr = err
+					}
+					return false
+				}
+				return ok
+			}
 		}
 		// Per-segment cut at topK+len(masked) is safe: masking only
 		// removes hits, so the global post-mask top-K is contained in
@@ -943,9 +1142,12 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 		segK := 0
 		if topK > 0 {
 			segK = topK + len(masked)
+			if cf != nil {
+				segK = topK
+			}
 		}
-		for _, h := range seg.ng.LookupCtx(ctx, aq, thr, segK) {
-			add(seg, masked, h.Ord, h.Score)
+		for _, h := range seg.ng.LookupFilteredCtx(ctx, aq, thr, segK, keep) {
+			add(seg, masked, h.Ord, h.Score, cf != nil)
 		}
 	}
 	matchedKey := aq
@@ -954,6 +1156,9 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 		// suffix only when a level has NO post-tombstone survivors. `add`
 		// applies masking before appending, so `len(out) > 0` is the correct
 		// post-mask check — a fully tombstoned level must not stop descent.
+		// The same holds with a filter: a fully filtered level descends,
+		// exactly like a fully masked one.
+		walked := 0
 		for _, level := range exactLevels(aq, l.cfg.Match.Fallback == "parent_domain") {
 			score := 100.0
 			if level != aq {
@@ -967,11 +1172,18 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 			// top-K — collecting a hot key's full run just to truncate would
 			// allocate and sort the whole hit set. Which ties survive follows
 			// collection order (base then overlay, ordinal-ascending) — the
-			// same documented stance as the ngram per-segment cut.
+			// same documented stance as the ngram per-segment cut. A filter
+			// can make a full-run walk real work, so the walk polls ctx:
+			// it is the one loop where added CPU is otherwise invisible to
+			// cancellation.
 			full := func() bool { return topK > 0 && len(out) >= topK }
 			if s.base != nil && s.base.ex != nil && !full() {
 				for _, ord := range s.base.ex.Lookup(level) {
-					add(s.base, s.tombstones, ord, score)
+					walked++
+					if walked%exactCancelCheckEvery == 0 && ctx.Err() != nil {
+						return nil, nil
+					}
+					add(s.base, s.tombstones, ord, score, false)
 					if full() {
 						break
 					}
@@ -979,7 +1191,11 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 			}
 			if s.overlay != nil && s.overlay.ex != nil && !full() {
 				for _, ord := range s.overlay.ex.Lookup(level) {
-					add(s.overlay, nil, ord, score)
+					walked++
+					if walked%exactCancelCheckEvery == 0 && ctx.Err() != nil {
+						return nil, nil
+					}
+					add(s.overlay, nil, ord, score, false)
 					if full() {
 						break
 					}
@@ -994,8 +1210,11 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 		collectNgram(s.base, s.tombstones)
 		collectNgram(s.overlay, nil)
 	}
+	if filterErr != nil {
+		return nil, filterErr
+	}
 	if len(out) == 0 {
-		return nil
+		return nil, nil
 	}
 	// A scan canceled AFTER an earlier segment already contributed would
 	// otherwise return those partial results as if complete (LookupCtx
@@ -1003,7 +1222,7 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 	// segment had no hits"). Honor the documented contract — the whole
 	// query returns nil once canceled.
 	if ctx.Err() != nil {
-		return nil
+		return nil, nil
 	}
 
 	sortCandidates(out, meta)
@@ -1012,7 +1231,7 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 		meta = meta[:topK]
 	}
 	l.attributeKeys(s, aq, matchedKey, out, meta)
-	return out
+	return out, nil
 }
 
 // Version returns the snapshot version stamp. Store-managed lists carry the

@@ -59,6 +59,17 @@ type GoldenProbe struct {
 	MinScore float64 `json:"min_score,omitempty"` // with ExpectID: candidate's score must be >= this (0 = any)
 }
 
+// FilterField declares one payload dot-path as query-filterable under a
+// logical Name (e.g. Name "program", Path "meta.program"). Declarations are
+// part of the resolved configuration: they are digested into the list's
+// version stamp, so a declaration change is an identity change. NewList
+// normalizes the slice to unique, name-sorted entries — declaration ORDER
+// is never identity-bearing.
+type FilterField struct {
+	Name string `json:"name"` // the logical name queries use
+	Path string `json:"path"` // dot-path into the payload (array auto-descent)
+}
+
 // ListConfig is a list's full declared configuration.
 type ListConfig struct {
 	Analyzer AnalyzerConfig `json:"analyzer"`
@@ -67,6 +78,13 @@ type ListConfig struct {
 	// Golden is the list's readiness probe set (see GoldenProbe); empty
 	// means the list contributes only its load state to readiness.
 	Golden []GoldenProbe `json:"golden,omitempty"`
+
+	// Filterable declares which payload dot-paths queries may filter on,
+	// under logical names (see FilterField). Empty (the default) means the
+	// list accepts no filters. NewList validates and normalizes the slice
+	// (unique, name-sorted); a declaration change is a config-identity
+	// change.
+	Filterable []FilterField `json:"filterable,omitempty"`
 
 	// OverlayAutoCompact, when > 0, makes the Store fold the overlay into a
 	// new base in the background once the overlay reaches this many entries;
@@ -80,14 +98,16 @@ type ListConfig struct {
 	OverlayAutoCompact int `json:"overlay_auto_compact,omitempty"`
 }
 
-// clone returns a copy sharing no mutable state with the receiver. Three
-// fields are slice-backed (analyzer steps, gram sizes, golden probes —
-// GoldenProbe itself is all scalars); everything else copies by value.
+// clone returns a copy sharing no mutable state with the receiver. Four
+// fields are slice-backed (analyzer steps, gram sizes, golden probes,
+// filterable fields — GoldenProbe and FilterField themselves are all
+// scalars); everything else copies by value.
 // NewList clones on the way in and Config on the way out, so a list's
 // validated config can never be reached through a caller-held slice.
 func (c ListConfig) clone() ListConfig {
 	c.Analyzer.Steps = slices.Clone(c.Analyzer.Steps)
 	c.Match.Grams = slices.Clone(c.Match.Grams)
 	c.Golden = slices.Clone(c.Golden)
+	c.Filterable = slices.Clone(c.Filterable)
 	return c
 }

@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/csv"
@@ -317,6 +318,8 @@ func cmdQuery(args []string) error {
 	q := fs.String("q", "", "query string (required)")
 	threshold := fs.Float64("threshold", 0, "match threshold override (0 = list default)")
 	topk := fs.Int("topk", 0, "top-K override (0 = list default)")
+	var filters filterFlags
+	fs.Var(&filters, "filter", "repeatable name=value: keep only candidates whose payload matches every filter (names must be declared filterable in the list config)")
 	fs.Parse(args)
 	if *data == "" || *list == "" || *q == "" {
 		fs.Usage()
@@ -332,6 +335,21 @@ func cmdQuery(args []string) error {
 		return fmt.Errorf("unknown list %q in %s", *list, *data)
 	}
 	enc := json.NewEncoder(os.Stdout)
+	if len(filters.m) > 0 {
+		// The error-returning filtered path: an undeclared name or a
+		// malformed evaluated payload is an error, never a silent
+		// unfiltered or empty answer.
+		cands, _, err := l.QueryFilteredCtx(context.Background(), *q, engine.QueryOpts{Threshold: *threshold, TopK: *topk}, filters.m)
+		if err != nil {
+			return err
+		}
+		for _, c := range cands {
+			if err := enc.Encode(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for _, c := range l.Query(*q, engine.QueryOpts{Threshold: *threshold, TopK: *topk}) {
 		if err := enc.Encode(c); err != nil {
 			return err

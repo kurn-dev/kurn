@@ -35,7 +35,9 @@ func TestCloseWaitsForAnAlreadyAdmittedMutation(t *testing.T) {
 	defer func() { testHookAdmitted = nil }()
 
 	var wrote atomic.Bool
+	upsertDone := make(chan struct{})
 	go func() {
+		defer close(upsertDone)
 		if err := st.Upsert("people", []Entry{{ID: "p1", Keys: []string{"Anna Smith"}}}); err != nil {
 			t.Error(err)
 		}
@@ -65,8 +67,30 @@ func TestCloseWaitsForAnAlreadyAdmittedMutation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close never returned after the mutation was released")
 	}
+	// Synchronize with the WRITER GOROUTINE before reading its flag. The
+	// engine guarantees the write happens-before Close returns (write →
+	// endOp → ops.Wait), but wrote.Store runs after Upsert RETURNS —
+	// outside that window — so without this receive the flag check races
+	// the goroutine scheduler and lost ~1/200 under -race (the flake this
+	// fixes). The 150 ms early-return select above is untouched: it is the
+	// real regression guard for the Close lock-sweep bug.
+	select {
+	case <-upsertDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the mutation goroutine never finished")
+	}
 	if !wrote.Load() {
 		t.Fatal("Close returned before the mutation finished writing")
+	}
+	// And the contract itself, not just the test-side flag: the mutation's
+	// EFFECT is observable after Close returns (reads keep serving the
+	// acknowledged snapshot).
+	l, ok := st.List("people")
+	if !ok {
+		t.Fatal("list missing after Close")
+	}
+	if c := l.Query("anna smith", QueryOpts{}); len(c) == 0 || c[0].EntryID != "p1" {
+		t.Fatalf("mutation effect not visible after Close: %+v", c)
 	}
 }
 

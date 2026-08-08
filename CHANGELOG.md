@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.5.0 — 2026-08-08
+
+### Typed equality and `IN` payload filters
+
+Query filters now accept exact JSON booleans and numbers as well as strings,
+plus one set operator: `{"in":[...]}`. Logical names remain ANDed; values in
+an `in` set are ORed; types never coerce (`"1"`, `1`, and `true` are distinct).
+The v0.4.0 string APIs and repeatable CLI `-filter name=value` syntax remain
+source- and behavior-compatible wrappers. Typed callers gain the immutable
+`TypedFilter`, `ParseTypedFilter`, `PrepareTypedFilteredQuery`, and
+`QueryTypedFilteredCtx` APIs; the CLI gains mutually exclusive
+`-filter-json '<object>'` using that same parser.
+
+Accepted filters have one deterministic identity and echo: names are sorted;
+`in` values are sorted and deduplicated; singleton sets collapse to equality;
+numbers use exact fixed-decimal canonical form without `float64`; and scalar
+order is `false`, `true`, numeric value, then UTF-8 string bytes. Limits are
+enforced before admission or execution: 8 names, 64 alternatives per set,
+512 decoded runes per string, bounded exact-number syntax, and a 32 KiB
+canonical expression. The maximum v0.4.0 string envelope remains valid.
+Duplicate or unknown members, nested values, nulls, empty sets, and limit
+violations fail closed with field-naming 400s. Valid payload values of another
+JSON type are non-matches; malformed stored payloads still abort the query.
+
+Admission remains exactly unchanged when no filter is present. Filtered
+queries additionally price compiled alternatives and canonical scalar bytes;
+the shared 48-case corpus and ordinary/no-floor benchmark matrix pin parser,
+HTTP, and downstream PostgreSQL agreement, including exact U+0000 handling.
+
+### Filter execution telemetry
+
+Successful non-empty-filter responses now include `filter_stats`, keyed by
+list name, with the number of live score-qualified predicate evaluations and
+complete-filter rejections actually performed. The values are execution
+diagnostics for the pinned snapshot and plan—not cardinality, coverage, or
+path-safety claims—and are omitted from unfiltered and failed responses. They
+can expose bounded information about hidden score-qualified candidates and
+remain covered by the query rate limit.
+
+The engine adds immutable per-run `FilterStats` via `ExecuteStats`; existing
+prepared-query and query entry points retain their signatures and unfiltered
+allocation behavior. `kurn query -stats` writes one JSON stats object to
+stderr after a successful filtered query while leaving the stdout candidate
+stream unchanged.
+
 ## v0.4.0 — 2026-08-07
 
 ### Query-time payload filters

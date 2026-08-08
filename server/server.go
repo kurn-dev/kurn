@@ -675,11 +675,11 @@ func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 // present — "unlimited" is not offered over HTTP (the global merge is always
 // cut, so an uncapped per-list collection would only buy allocation).
 type queryReq struct {
-	Q         string            `json:"q"`
-	Lists     []string          `json:"lists"`
-	Threshold *float64          `json:"threshold,omitempty"` // absent = per-list default; else 0..1
-	TopK      *int              `json:"topk,omitempty"`      // absent = per-list default + global 100; else 1..maxTopK
-	Filter    map[string]string `json:"filter,omitempty"`    // DECLARED logical name -> exact decoded-string value, ANDed; {} == omitted
+	Q         string          `json:"q"`
+	Lists     []string        `json:"lists"`
+	Threshold *float64        `json:"threshold,omitempty"` // absent = per-list default; else 0..1
+	TopK      *int            `json:"topk,omitempty"`      // absent = per-list default + global 100; else 1..maxTopK
+	Filter    json.RawMessage `json:"filter,omitempty"`    // typed expression; {} canonicalizes to omitted
 
 	// filterDupErr carries a duplicate-name finding from UnmarshalJSON to
 	// runQuery WITHOUT failing the decode: a batch decodes []queryReq in
@@ -689,10 +689,10 @@ type queryReq struct {
 	filterDupErr error
 }
 
-// UnmarshalJSON decodes normally, then walks the raw filter member for
-// duplicate logical names — encoding/json's map is last-wins, and a
-// silently collapsed duplicate must be a request error, not a different
-// filter than the client believes it sent.
+// UnmarshalJSON decodes normally, then walks the complete raw envelope for
+// duplicate top-level filter members and logical names. RawMessage preserves
+// the selected expression for the shared parser, but encoding/json still
+// chooses the last repeated top-level member.
 func (q *queryReq) UnmarshalJSON(b []byte) error {
 	type plain queryReq // method-free alias: avoids UnmarshalJSON recursion
 	if err := json.Unmarshal(b, (*plain)(q)); err != nil {
@@ -713,14 +713,15 @@ type respCand struct {
 type queryResp struct {
 	Candidates []respCand        `json:"candidates"` // always present; [] when empty
 	Versions   map[string]string `json:"versions"`
-	// Filter echoes the exact normalized applied filter on every
+	// Filter echoes the canonical applied expression on every
 	// successful FILTERED query, including an empty result. A client
-	// sending a non-empty filter MUST require exact echo equality: an old
+	// sending a non-empty filter MUST require equality with the canonical
+	// expression it expected: an old
 	// node ignores the unknown request member and omits the echo, and
 	// only that check turns the silent downgrade into a client-side
 	// failure instead of an unfiltered answer read as filtered.
 	// Unfiltered responses omit the member (the old shape, byte-for-byte).
-	Filter map[string]string `json:"filter,omitempty"`
+	Filter json.RawMessage `json:"filter,omitempty"`
 	// FilterStats reports, per list name, what the filtered execution
 	// actually did (see engine.FilterStats: live, score-qualified
 	// predicate invocations and how many failed the complete filter).
@@ -801,24 +802,12 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 	if req.filterDupErr != nil {
 		return queryResp{}, http.StatusBadRequest, req.filterDupErr.Error()
 	}
-	if len(req.Filter) > maxFilterNames {
-		return queryResp{}, http.StatusBadRequest, fmt.Sprintf("filter has %d names, max %d", len(req.Filter), maxFilterNames)
-	}
-	if len(req.Filter) > 0 {
-		// Sorted iteration: bound errors must name the same offender on
-		// every identical request — map order is nondeterministic.
-		fnames := make([]string, 0, len(req.Filter))
-		for name := range req.Filter {
-			fnames = append(fnames, name)
-		}
-		sort.Strings(fnames)
-		for _, name := range fnames {
-			if utf8.RuneCountInString(name) > maxFilterNameChars {
-				return queryResp{}, http.StatusBadRequest, fmt.Sprintf("filter name %q exceeds %d chars", name, maxFilterNameChars)
-			}
-			if utf8.RuneCountInString(req.Filter[name]) > maxFilterValueChars {
-				return queryResp{}, http.StatusBadRequest, fmt.Sprintf("filter value for %q exceeds %d chars", name, maxFilterValueChars)
-			}
+	var typedFilter engine.TypedFilter
+	if len(req.Filter) > 0 && !bytes.Equal(bytes.TrimSpace(req.Filter), []byte("null")) {
+		var ferr error
+		typedFilter, ferr = engine.ParseTypedFilter(req.Filter)
+		if ferr != nil {
+			return queryResp{}, http.StatusBadRequest, ferr.Error()
 		}
 	}
 	// Dedupe list names (order-preserving): a duplicated name would run the
@@ -890,7 +879,7 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 	// on any list is a request error — nothing may execute and no governor
 	// slice (tenant or global) may be held for a request that was never
 	// valid. The engine error names the field and the list.
-	filtered := len(req.Filter) > 0
+	filtered := !typedFilter.Empty()
 	var prepared []*engine.PreparedQuery
 	var fprepared []*engine.FilteredQuery
 	var cost int64
@@ -899,7 +888,7 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		for i, l := range lists {
 			lopts := opts
 			lopts.TopK = listK[i] // the bound admission charges for (always > 0)
-			fq, ferr := l.PrepareFilteredQuery(req.Q, lopts, req.Filter)
+			fq, ferr := l.PrepareTypedFilteredQuery(req.Q, lopts, typedFilter)
 			if ferr != nil {
 				return queryResp{}, http.StatusBadRequest, ferr.Error()
 			}
@@ -1014,10 +1003,9 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		TookUs:     time.Since(start).Microseconds(),
 	}
 	if filtered {
-		// The applied echo is the same normalized name→value map for every
-		// list (it is the request's map, name-sorted at compile); take it
-		// from the first prepared list.
-		res.Filter = fprepared[0].AppliedFilter()
+		// The canonical applied expression is identical for every list; take
+		// the defensive-copy echo from the first prepared query.
+		res.Filter = fprepared[0].AppliedFilterJSON()
 		res.FilterStats = fstats
 	}
 	return res, 0, ""

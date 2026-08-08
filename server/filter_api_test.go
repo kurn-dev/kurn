@@ -35,10 +35,78 @@ func putFilterableList(t *testing.T, base, name string) {
 	t.Helper()
 	do(t, "PUT", base+"/v1/lists/"+name,
 		`{"analyzer":{"steps":["lowercase","trim"]},"match":{"mode":"ngram","grams":[2,3],"threshold":0.5},
-		  "filterable":[{"name":"program","path":"program"},{"name":"country","path":"meta.country"}]}`)
+		  "filterable":[{"name":"active","path":"active"},{"name":"program","path":"program"},{"name":"country","path":"meta.country"},{"name":"risk","path":"risk"}]}`)
 	do(t, "POST", base+"/v1/lists/"+name+"/entries", `[
-		{"id":"e1","keys":["dana kovak"],"payload":{"program":"SDN","meta":{"country":"EE"}}},
-		{"id":"e2","keys":["dana kovak"],"payload":{"program":"EU","meta":{"country":"FR"}}}]`)
+		{"id":"e1","keys":["dana kovak"],"payload":{"active":true,"program":"SDN","meta":{"country":"EE"},"risk":1.00}},
+		{"id":"e2","keys":["dana kovak"],"payload":{"active":false,"program":"EU","meta":{"country":"FR"},"risk":2}}]`)
+}
+
+func TestTypedFilterCanonicalEchoAndMatching(t *testing.T) {
+	ts, _ := newFilterTS(t)
+	putFilterableList(t, ts.URL, "sanctions")
+
+	resp, body := do(t, "POST", ts.URL+"/v1/query",
+		`{"q":"dana kovak","lists":["sanctions"],"filter":{"risk":{"in":[2,1.0,1e0]},"active":true}}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("typed hit: %d %s", resp.StatusCode, body)
+	}
+	var got struct {
+		Candidates []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"candidates"`
+		Filter json.RawMessage `json:"filter"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Candidates) != 1 || got.Candidates[0].EntryID != "e1" {
+		t.Fatalf("typed result: %s", body)
+	}
+	want := `{"active":true,"risk":{"in":[1,2]}}`
+	if string(got.Filter) != want {
+		t.Fatalf("canonical echo got %s, want %s", got.Filter, want)
+	}
+
+	// Type exactness: the payload number 1 must not match string "1".
+	resp, body = do(t, "POST", ts.URL+"/v1/query",
+		`{"q":"dana kovak","lists":["sanctions"],"filter":{"risk":"1"}}`)
+	if resp.StatusCode != 200 || strings.Count(string(body), `"entry_id"`) != 0 {
+		t.Fatalf("number/string coercion: %d %s", resp.StatusCode, body)
+	}
+}
+
+func TestTypedFilterInvalidGrammarIsLocalAndFailClosed(t *testing.T) {
+	ts, _ := newFilterTS(t)
+	putFilterableList(t, ts.URL, "sanctions")
+
+	bad := []struct {
+		filter string
+		want   string
+	}{
+		{`{"program":null}`, `program`},
+		{`{"program":{"in":[]}}`, `empty in`},
+		{`{"program":{"wat":["SDN"]}}`, `unknown operator`},
+		{`{"program":{"in":["SDN"],"wat":["EU"]}}`, `exactly one operator`},
+		{`{"program":{"in":[["SDN"]]}}`, `nested or null`},
+		{`{"program":{"in":["SDN"],"\u0069n":["EU"]}}`, `duplicate operator`},
+	}
+	for _, tc := range bad {
+		resp, body := do(t, "POST", ts.URL+"/v1/query",
+			`{"q":"dana kovak","lists":["sanctions"],"filter":`+tc.filter+`}`)
+		if resp.StatusCode != 400 || !strings.Contains(string(body), tc.want) {
+			t.Fatalf("%s: %d %s (want %q)", tc.filter, resp.StatusCode, body, tc.want)
+		}
+		if strings.Contains(string(body), `"candidates"`) {
+			t.Fatalf("invalid typed filter reached execution: %s", body)
+		}
+	}
+
+	resp, body := do(t, "POST", ts.URL+"/v1/batch-query", `{"checks":[
+		{"q":"dana kovak","lists":["sanctions"],"filter":{"program":{"in":[]}}},
+		{"q":"dana kovak","lists":["sanctions"],"filter":{"program":"SDN"}}]}`)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), "empty in") || strings.Count(string(body), `"entry_id"`) != 1 {
+		t.Fatalf("batch typed error locality: %d %s", resp.StatusCode, body)
+	}
 }
 
 func TestFilterDeclarationEnforcedAcrossLists(t *testing.T) {
@@ -228,6 +296,7 @@ func TestFilterEmptyIdentity(t *testing.T) {
 	for _, body := range []string{
 		`{"q":"dana kovak","lists":["sanctions"]}`,
 		`{"q":"dana kovak","lists":["sanctions"],"filter":{}}`,
+		`{"q":"dana kovak","lists":["sanctions"],"filter":null}`,
 	} {
 		resp, raw := do(t, "POST", ts.URL+"/v1/query", body)
 		if resp.StatusCode != 200 {

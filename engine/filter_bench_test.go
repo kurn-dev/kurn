@@ -128,3 +128,69 @@ func BenchmarkFilterMatrix(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkTypedFilterAlternatives isolates the new C2 expression-shape
+// dimension. The payload/path/floor dimensions remain covered by
+// BenchmarkFilterMatrix and the accepted C3 study; this adds one versus the
+// maximum 64 compiled alternatives on a prepared query, for hit and miss.
+func BenchmarkTypedFilterAlternatives(b *testing.B) {
+	l := buildBenchList(b, 20000, 1500)
+	one, err := engine.ParseTypedFilter([]byte(`{"program":"SDN"}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	var maxRaw strings.Builder
+	maxRaw.WriteString(`{"program":{"in":["SDN"`)
+	for i := 1; i < 64; i++ {
+		fmt.Fprintf(&maxRaw, `,"v%02d"`, i)
+	}
+	maxRaw.WriteString(`]}}`)
+	max, err := engine.ParseTypedFilter([]byte(maxRaw.String()))
+	if err != nil {
+		b.Fatal(err)
+	}
+	missOne, err := engine.ParseTypedFilter([]byte(`{"program":"NEVER"}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	var missRaw strings.Builder
+	missRaw.WriteString(`{"program":{"in":[`)
+	for i := 0; i < 64; i++ {
+		if i > 0 {
+			missRaw.WriteByte(',')
+		}
+		fmt.Fprintf(&missRaw, `"m%02d"`, i)
+	}
+	missRaw.WriteString(`]}}`)
+	missMax, err := engine.ParseTypedFilter([]byte(missRaw.String()))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		expr engine.TypedFilter
+	}{
+		{"one/hit", one}, {"max/hit", max},
+		{"one/miss", missOne}, {"max/miss", missMax},
+	} {
+		for _, floor := range []struct {
+			name string
+			opts engine.QueryOpts
+		}{{"ordinary", engine.QueryOpts{}}, {"no-floor", engine.QueryOpts{Threshold: -1}}} {
+			b.Run(tc.name+"/"+floor.name, func(b *testing.B) {
+				p, err := l.PrepareTypedFilteredQuery("dana kovak 73", floor.opts, tc.expr)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.ReportMetric(float64(p.Cost()), "charge")
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					if _, _, err := p.Execute(context.Background()); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}

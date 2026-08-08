@@ -1,23 +1,13 @@
 package server
 
-// Query-time filter surface: request bounds and the duplicate-aware walk
-// of the raw "filter" member.
+// Query-time filter surface: the top-level duplicate-aware walk of the raw
+// "filter" member. The engine's shared typed parser owns the grammar and all
+// expression bounds.
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-)
-
-// Request bounds for the filter member, mirroring the engine's compile
-// bounds (≤8 declared fields per list; name/value rune bounds) so the
-// server gives the familiar per-field 400 before any list is prepared.
-// Payload-PATH bounds are a config concern (validated on Filterable
-// declarations), not a request concern.
-const (
-	maxFilterNames      = 8
-	maxFilterNameChars  = 128
-	maxFilterValueChars = 512
 )
 
 // dupFilterName reports a duplicated logical name inside the request's
@@ -78,13 +68,13 @@ func dupFilterName(b []byte) error {
 		}
 		d, isDelim := vt.(json.Delim)
 		if !isDelim {
-			continue // scalar filter: the typed decode rejects it
+			continue // scalar filter: the shared typed parser owns its semantics
 		}
 		if d == '[' {
 			if skipRest(dec) != nil {
 				return nil
 			}
-			continue // array filter: the typed decode rejects it
+			continue // array filter: the shared typed parser rejects it
 		}
 		seen := make(map[string]struct{})
 		for dec.More() {

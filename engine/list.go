@@ -954,6 +954,22 @@ func (l *List) PrepareFilteredQuery(q string, opts QueryOpts, filter map[string]
 	if err != nil {
 		return nil, err
 	}
+	return l.prepareFilteredQuery(q, opts, cf), nil
+}
+
+// PrepareTypedFilteredQuery is the typed counterpart to
+// PrepareFilteredQuery. The TypedFilter has already been grammar-checked and
+// canonicalized; this step validates its logical names against the list and
+// pins the snapshot admission will charge and execution will query.
+func (l *List) PrepareTypedFilteredQuery(q string, opts QueryOpts, filter TypedFilter) (*FilteredQuery, error) {
+	cf, err := l.compileTypedFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	return l.prepareFilteredQuery(q, opts, cf), nil
+}
+
+func (l *List) prepareFilteredQuery(q string, opts QueryOpts, cf *compiledFilter) *FilteredQuery {
 	s := l.snap.Load()
 	topK := l.cfg.Match.TopK
 	if opts.TopK > 0 {
@@ -975,8 +991,10 @@ func (l *List) PrepareFilteredQuery(q string, opts QueryOpts, filter map[string]
 			}
 		}
 		cost += l.filterChargeSnap(s, len(cf.terms), levels)
+		cost += filterPerAlternative*int64(cf.alternatives) + filterPerScalarByte*int64(cf.scalarBytes)
+		cost += filterExprEvalChargeSnap(s, cf.alternatives, cf.scalarBytes, levels)
 	}
-	return &FilteredQuery{l: l, s: s, q: q, opts: opts, cf: cf, cost: cost}, nil
+	return &FilteredQuery{l: l, s: s, q: q, opts: opts, cf: cf, cost: cost}
 }
 
 // Cost is the admission charge for executing THIS prepared filtered query.
@@ -985,6 +1003,10 @@ func (p *FilteredQuery) Cost() int64 { return p.cost }
 // AppliedFilter returns the normalized applied filter (name → value) for
 // the response echo; nil for the no-filter path.
 func (p *FilteredQuery) AppliedFilter() map[string]string { return p.cf.applied() }
+
+// AppliedFilterJSON returns the canonical typed expression for response
+// echo/persistence. It returns a fresh byte slice, or nil for no filter.
+func (p *FilteredQuery) AppliedFilterJSON() []byte { return p.cf.appliedJSON() }
 
 // Execute runs the prepared filtered query against its pinned snapshot.
 // A malformed payload in the evaluated set aborts with an error rather
@@ -1032,6 +1054,16 @@ func (l *List) QueryFilteredCtx(ctx context.Context, q string, opts QueryOpts, f
 	return p.Execute(ctx)
 }
 
+// QueryTypedFilteredCtx is the one-call typed convenience form of
+// PrepareTypedFilteredQuery + Execute.
+func (l *List) QueryTypedFilteredCtx(ctx context.Context, q string, opts QueryOpts, filter TypedFilter) ([]Candidate, string, error) {
+	p, err := l.PrepareTypedFilteredQuery(q, opts, filter)
+	if err != nil {
+		return nil, "", err
+	}
+	return p.Execute(ctx)
+}
+
 // exactCancelCheckEvery is how many walked ordinals the exact path runs
 // between ctx checks once a filter can extend a hot key's run.
 const exactCancelCheckEvery = 4096
@@ -1050,6 +1082,20 @@ const exactCancelCheckEvery = 4096
 const (
 	filterScanPerByte = 1
 	filterPerPathOrd  = 192
+	// Parsing/canonicalization occurs before admission, but the prepared
+	// predicate retains and evaluates every canonical alternative. These
+	// terms price the accepted expression shape itself in addition to the
+	// snapshot scan/path work. They are exactly absent when cf is nil.
+	filterPerAlternative = 128
+	filterPerScalarByte  = 8
+	// Alternative comparison is candidate work, not merely compile work.
+	// The 20k × 1.5KB C2 matrix measured 1→64 alternatives at 1.22–1.31×
+	// wall time; these ordinal-scaled terms make the corresponding charge
+	// grow 1.36× (ordinary and no-floor share a charge), conservatively
+	// above both measured shapes. Scalar bytes price longer accepted values
+	// even when alternative count is unchanged.
+	filterPerAlternativeOrd = 6
+	filterPerScalarByteOrd  = 1
 )
 
 // filterChargeSnap is the filter term over one already-loaded snapshot,
@@ -1068,6 +1114,28 @@ func (l *List) filterChargeSnap(s *snapshot, nPaths, levels int) int64 {
 			// both terms scale with levels.
 			b += filterScanPerByte * sg.payloadBytes * int64(levels)
 			b += filterPerPathOrd * int64(nPaths) * int64(sg.ex.NumOrds()) * int64(levels)
+		}
+	}
+	charge(s.base)
+	charge(s.overlay)
+	return b
+}
+
+// filterExprEvalChargeSnap prices alternative lookup over every ordinal a
+// filtered scan may evaluate. Exact parent fallback can revisit an ordinal at
+// each level, so it scales by the same conservative level bound as the path
+// and payload terms.
+func filterExprEvalChargeSnap(s *snapshot, alternatives, scalarBytes, levels int) int64 {
+	perOrd := filterPerAlternativeOrd*int64(alternatives) + filterPerScalarByteOrd*int64(scalarBytes)
+	var b int64
+	charge := func(sg *segment) {
+		if sg == nil {
+			return
+		}
+		if sg.ng != nil {
+			b += perOrd * int64(sg.ng.NumOrds())
+		} else if sg.ex != nil {
+			b += perOrd * int64(sg.ex.NumOrds()) * int64(levels)
 		}
 	}
 	charge(s.base)

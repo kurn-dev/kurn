@@ -2,9 +2,10 @@ package engine
 
 // Byte-level payload scanning for query-time filters. Dot-path traversal
 // mirrors the ingest mapping's semantics (split on dots, arrays
-// auto-descend, any reached value may match); equality is exact
-// decoded-JSON-string equality — an escaped spelling ("SD\u004e") equals
-// its decoded form. One strict pass: matches are recorded, never
+// auto-descend, any reached value may match); equality is decoded and
+// type-exact for strings, booleans, and arbitrary-precision canonical JSON
+// numbers. An escaped string spelling ("SD\u004e") equals its decoded form.
+// One strict pass: matches are recorded, never
 // early-exited, so a malformed tail can never hide behind a hit. Everything
 // is read-only over the payload's backing array; the only allocations are
 // slow-path string decodes.
@@ -133,20 +134,26 @@ func (s *payloadScan) skipValue() error {
 	case c == '[':
 		return s.skipArray()
 	default: // number, true, false, null: runs to a delimiter
-		start := s.i
-		for s.i < len(s.b) {
-			switch s.b[s.i] {
-			case ',', '}', ']', '{', '[', '"', ' ', '\t', '\n', '\r':
-				goto tokend
-			}
-			s.i++
-		}
-	tokend:
-		if !validScalarToken(s.b[start:s.i]) {
-			return &scanError{"invalid scalar"}
-		}
-		return nil
+		_, _, err := s.rawScalar()
+		return err
 	}
+}
+
+// rawScalar consumes and validates one non-string JSON scalar token.
+func (s *payloadScan) rawScalar() (int, int, error) {
+	start := s.i
+	for s.i < len(s.b) {
+		switch s.b[s.i] {
+		case ',', '}', ']', '{', '[', '"', ' ', '\t', '\n', '\r':
+			goto tokend
+		}
+		s.i++
+	}
+tokend:
+	if !validScalarToken(s.b[start:s.i]) {
+		return 0, 0, &scanError{"invalid scalar"}
+	}
+	return start, s.i, nil
 }
 
 func (s *payloadScan) skipObject() error {
@@ -295,9 +302,8 @@ type filterNode struct {
 
 // terminalTerm is one AND term ending at this node.
 type terminalTerm struct {
-	bit       uint8  // this term's bit in the match mask
-	want      string // expected decoded string
-	wantClean bool   // want needs no JSON escaping
+	bit   uint8 // this term's bit in the match mask
+	value filterValue
 }
 
 // child returns the child whose segment matches the raw key bytes (decoded
@@ -332,13 +338,64 @@ func (s *payloadScan) walkValue(n *filterNode, bits *uint8) error {
 			return &scanError{"bad string token"}
 		}
 		for _, t := range n.terms {
-			if *bits&t.bit == 0 && decodedStringEq(s.b[vs:ve], s.b[vs-1:ve+1], t.want, t.wantClean) {
+			if *bits&t.bit == 0 && t.value.matchesString(s.b[vs:ve], s.b[vs-1:ve+1]) {
 				*bits |= t.bit
 			}
 		}
 		return nil
 	default:
-		return s.skipValue()
+		start, end, err := s.rawScalar()
+		if err != nil {
+			return err
+		}
+		for _, t := range n.terms {
+			if *bits&t.bit == 0 && t.value.matchesScalar(s.b[start:end]) {
+				*bits |= t.bit
+			}
+		}
+		return nil
+	}
+}
+
+func (v filterValue) matchesString(inner, token []byte) bool {
+	for _, scalar := range v.scalars {
+		if scalar.kind == filterString && decodedStringEq(inner, token, scalar.value, scalar.clean) {
+			return true
+		}
+	}
+	return false
+}
+
+func (v filterValue) matchesScalar(token []byte) bool {
+	switch string(token) {
+	case "false":
+		for _, scalar := range v.scalars {
+			if scalar.kind == filterFalse {
+				return true
+			}
+		}
+		return false
+	case "true":
+		for _, scalar := range v.scalars {
+			if scalar.kind == filterTrue {
+				return true
+			}
+		}
+		return false
+	case "null":
+		return false
+	default:
+		var scratch [256]byte
+		canonical, comparable, err := canonicalNumberTokenBytes(token, false, scratch[:0])
+		if err != nil || !comparable {
+			return false
+		}
+		for _, scalar := range v.scalars {
+			if scalar.kind == filterNumber && bytes.Equal([]byte(scalar.value), canonical) {
+				return true
+			}
+		}
+		return false
 	}
 }
 
@@ -432,7 +489,9 @@ func pathMatch(payload []byte, segs []string, want string, wantClean, segsClean 
 		}
 		n = child
 	}
-	n.terms = append(n.terms, terminalTerm{bit: 1, want: want, wantClean: wantClean})
+	n.terms = append(n.terms, terminalTerm{bit: 1, value: filterValue{scalars: []filterScalar{{
+		kind: filterString, value: want, clean: wantClean,
+	}}}})
 	s := &payloadScan{b: payload}
 	var bits uint8
 	if err := s.walkValue(root, &bits); err != nil {

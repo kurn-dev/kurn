@@ -1,0 +1,592 @@
+{
+ "corpus": "kurn filter canonicalization fixtures",
+ "version": 1,
+ "authority": "kurn-platform docs 2026-08-08-v050-agreed-scope.md §2",
+ "note": "Shared across Go, HTTP, registration, and PostgreSQL validators — the drift guard for independently implemented canonicalizers. Semantic facts only: byte-level canonical object encoding is pinned by the engine implementation and exercised via the identity cases, not literal bytes here. String values beginning with 'RAW:' substitute the rest of the string verbatim as a JSON token in the document under test.",
+ "cases": [
+  {
+   "kind": "number",
+   "spellings": [
+    "1",
+    "1.0",
+    "1e0",
+    "10e-1",
+    "1.00",
+    "0.1e1"
+   ],
+   "canonical": "1"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "0",
+    "0.0",
+    "-0",
+    "-0.0",
+    "-0e5",
+    "0e-5"
+   ],
+   "canonical": "0"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "0.5",
+    "5e-1",
+    "0.50",
+    "50e-2"
+   ],
+   "canonical": "0.5"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "100",
+    "1e2",
+    "10e1",
+    "100.00"
+   ],
+   "canonical": "100"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "15",
+    "1.5e1"
+   ],
+   "canonical": "15"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "0.01",
+    "1e-2"
+   ],
+   "canonical": "0.01"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "-1.5",
+    "-1.50",
+    "-15e-1"
+   ],
+   "canonical": "-1.5"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "-0.0025",
+    "-2.5e-3"
+   ],
+   "canonical": "-0.0025"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "123456789.000001",
+    "1.23456789000001e8"
+   ],
+   "canonical": "123456789.000001"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "9999999999999999999999999999999999999999",
+    "9.999999999999999999999999999999999999999e39"
+   ],
+   "canonical": "9999999999999999999999999999999999999999"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "1e200"
+   ],
+   "canonical": "100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+   "kind": "number",
+   "spellings": [
+    "1e-200"
+   ],
+   "canonical": "0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": "RAW:11111111111111111111111111111111111111111"
+   },
+   "reason": "41 significant digits exceeds 40"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": {
+     "in": [
+      "a",
+      "RAW:1.0e0",
+      "b",
+      "RAW:11111111111111111111111111111111111111111"
+     ]
+    }
+   },
+   "reason": "over-limit number inside in"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": "RAW:1e201"
+   },
+   "reason": "exponent above +200"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": "RAW:1e-201"
+   },
+   "reason": "exponent below -200"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": "RAW:1.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e0"
+   },
+   "reason": "number token exceeds 256 bytes"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": null
+   },
+   "reason": "null value"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": {
+     "in": []
+    }
+   },
+   "reason": "empty in"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": {
+     "in": [
+      [
+       "a"
+      ]
+     ]
+    }
+   },
+   "reason": "nested value inside in"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": {
+     "in": [
+      "a"
+     ],
+     "eq": "b"
+    }
+   },
+   "reason": "multiple operator members"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": {
+     "like": "a%"
+    }
+   },
+   "reason": "unknown operator"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": {
+     "in": [
+      "v000",
+      "v001",
+      "v002",
+      "v003",
+      "v004",
+      "v005",
+      "v006",
+      "v007",
+      "v008",
+      "v009",
+      "v010",
+      "v011",
+      "v012",
+      "v013",
+      "v014",
+      "v015",
+      "v016",
+      "v017",
+      "v018",
+      "v019",
+      "v020",
+      "v021",
+      "v022",
+      "v023",
+      "v024",
+      "v025",
+      "v026",
+      "v027",
+      "v028",
+      "v029",
+      "v030",
+      "v031",
+      "v032",
+      "v033",
+      "v034",
+      "v035",
+      "v036",
+      "v037",
+      "v038",
+      "v039",
+      "v040",
+      "v041",
+      "v042",
+      "v043",
+      "v044",
+      "v045",
+      "v046",
+      "v047",
+      "v048",
+      "v049",
+      "v050",
+      "v051",
+      "v052",
+      "v053",
+      "v054",
+      "v055",
+      "v056",
+      "v057",
+      "v058",
+      "v059",
+      "v060",
+      "v061",
+      "v062",
+      "v063",
+      "v064"
+     ]
+    }
+   },
+   "reason": "65 alternatives exceeds 64"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "f": "äääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääää"
+   },
+   "reason": "513 decoded runes exceeds 512"
+  },
+  {
+   "kind": "invalid",
+   "filter": {
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": "v"
+   },
+   "reason": "name exceeds 128 runes"
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    "b",
+    "a",
+    "b"
+   ],
+   "canonical": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    true,
+    "a",
+    1,
+    false
+   ],
+   "canonical": [
+    false,
+    true,
+    1,
+    "a"
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    10,
+    9,
+    "9"
+   ],
+   "canonical": [
+    9,
+    10,
+    "9"
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    "z",
+    "é"
+   ],
+   "canonical": [
+    "z",
+    "é"
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    1,
+    "1"
+   ],
+   "canonical": [
+    1,
+    "1"
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    2,
+    10
+   ],
+   "canonical": [
+    2,
+    10
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    false,
+    false
+   ],
+   "canonical": [
+    false
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    1,
+    1.0
+   ],
+   "canonical": [
+    1
+   ]
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    "é",
+    "ß",
+    "a"
+   ],
+   "canonical": [
+    "a",
+    "ß",
+    "é"
+   ]
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "p": {
+     "in": [
+      "SDN",
+      "HUF"
+     ]
+    }
+   },
+   "b": {
+    "p": {
+     "in": [
+      "HUF",
+      "SDN",
+      "SDN"
+     ]
+    }
+   },
+   "equal": true
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "n": {
+     "in": [
+      1,
+      2
+     ]
+    }
+   },
+   "b": {
+    "n": {
+     "in": [
+      2,
+      1.0,
+      1
+     ]
+    }
+   },
+   "equal": true
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "a": "x",
+    "b": "y"
+   },
+   "b": {
+    "b": "y",
+    "a": "x"
+   },
+   "equal": true
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "p": {
+     "in": [
+      "SDN",
+      "EU"
+     ]
+    }
+   },
+   "b": {
+    "p": {
+     "in": [
+      "SDN"
+     ]
+    }
+   },
+   "equal": false
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "n": 1
+   },
+   "b": {
+    "n": "1"
+   },
+   "equal": false
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "n": 1
+   },
+   "b": {
+    "n": true
+   },
+   "equal": false
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "p": "SDN"
+   },
+   "b": {
+    "p": "SDN",
+    "q": "x"
+   },
+   "equal": false
+  },
+  {
+   "kind": "legacy-envelope",
+   "filter": {
+    "field_00": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "field_01": "ääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääää",
+    "field_02": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "field_03": "ääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääää",
+    "field_04": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "field_05": "ääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääää",
+    "field_06": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn": "ääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääää"
+   },
+   "must_remain_valid": true
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "p": {
+     "in": [
+      "SDN"
+     ]
+    }
+   },
+   "b": {
+    "p": "SDN"
+   },
+   "equal": true
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "p": {
+     "in": [
+      "SDN",
+      "SDN"
+     ]
+    }
+   },
+   "b": {
+    "p": "SDN"
+   },
+   "equal": true
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "p": "a\u0000b"
+   },
+   "b": {
+    "p": "ab"
+   },
+   "equal": false
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "p": "a\u0000b"
+   },
+   "b": {
+    "p": "a\u0000b"
+   },
+   "equal": true
+  },
+  {
+   "kind": "identity",
+   "a": {
+    "q\"s": "back\\slash\nnewline\ttab"
+   },
+   "b": {
+    "q\"s": "back\\slash\nnewline\ttab"
+   },
+   "equal": true
+  },
+  {
+   "kind": "in-set",
+   "input": [
+    "b",
+    "a\u0000",
+    "a"
+   ],
+   "canonical": [
+    "a",
+    "a\u0000",
+    "b"
+   ]
+  }
+ ]
+}

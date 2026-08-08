@@ -17,7 +17,7 @@ import (
 
 func TestStatsFlagRequiresFilter(t *testing.T) {
 	err := cmdQuery([]string{"-data", t.TempDir(), "-list", "people", "-q", "x", "-stats"})
-	if err == nil || !strings.Contains(err.Error(), "-stats requires -filter") {
+	if err == nil || !strings.Contains(err.Error(), "-stats requires a non-empty") {
 		t.Fatalf("want the -stats-requires-filter error, got %v", err)
 	}
 }

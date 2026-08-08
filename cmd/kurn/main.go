@@ -320,16 +320,31 @@ func cmdQuery(args []string) error {
 	topk := fs.Int("topk", 0, "top-K override (0 = list default)")
 	var filters filterFlags
 	fs.Var(&filters, "filter", "repeatable name=value: keep only candidates whose payload matches every filter (names must be declared filterable in the list config)")
-	stats := fs.Bool("stats", false, "with -filter: after a successful query, write one filter_stats JSON object to stderr (stdout stays candidates-only)")
+	filterJSON := fs.String("filter-json", "", "typed filter JSON object (strings, booleans, numbers, or {\"in\":[...]}); mutually exclusive with -filter")
+	stats := fs.Bool("stats", false, "with a non-empty -filter or -filter-json: after success, write one filter_stats JSON object to stderr")
 	fs.Parse(args)
 	if *data == "" || *list == "" || *q == "" {
 		fs.Usage()
 		return fmt.Errorf("query: -data, -list and -q are required")
 	}
-	if *stats && len(filters.m) == 0 {
+	filterJSONSet := false
+	fs.Visit(func(f *flag.Flag) { filterJSONSet = filterJSONSet || f.Name == "filter-json" })
+	if filterJSONSet && len(filters.m) > 0 {
+		return fmt.Errorf("query: -filter-json and -filter are mutually exclusive")
+	}
+	var typedFilter engine.TypedFilter
+	if filterJSONSet {
+		var err error
+		typedFilter, err = engine.ParseTypedFilter([]byte(*filterJSON))
+		if err != nil {
+			return fmt.Errorf("query: -filter-json: %w", err)
+		}
+	}
+	filtered := len(filters.m) > 0 || !typedFilter.Empty()
+	if *stats && !filtered {
 		// Fail closed: silently emitting nothing would read as "the
 		// filter evaluated zero candidates".
-		return fmt.Errorf("query: -stats requires -filter (stats exist only for filtered executions)")
+		return fmt.Errorf("query: -stats requires a non-empty -filter or -filter-json")
 	}
 
 	st, err := engine.Open(*data)
@@ -341,11 +356,16 @@ func cmdQuery(args []string) error {
 		return fmt.Errorf("unknown list %q in %s", *list, *data)
 	}
 	enc := json.NewEncoder(os.Stdout)
-	if len(filters.m) > 0 {
+	if filtered {
 		// The error-returning filtered path: an undeclared name or a
 		// malformed evaluated payload is an error, never a silent
 		// unfiltered or empty answer.
-		fq, err := l.PrepareFilteredQuery(*q, engine.QueryOpts{Threshold: *threshold, TopK: *topk}, filters.m)
+		var fq *engine.FilteredQuery
+		if filterJSONSet {
+			fq, err = l.PrepareTypedFilteredQuery(*q, engine.QueryOpts{Threshold: *threshold, TopK: *topk}, typedFilter)
+		} else {
+			fq, err = l.PrepareFilteredQuery(*q, engine.QueryOpts{Threshold: *threshold, TopK: *topk}, filters.m)
+		}
 		if err != nil {
 			return err
 		}

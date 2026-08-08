@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/kurn-dev/kurn/engine"
@@ -71,14 +72,24 @@ func TestFilterChargePins(t *testing.T) {
 	// 17-byte payloads and no tombstones or overlay.
 	payloadBytes := int64(500) * int64(len(pEntry("p", "k", "SDN").Payload))
 	var ords int64 = 500
-	wantDelta := func(nPaths int64) int64 {
-		return payloadBytes + 192*nPaths*ords // constants pinned: 1, 192
+	exprCharge := func(levels int64, values ...string) int64 {
+		var charge, scalarBytes int64
+		for _, value := range values {
+			bytes := int64(len(value) + 2) // canonical JSON string bytes
+			charge += 128 + 8*bytes
+			scalarBytes += bytes
+		}
+		charge += ords * levels * (6*int64(len(values)) + scalarBytes)
+		return charge
 	}
-	if delta := one.Cost() - plain.Cost(); delta != wantDelta(1) {
-		t.Fatalf("one-path delta %d, formula says %d", delta, wantDelta(1))
+	wantScanDelta := func(nPaths int64) int64 {
+		return payloadBytes + 192*nPaths*ords // scan constants pinned: 1, 192
 	}
-	if delta := two.Cost() - one2.Cost(); delta != wantDelta(2)-wantDelta(1) {
-		t.Fatalf("second-path delta %d, formula says %d", delta, wantDelta(2)-wantDelta(1))
+	if want := wantScanDelta(1) + exprCharge(1, "SDN"); one.Cost()-plain.Cost() != want {
+		t.Fatalf("one-path delta %d, formula says %d", one.Cost()-plain.Cost(), want)
+	}
+	if want := wantScanDelta(2) - wantScanDelta(1) + exprCharge(1, "x"); two.Cost()-one2.Cost() != want {
+		t.Fatalf("second-path delta %d, formula says %d", two.Cost()-one2.Cost(), want)
 	}
 
 	// Max-path scaling: a list with eight declarations accepts eight
@@ -109,8 +120,8 @@ func TestFilterChargePins(t *testing.T) {
 	if max.Cost() <= one8.Cost() {
 		t.Fatal("eight-path charge does not exceed one-path charge")
 	}
-	if delta := max.Cost() - one8.Cost(); delta != wantDelta(8)-wantDelta(1) {
-		t.Fatalf("eight-path delta over one-path %d, formula says %d", delta, wantDelta(8)-wantDelta(1))
+	if want := wantScanDelta(8) - wantScanDelta(1) + 7*exprCharge(1, "x"); max.Cost()-one8.Cost() != want {
+		t.Fatalf("eight-path delta over one-path %d, formula says %d", max.Cost()-one8.Cost(), want)
 	}
 
 	// Exact mode: the delta scales with walked levels as well as paths.
@@ -129,8 +140,8 @@ func TestFilterChargePins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if delta := deep.Cost() - xplain.Cost(); delta != 3*wantDelta(1) {
-		t.Fatalf("exact 3-level delta %d, formula says %d", delta, 3*wantDelta(1))
+	if want := 3*wantScanDelta(1) + exprCharge(3, "SDN"); deep.Cost()-xplain.Cost() != want {
+		t.Fatalf("exact 3-level delta %d, formula says %d", deep.Cost()-xplain.Cost(), want)
 	}
 	xcfg2 := xcfg
 	xcfg2.Match.Fallback = ""
@@ -146,8 +157,8 @@ func TestFilterChargePins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if delta := flat.Cost() - xplain2.Cost(); delta != wantDelta(1) {
-		t.Fatalf("exact 1-level delta %d, formula says %d", delta, wantDelta(1))
+	if want := wantScanDelta(1) + exprCharge(1, "SDN"); flat.Cost()-xplain2.Cost() != want {
+		t.Fatalf("exact 1-level delta %d, formula says %d", flat.Cost()-xplain2.Cost(), want)
 	}
 }
 
@@ -201,5 +212,90 @@ func TestFilterCompileClonesCallerData(t *testing.T) {
 	}
 	if len(got) != 1 || !json.Valid(got[0].Payload) || got[0].EntryID != "p1" {
 		t.Fatalf("caller mutation after prepare changed the outcome: %+v", got)
+	}
+}
+
+func TestTypedFilterAlternativeAndScalarCharge(t *testing.T) {
+	l, err := engine.NewList("typed-charge", filterableCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Replace([]engine.Entry{pEntry("p1", "dana kovak", "SDN")}); err != nil {
+		t.Fatal(err)
+	}
+	oneExpr, err := engine.ParseTypedFilter([]byte(`{"program":"SDN"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw strings.Builder
+	raw.WriteString(`{"program":{"in":["SDN"`)
+	for i := 1; i < 64; i++ {
+		fmt.Fprintf(&raw, `,"v%02d"`, i)
+	}
+	raw.WriteString(`]}}`)
+	maxExpr, err := engine.ParseTypedFilter([]byte(raw.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := l.PrepareTypedFilteredQuery("dana kovak", engine.QueryOpts{}, oneExpr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	max, err := l.PrepareTypedFilteredQuery("dana kovak", engine.QueryOpts{}, maxExpr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Snapshot/path work is identical. The delta is the extra 63 compiled
+	// alternatives plus their canonical string bytes (63 × five bytes for
+	// the quoted vNN values), at the pinned expression constants.
+	want := int64(63*128 + 63*5*8 + 63*(6+5)) // one ordinal in this fixture
+	if got := max.Cost() - one.Cost(); got != want {
+		t.Fatalf("max-alternative charge delta %d, want %d", got, want)
+	}
+
+	max.Execute(context.Background()) // warm pools
+	allocs := testing.AllocsPerRun(50, func() {
+		if _, _, err := max.Execute(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 60 {
+		t.Fatalf("64-alternative typed execution allocates %.0f per run, over the 60 ceiling", allocs)
+	}
+}
+
+func TestTypedNumberScannerAllocs(t *testing.T) {
+	cfg := filterableCfg()
+	cfg.Filterable = []engine.FilterField{{Name: "n", Path: "n"}}
+	l, err := engine.NewList("typed-number-allocs", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]engine.Entry, 1000)
+	for i := range entries {
+		entries[i] = engine.Entry{
+			ID: fmt.Sprintf("n%04d", i), Keys: []string{"dana kovak"},
+			Payload: json.RawMessage(`{"n":1.00}`),
+		}
+	}
+	if err := l.Replace(entries); err != nil {
+		t.Fatal(err)
+	}
+	f, err := engine.ParseTypedFilter([]byte(`{"n":1e0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := l.PrepareTypedFilteredQuery("dana kovak", engine.QueryOpts{}, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Execute(context.Background())
+	allocs := testing.AllocsPerRun(25, func() {
+		if _, _, err := p.Execute(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 60 {
+		t.Fatalf("1000 numeric predicate evaluations allocate %.0f per run, over the 60 ceiling", allocs)
 	}
 }

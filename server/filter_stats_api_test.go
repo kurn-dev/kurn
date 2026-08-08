@@ -15,7 +15,7 @@ import (
 )
 
 type statsEnvelope struct {
-	Candidates []json.RawMessage `json:"candidates"`
+	Candidates  []json.RawMessage `json:"candidates"`
 	FilterStats map[string]struct {
 		Evaluated int64 `json:"evaluated"`
 		Rejected  int64 `json:"rejected"`

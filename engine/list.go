@@ -855,8 +855,10 @@ func (l *List) Query(q string, opts QueryOpts) []Candidate {
 // QueryCtx is Query with cooperative cancellation: the ngram scan polls ctx
 // periodically (see ngram.LookupCtx) and the whole query returns nil when
 // canceled — ambiguous with "no match" by design; callers that care check
-// ctx.Err(). The exact path takes no checks: its work is bounded by the
-// probe-level count and the topK collection cap, microseconds at any scale.
+// ctx.Err(). The exact path polls while walking a hot key's ordinal run:
+// unfiltered execution keeps its historical coarse cadence, while a filter
+// uses a tighter cadence because strict payload evaluation makes each walked
+// ordinal materially more expensive.
 func (l *List) QueryCtx(ctx context.Context, q string, opts QueryOpts) []Candidate {
 	c, _ := l.QueryVersioned(ctx, q, opts)
 	return c
@@ -1064,9 +1066,18 @@ func (l *List) QueryTypedFilteredCtx(ctx context.Context, q string, opts QueryOp
 	return p.Execute(ctx)
 }
 
-// exactCancelCheckEvery is how many walked ordinals the exact path runs
-// between ctx checks once a filter can extend a hot key's run.
-const exactCancelCheckEvery = 4096
+// The unfiltered exact walk keeps its historical cancellation cadence. A
+// filtered walk polls more frequently because each ordinal can strictly scan
+// a large payload across several declared paths.
+const (
+	exactCancelCheckEvery         = 4096
+	exactFilteredCancelCheckEvery = 512
+)
+
+// testHookExactCancelPoll runs immediately before an exact-walk context
+// check. Tests use it to cancel deterministically at a known poll point; it
+// is nil in every other build and is checked only at poll cadence.
+var testHookExactCancelPoll func(walked, every int)
 
 // Filter charge constants — CPU-admission proxies, NOT materialized
 // memory (the model's first term of that kind; the scanner allocates ~0,
@@ -1266,6 +1277,10 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 		// The same holds with a filter: a fully filtered level descends,
 		// exactly like a fully masked one.
 		walked := 0
+		cancelCheckEvery := exactCancelCheckEvery
+		if cf != nil {
+			cancelCheckEvery = exactFilteredCancelCheckEvery
+		}
 		for _, level := range exactLevels(aq, l.cfg.Match.Fallback == "parent_domain") {
 			score := 100.0
 			if level != aq {
@@ -1287,11 +1302,16 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 			if s.base != nil && s.base.ex != nil && !full() {
 				for _, ord := range s.base.ex.Lookup(level) {
 					walked++
-					if walked%exactCancelCheckEvery == 0 && ctx.Err() != nil {
-						if fst != nil {
-							*fst = FilterStats{}
+					if walked%cancelCheckEvery == 0 {
+						if testHookExactCancelPoll != nil {
+							testHookExactCancelPoll(walked, cancelCheckEvery)
 						}
-						return nil, nil
+						if ctx.Err() != nil {
+							if fst != nil {
+								*fst = FilterStats{}
+							}
+							return nil, nil
+						}
 					}
 					add(s.base, s.tombstones, ord, score, false)
 					if full() {
@@ -1302,11 +1322,16 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 			if s.overlay != nil && s.overlay.ex != nil && !full() {
 				for _, ord := range s.overlay.ex.Lookup(level) {
 					walked++
-					if walked%exactCancelCheckEvery == 0 && ctx.Err() != nil {
-						if fst != nil {
-							*fst = FilterStats{}
+					if walked%cancelCheckEvery == 0 {
+						if testHookExactCancelPoll != nil {
+							testHookExactCancelPoll(walked, cancelCheckEvery)
 						}
-						return nil, nil
+						if ctx.Err() != nil {
+							if fst != nil {
+								*fst = FilterStats{}
+							}
+							return nil, nil
+						}
 					}
 					add(s.overlay, nil, ord, score, false)
 					if full() {

@@ -264,7 +264,7 @@ func TestFilteredOverlaySupersedesBase(t *testing.T) {
 
 // Exact hot-run walk + cancellation: one key shared by 50k entries, all
 // failing the filter except the LAST ordinal. A completed walk must find
-// it; a mid-walk cancellation must return nil via the 4096-ordinal poll —
+// it; a mid-walk cancellation must return nil via the 512-ordinal poll —
 // the outcome distinguishes the two (a missing poll would return the hit).
 func TestFilteredExactHotRunAndCancellation(t *testing.T) {
 	cfg := engine.ListConfig{

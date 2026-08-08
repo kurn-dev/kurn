@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.5.1 — 2026-08-08
+
+### Bounded filtered exact-query cancellation
+
+Exact-mode walks with a non-empty compiled payload filter now poll context
+cancellation every 512 walked ordinals instead of every 4,096. The tighter
+cadence bounds work after cancellation when a hot exact key fans out across
+large payloads and several declared paths. Cancellation still returns no
+partial candidates or `FilterStats`; callers distinguish cancellation through
+`ctx.Err()` as before.
+
+Unfiltered exact queries retain their existing 4,096-ordinal cadence, early
+stop, result bytes, and allocation shape. On the locked 100,000-entry,
+2,048-byte-payload, eight-path reference case, independently reproduced p95
+return time after cancellation is 1.345 ms against the 3 ms release bar;
+filtered late/miss throughput remains flat against v0.5.0.
+
+### Drift and parser assurance
+
+The permanent engine suite adds a fixed-seed 4,114-case differential between
+the strict one-pass payload evaluator and an independent complete JSON decoder.
+It covers nested arrays and paths, escaped names and values, exact typed
+scalars and `IN`, duplicate members, malformed tails, U+0000/controls, numeric
+boundaries, caller mutation, and repeated execution. No accepted filter
+spelling or production parser behavior changes in this patch.
+
+Platform verification also gains a PostgreSQL concurrency sentinel proving
+that equivalent canonical filters registered through separate connections
+converge on one standing-check identity while unequal filters remain distinct.
+This is test-side assurance; no database migration is required.
+
+### Documentation boundary
+
+Public documentation now presents kurn as an in-memory search engine for fast
+fuzzy and exact retrieval over application-owned collections. Public-feed
+mappings remain ingestion recipes and evaluation evidence rather than the
+product category. The workload boundary is explicit: single-node resident
+short-string retrieval, not full-text ranking, faceting, distributed sharding,
+or entity resolution. The release operations runbook moves to the downstream
+platform repository; contributor-facing DCO and test rules remain public.
+
 ## v0.5.0 — 2026-08-08
 
 ### Typed equality and `IN` payload filters

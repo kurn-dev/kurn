@@ -320,10 +320,16 @@ func cmdQuery(args []string) error {
 	topk := fs.Int("topk", 0, "top-K override (0 = list default)")
 	var filters filterFlags
 	fs.Var(&filters, "filter", "repeatable name=value: keep only candidates whose payload matches every filter (names must be declared filterable in the list config)")
+	stats := fs.Bool("stats", false, "with -filter: after a successful query, write one filter_stats JSON object to stderr (stdout stays candidates-only)")
 	fs.Parse(args)
 	if *data == "" || *list == "" || *q == "" {
 		fs.Usage()
 		return fmt.Errorf("query: -data, -list and -q are required")
+	}
+	if *stats && len(filters.m) == 0 {
+		// Fail closed: silently emitting nothing would read as "the
+		// filter evaluated zero candidates".
+		return fmt.Errorf("query: -stats requires -filter (stats exist only for filtered executions)")
 	}
 
 	st, err := engine.Open(*data)
@@ -339,7 +345,11 @@ func cmdQuery(args []string) error {
 		// The error-returning filtered path: an undeclared name or a
 		// malformed evaluated payload is an error, never a silent
 		// unfiltered or empty answer.
-		cands, _, err := l.QueryFilteredCtx(context.Background(), *q, engine.QueryOpts{Threshold: *threshold, TopK: *topk}, filters.m)
+		fq, err := l.PrepareFilteredQuery(*q, engine.QueryOpts{Threshold: *threshold, TopK: *topk}, filters.m)
+		if err != nil {
+			return err
+		}
+		cands, _, fst, err := fq.ExecuteStats(context.Background())
 		if err != nil {
 			return err
 		}
@@ -347,6 +357,14 @@ func cmdQuery(args []string) error {
 			if err := enc.Encode(c); err != nil {
 				return err
 			}
+		}
+		if *stats {
+			// One JSON object on stderr, mirroring the HTTP member shape,
+			// only after full success — stdout remains candidate-per-line.
+			serr := json.NewEncoder(os.Stderr)
+			return serr.Encode(map[string]map[string]map[string]int64{
+				"filter_stats": {*list: {"evaluated": fst.Evaluated, "rejected": fst.Rejected}},
+			})
 		}
 		return nil
 	}

@@ -926,7 +926,7 @@ func (p *PreparedQuery) Cost() int64 { return p.cost }
 // returns candidates plus that snapshot's version — the exact state the
 // admission charge was computed from.
 func (p *PreparedQuery) Execute(ctx context.Context) ([]Candidate, string) {
-	c, _ := p.l.querySnap(ctx, p.s, p.q, p.opts, nil) // nil filter never errors
+	c, _ := p.l.querySnap(ctx, p.s, p.q, p.opts, nil, nil) // nil filter never errors
 	return c, p.s.version
 }
 
@@ -991,8 +991,35 @@ func (p *FilteredQuery) AppliedFilter() map[string]string { return p.cf.applied(
 // than dropping the candidate — a dropped candidate could manufacture a
 // clear result.
 func (p *FilteredQuery) Execute(ctx context.Context) ([]Candidate, string, error) {
-	c, err := p.l.querySnap(ctx, p.s, p.q, p.opts, p.cf)
+	c, err := p.l.querySnap(ctx, p.s, p.q, p.opts, p.cf, nil)
 	return c, p.s.version, err
+}
+
+// FilterStats reports what one filtered execution actually did:
+// Evaluated counts live, score-qualified payload predicate invocations
+// performed; Rejected counts the well-formed evaluations that did not
+// satisfy the complete filter. Tombstoned entries and candidates the
+// query never reached are not counted. These are execution diagnostics
+// — deterministic for a pinned snapshot and request, but query-plan
+// dependent (exact-mode early stop and parent fallback legitimately
+// change them) — never list cardinality, path coverage, or a proof
+// that a declared path exists.
+type FilterStats struct {
+	Evaluated int64
+	Rejected  int64
+}
+
+// ExecuteStats is Execute plus the execution's FilterStats, returned by
+// value per run — the prepared query retains no per-run state and stays
+// safe to execute repeatedly. A failed or canceled execution reports
+// zero stats: partial counts must not read as successful evidence.
+func (p *FilteredQuery) ExecuteStats(ctx context.Context) ([]Candidate, string, FilterStats, error) {
+	var fst FilterStats
+	c, err := p.l.querySnap(ctx, p.s, p.q, p.opts, p.cf, &fst)
+	if err != nil {
+		return c, p.s.version, FilterStats{}, err
+	}
+	return c, p.s.version, fst, nil
 }
 
 // QueryFilteredCtx is the one-call convenience form of
@@ -1053,7 +1080,7 @@ func (l *List) filterChargeSnap(s *snapshot, nPaths, levels int) int64 {
 // compiled filter (nil = unfiltered); a malformed payload in the
 // evaluated set is captured and returned as an error — never a dropped
 // candidate.
-func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryOpts, cf *compiledFilter) ([]Candidate, error) {
+func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryOpts, cf *compiledFilter, fst *FilterStats) ([]Candidate, error) {
 	if ctx.Err() != nil {
 		return nil, nil
 	}
@@ -1087,6 +1114,9 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 			}
 		}
 		if cf != nil && !prechecked {
+			if fst != nil {
+				fst.Evaluated++
+			}
 			ok, err := cf.eval(e.Payload)
 			if err != nil {
 				if filterErr == nil {
@@ -1095,6 +1125,9 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 				return
 			}
 			if !ok {
+				if fst != nil {
+					fst.Rejected++
+				}
 				return
 			}
 		}
@@ -1120,12 +1153,18 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 						return false
 					}
 				}
+				if fst != nil {
+					fst.Evaluated++
+				}
 				ok, err := cf.eval(e.Payload)
 				if err != nil {
 					if filterErr == nil {
 						filterErr = err
 					}
 					return false
+				}
+				if !ok && fst != nil {
+					fst.Rejected++
 				}
 				return ok
 			}
@@ -1181,6 +1220,9 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 				for _, ord := range s.base.ex.Lookup(level) {
 					walked++
 					if walked%exactCancelCheckEvery == 0 && ctx.Err() != nil {
+						if fst != nil {
+							*fst = FilterStats{}
+						}
 						return nil, nil
 					}
 					add(s.base, s.tombstones, ord, score, false)
@@ -1193,6 +1235,9 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 				for _, ord := range s.overlay.ex.Lookup(level) {
 					walked++
 					if walked%exactCancelCheckEvery == 0 && ctx.Err() != nil {
+						if fst != nil {
+							*fst = FilterStats{}
+						}
 						return nil, nil
 					}
 					add(s.overlay, nil, ord, score, false)
@@ -1213,15 +1258,22 @@ func (l *List) querySnap(ctx context.Context, s *snapshot, q string, opts QueryO
 	if filterErr != nil {
 		return nil, filterErr
 	}
-	if len(out) == 0 {
-		return nil, nil
-	}
 	// A scan canceled AFTER an earlier segment already contributed would
 	// otherwise return those partial results as if complete (LookupCtx
 	// returns nil for the canceled segment, indistinguishable from "that
 	// segment had no hits"). Honor the documented contract — the whole
-	// query returns nil once canceled.
+	// query returns nil once canceled, and a canceled run reports no
+	// stats: counts from a partial scan must not read as evidence. This
+	// check sits BEFORE the empty-result return so a canceled scan that
+	// collected nothing cannot pass off partial counts as an empty
+	// success.
 	if ctx.Err() != nil {
+		if fst != nil {
+			*fst = FilterStats{}
+		}
+		return nil, nil
+	}
+	if len(out) == 0 {
 		return nil, nil
 	}
 

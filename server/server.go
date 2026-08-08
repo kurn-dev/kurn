@@ -721,7 +721,24 @@ type queryResp struct {
 	// failure instead of an unfiltered answer read as filtered.
 	// Unfiltered responses omit the member (the old shape, byte-for-byte).
 	Filter map[string]string `json:"filter,omitempty"`
-	TookUs int64             `json:"took_us"`
+	// FilterStats reports, per list name, what the filtered execution
+	// actually did (see engine.FilterStats: live, score-qualified
+	// predicate invocations and how many failed the complete filter).
+	// Present on every successful FILTERED response — including an empty
+	// result — and never otherwise: unfiltered responses keep the old
+	// shape, and a failed response carries no partial counts. Keying by
+	// list name means reordering the request's lists cannot change the
+	// evidence. Disclosure note: rejected counts are a bounded
+	// cardinality oracle over score-qualified hidden candidates; the
+	// endpoint's existing rate limits are the cover.
+	FilterStats map[string]filterStatsResp `json:"filter_stats,omitempty"`
+	TookUs      int64                      `json:"took_us"`
+}
+
+// filterStatsResp is one list's execution telemetry in a query response.
+type filterStatsResp struct {
+	Evaluated int64 `json:"evaluated"`
+	Rejected  int64 `json:"rejected"`
 }
 
 // query runs q against every named list and merges the results (see
@@ -940,6 +957,10 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 	start := time.Now()
 	out := make([]respCand, 0)
 	versions := make(map[string]string, len(lists))
+	var fstats map[string]filterStatsResp
+	if filtered {
+		fstats = make(map[string]filterStatsResp, len(lists))
+	}
 	for i := range lists {
 		name := names[i]
 		lstart := time.Now()
@@ -950,7 +971,8 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		var ver string
 		if filtered {
 			var xerr error
-			cands, ver, xerr = fprepared[i].Execute(ctx)
+			var fst engine.FilterStats
+			cands, ver, fst, xerr = fprepared[i].ExecuteStats(ctx)
 			if xerr != nil {
 				// A stored payload failed strict evaluation: node/data
 				// failure, not a bad request. No partial answer may escape
@@ -958,6 +980,7 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 				// deferred releases above.
 				return queryResp{}, http.StatusInternalServerError, fmt.Sprintf("list %s: %v", name, xerr)
 			}
+			fstats[name] = filterStatsResp{Evaluated: fst.Evaluated, Rejected: fst.Rejected}
 		} else {
 			cands, ver = prepared[i].Execute(ctx)
 		}
@@ -995,6 +1018,7 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		// list (it is the request's map, name-sorted at compile); take it
 		// from the first prepared list.
 		res.Filter = fprepared[0].AppliedFilter()
+		res.FilterStats = fstats
 	}
 	return res, 0, ""
 }

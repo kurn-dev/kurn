@@ -285,8 +285,8 @@ The first row is the median of three runs in one session; p50 moves about
   at 0.45 for roughly 3× the latency — measured on synthetic perturbations,
   which are an easier corpus than real-world name data, so the *shape*
   (per-class floors, threshold trade-off) is the transferable claim rather
-  than the level. On real ground truth (OFAC SDN aliases, indexed the way
-  screening lists actually ship): 1.000.
+  than the level. On real ground truth (OFAC SDN aliases, indexed with the
+  publisher-provided aliases as keys): 1.000.
 
 **Exact lists**, identifier preset, 2M keys: 133 B/key, p99 4 µs, 925k
 queries/s single-threaded.
@@ -302,7 +302,8 @@ rebuild. Recovery time is open time.
 Any feed — a database export, a CSV, an XML publication, an NDJSON dump —
 loads through a declarative **mapping** instead of custom code: dot-paths,
 per-instance equals-only filters, multi-path joins. The examples in
-[docs/examples/](docs/examples/) map the major public screening lists;
+[docs/examples/](docs/examples/) map several structurally difficult public
+feeds;
 the same file shape maps a `SELECT` from your own tables:
 
 ```sh

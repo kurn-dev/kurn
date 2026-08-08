@@ -197,7 +197,7 @@ Results:
 
 - **Aliases held out of the index** (the matcher must bridge primary↔alias
   itself): recall **0.541 @ 0.6**, **0.713 @ 0.45**.
-- **Aliases indexed as keys** (how screening lists actually ship):
+- **Aliases indexed as keys** (using the publisher-provided aliases):
   **1.000 @ 0.6** — alias data does the bridging, not fuzzy cleverness.
 - Misses @ 0.6 (3,981): 41.2% are identity changes (zero shared tokens —
   unbridgeable by any string matcher); a strict phonetic (Metaphone)

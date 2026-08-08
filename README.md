@@ -2,17 +2,24 @@
 
 [![CI](https://github.com/kurn-dev/kurn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kurn-dev/kurn/actions/workflows/ci.yml)
 
-**Fuzzy lookup, next to your code.**
+**In-memory search, next to your code.**
 
-kurn is an in-memory engine for matching short strings — product names,
-customers, domains, denylists, any list you have. Typo-tolerant
-(character-ngram, IDF-weighted, scored 0–100) or exact, it runs as a Go
-library inside your service or as a sidecar (`kurnd`) beside it, so there is
-no search cluster to maintain. Every answer carries the content-addressed
-version of the data it was computed against — candidates and version come
-from one atomic snapshot — so the same query against the same version, on
-the same kurn version, returns the same candidates: byte for byte, on any
-machine.
+kurn is an in-memory search engine for fast fuzzy and exact retrieval over
+application-owned collections. Product names, customers, domains, denylists,
+or any other short-string collection can share one engine, with declared
+analyzers and optional exact typed filters over payload fields. It runs as a
+Go library inside your service or as a sidecar (`kurnd`) beside it, so there
+is no search cluster to maintain. Every answer carries the content-addressed
+version of the data and resolved configuration it used — candidates and
+version come from one atomic snapshot — so the same query against the same
+version, on the same kurn version, returns the same candidates byte for byte
+on any machine.
+
+The workload boundary is deliberate: one node, resident application-owned
+collections, and short-string retrieval. kurn is not full-text document
+ranking, faceting, distributed sharding, or entity resolution. A fuzzy score
+is string similarity, not a probability of identity; a match is a candidate
+to review, and a non-match is not a clearance.
 
 A common shape: your database stays the system of record, a query exports the
 rows worth matching, `kurn build` turns them into a content-addressed bundle,
@@ -180,7 +187,7 @@ quickstart query over a 2-entry list).
 | `DELETE /v1/lists/{list}/entries/{id}` | delete one entry | idempotent tombstone |
 | `POST /v1/lists/{list}/reload` | publish a shipped bundle: re-open the list from disk | atomic swap; failure keeps previous content serving (409); response = fresh stats + golden-probe results |
 | `POST /v1/lists/{list}/compact` | fold journal/overlay into a fresh base | run after large append sessions |
-| `POST /v1/query` | query one or more lists | `{"q","lists",["threshold"],["topk"]}`; 1–100 list entries, `threshold` in `[0, 1]`, and `topk` in `[1, 1000]` when present (400 otherwise) — an ABSENT field means "list default", while an explicit `"threshold": 0` queries with no score floor (the two are distinct); results from all named lists are merged (score desc), each candidate tagged with its `list`; global top-K after merge (100 when `topk` omitted); an empty `candidates` array is an explicit "no match", not an error; unknown list anywhere in the request is a 404 and nothing runs. Library note: `engine.QueryOpts` uses zero = list default and NEGATIVE = explicit zero (no floor / unlimited). Optional `"filter"`: map of DECLARED logical names to exact decoded-JSON-string values, ANDed (max 8 names, 128 runes/name, 512/value) — no trimming, coercion, normalization, wildcards, or IN; every name must be declared `filterable` by every requested list, else 400 and nothing runs — a typo'd filter can never silently return an unfiltered or empty "clear". A repeated name OR a repeated filter member in the JSON is a 400 (never silent last-wins). Filtering runs BEFORE the per-list top-K cut (a match cannot be starved by unfiltered higher scorers) and never changes scores; on exact-mode lists with `parent_domain` fallback, a level with no post-filter survivors descends to the parent level, exactly as a fully masked level does. Payload arrays auto-descend; a missing path or non-string value is a non-match; a malformed stored payload is a 500, never a non-match. An empty filter object equals omission and has no echo; successful NON-empty filtered responses (including empty candidate sets) echo the applied `filter` — clients MUST require the echo to equal what they sent (a pre-filter node ignores the member and omits the echo). Library: `PrepareFilteredQuery`/`QueryFilteredCtx` |
+| `POST /v1/query` | query one or more lists | `{"q","lists",["threshold"],["topk"],["filter"]}`; 1–100 list entries, `threshold` in `[0, 1]`, and `topk` in `[1, 1000]` when present (400 otherwise). Results from all named lists are merged score-descending and cut globally. Optional `filter` maps up to eight declared logical names to exact JSON strings, booleans, numbers, or `{"in":[...]}` sets (up to 64 alternatives); names are ANDed, IN values are ORed, and types never coerce. Every name must be declared `filterable` by every requested list or the whole query fails with 400. Repeated names/members, nulls, nested values, empty sets, unknown/repeated operators, oversize expressions, and malformed stored payload fail closed. Filtering runs before the per-list top-K cut and never changes scores; payload arrays auto-descend, while a missing path or reached value of another type is a non-match. A non-empty successful response echoes the canonical applied expression (sorted names/sets, deduplicated IN, fixed-decimal numbers) and includes per-list `filter_stats`; clients must compare the echo with their locally canonicalized expression, not raw request bytes, and tolerate omission from older nodes. Library: `ParseTypedFilter`, `PrepareTypedFilteredQuery`, `QueryTypedFilteredCtx`; the legacy string-map wrappers remain compatible. |
 | `POST /v1/batch-query` | run up to 100 query checks in one request | `{"checks":[{"q","lists",["threshold"],["topk"]},...]}` (1–100 checks); `results[i]` is either a full single-query envelope or `{"error":"..."}` for that check, order preserved |
 
 Batch checks share one round trip; per-check errors are inline, so one bad

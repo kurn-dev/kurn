@@ -66,6 +66,10 @@ run "kurn <command> -h" for flags.`)
 }
 
 func cmdBench(args []string) error {
+	return cmdBenchTo(args, os.Stdout)
+}
+
+func cmdBenchTo(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	n := fs.Int("n", 1000000, "number of entries to generate (ignored with -entries)")
 	sample := fs.Int("sample", 2000, "entries sampled per category for the query corpus (ignored with -corpus)")
@@ -75,12 +79,16 @@ func cmdBench(args []string) error {
 	mode := fs.String("mode", "ngram", "match mode: ngram | exact")
 	entriesPath := fs.String("entries", "", "load entries from this NDJSON file instead of generating (one {\"id\",\"keys\"} per line; pair with -corpus)")
 	corpusPath := fs.String("corpus", "", "load the query corpus from this CSV file instead of generating (query,truth_id,category; pair with -entries)")
+	reportPath := fs.String("report-json", "", "also write a privacy-safe kurn-eval/v1 JSON report to this file (not stdout)")
 	fs.Parse(args)
 	if *n <= 0 || *sample <= 0 {
 		return fmt.Errorf("bench: -n and -sample must be > 0 (got -n %d -sample %d)", *n, *sample)
 	}
 	if (*entriesPath == "") != (*corpusPath == "") {
 		return fmt.Errorf("bench: -entries and -corpus must be given together (the query corpus must match the list content)")
+	}
+	if *reportPath == "-" {
+		return fmt.Errorf("bench: -report-json - is unsupported; use a file path so human stdout stays unambiguous")
 	}
 
 	l, err := engine.NewList("bench", engine.ListConfig{
@@ -96,18 +104,50 @@ func cmdBench(args []string) error {
 	// (downloaded separately) in the same shapes drives the same harness.
 	var entries []engine.Entry
 	var corpus []bench.Case
+	var reportInput evalInputIdentity
 	if *entriesPath != "" {
-		if entries, err = readEntries(*entriesPath); err != nil {
-			return err
-		}
-		if corpus, err = readCorpus(*corpusPath); err != nil {
-			return err
+		if *reportPath != "" {
+			var entriesSHA, corpusSHA string
+			if entries, entriesSHA, err = readEntriesWithSHA256(*entriesPath); err != nil {
+				return err
+			}
+			if corpus, corpusSHA, err = readCorpusWithSHA256(*corpusPath); err != nil {
+				return err
+			}
+			reportInput = evalInputIdentity{
+				Mode: "files",
+				Files: &evalFileInputIdentity{
+					EntriesSHA256: entriesSHA,
+					CorpusSHA256:  corpusSHA,
+				},
+			}
+		} else {
+			if entries, err = readEntries(*entriesPath); err != nil {
+				return err
+			}
+			if corpus, err = readCorpus(*corpusPath); err != nil {
+				return err
+			}
 		}
 	} else {
 		entries = bench.Generate(*seed, *n)
 		corpus = bench.Corpus(*seed, entries, *sample)
+		if *reportPath != "" {
+			reportInput = evalInputIdentity{
+				Mode: "synthetic",
+				Synthetic: &evalSyntheticInputIdentity{
+					Generator: evalSyntheticGeneratorV1,
+					Seed:      *seed,
+					Entries:   *n,
+					Sample:    *sample,
+				},
+			}
+		}
 	}
 	distinct := distinctKeys(entries)
+	if *reportPath != "" && distinct == 0 {
+		return fmt.Errorf("bench: report: input has no distinct keys")
+	}
 
 	// Memory: snapshot AFTER entries are materialized (and the counting map
 	// above is dead) but BEFORE Replace, so B/key covers the index the list
@@ -126,16 +166,28 @@ func cmdBench(args []string) error {
 	runtime.ReadMemStats(&m1)
 	// Signed delta: HeapAlloc is uint64 and a (theoretical) shrink across
 	// Replace would wrap unsigned subtraction to a huge bogus number.
-	bPerKey := float64(int64(m1.HeapAlloc)-int64(m0.HeapAlloc)) / float64(distinct)
+	heapDelta := int64(m1.HeapAlloc) - int64(m0.HeapAlloc)
+	bPerKey := float64(heapDelta) / float64(distinct)
 
 	rep := bench.Run(l, corpus, engine.QueryOpts{})
 
-	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "entries\t%d\n", len(entries))
+	if *reportPath != "" {
+		report := makeEvalReport(l, reportInput, len(entries), distinct, buildTime, heapDelta, m1.HeapAlloc, rep)
+		if err := writeEvalReport(*reportPath, report); err != nil {
+			return fmt.Errorf("bench: report: %w", err)
+		}
+	}
+
+	return writeHumanBenchReport(stdout, len(entries), distinct, buildTime, bPerKey, m1.HeapAlloc, rep)
+}
+
+func writeHumanBenchReport(stdout io.Writer, entries, distinct int, buildTime time.Duration, bPerKey float64, heapAlloc uint64, rep bench.Report) error {
+	w := tabwriter.NewWriter(stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "entries\t%d\n", entries)
 	fmt.Fprintf(w, "distinct keys\t%d\n", distinct)
 	fmt.Fprintf(w, "build time\t%v\n", buildTime.Round(time.Millisecond))
 	fmt.Fprintf(w, "index B/key\t%.1f\t(approx: HeapAlloc delta around Replace, entries excluded)\n", bPerKey)
-	fmt.Fprintf(w, "process HeapAlloc\t%.1f MiB\n", float64(m1.HeapAlloc)/(1<<20))
+	fmt.Fprintf(w, "process HeapAlloc\t%.1f MiB\n", float64(heapAlloc)/(1<<20))
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "category\tcases\tfound\trecall")
 	for _, cat := range bench.Categories() {
@@ -161,8 +213,26 @@ func readEntries(path string) ([]engine.Entry, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return decodeEntries(f, path)
+}
+
+func readEntriesWithSHA256(path string) ([]engine.Entry, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	entries, err := decodeEntries(io.TeeReader(f, h), path)
+	if err != nil {
+		return nil, "", err
+	}
+	return entries, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func decodeEntries(r io.Reader, path string) ([]engine.Entry, error) {
 	var entries []engine.Entry
-	dec := json.NewDecoder(bufio.NewReaderSize(f, 1<<20))
+	dec := json.NewDecoder(bufio.NewReaderSize(r, 1<<20))
 	for {
 		var e engine.Entry
 		if err := dec.Decode(&e); err == io.EOF {
@@ -186,7 +256,25 @@ func readCorpus(path string) ([]bench.Case, error) {
 		return nil, err
 	}
 	defer f.Close()
-	r := csv.NewReader(f)
+	return decodeCorpus(f, path)
+}
+
+func readCorpusWithSHA256(path string) ([]bench.Case, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	corpus, err := decodeCorpus(io.TeeReader(f, h), path)
+	if err != nil {
+		return nil, "", err
+	}
+	return corpus, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func decodeCorpus(src io.Reader, path string) ([]bench.Case, error) {
+	r := csv.NewReader(src)
 	header, err := r.Read()
 	if err != nil {
 		return nil, fmt.Errorf("bench: corpus %s: %w", path, err)

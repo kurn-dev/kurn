@@ -223,6 +223,10 @@ merging candidates across lists must not conflate the two.
 
 The engine is usable directly, without the server:
 
+For a complete compile-checked program using fuzzy and exact lists, a typed
+filter, answer-version capture, and clean store shutdown, see
+[`examples/embed`](examples/embed).
+
 ```go
 package main
 

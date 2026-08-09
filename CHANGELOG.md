@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.5.2 — 2026-08-09
+
+### Portable evaluation reports
+
+`kurn bench` now accepts opt-in `-report-json <path>` and writes a versioned
+`kurn-eval/v1` JSON report for reproducible evaluation pipelines. The report
+identifies the resolved analyzer and match configuration, engine and Go build
+identity, synthetic-generator parameters or SHA-256 input identities, corpus
+and category outcomes, and fixed-unit run observations. It deliberately omits
+source and target paths, host and user identity, raw entries, queries, truth
+IDs, environment variables, and file contents.
+
+Report writes fail closed: the command validates a typed, map-free object,
+writes a temporary file beside the target, fsyncs and closes it, then renames
+it into place. A failure cannot leave a partial final artifact. Omitting the
+flag preserves the existing human-readable bench output and exit behavior;
+`-report-json -` is rejected so machine output cannot collide with that stdout
+contract.
+
+Observation fields are evidence for one run, not deterministic identity.
+Memory remains an approximate HeapAlloc delta around `Replace`, including
+allocator slack and other GC-window movement. Measured results still require
+their corpus, machine, date, method, and caveats; the schema is not a query-API
+compatibility promise or an endorsement of a corpus.
+
+### Regression and embedding evidence
+
+The report suite pins schema bytes and ordering, resolved-config equivalence,
+input-byte sensitivity and path independence, privacy needles, synthetic and
+file-mode population, finite observations, legacy stdout compatibility, and
+atomic failure behavior. The public schema document records the identity and
+measurement boundary.
+
+`examples/embed` adds a compile-checked, CI-smoked library example over
+invented application-owned data. It constructs fuzzy and exact lists through
+the public API, replaces entries, demonstrates typed filtering, captures the
+version returned with each answer, and closes cleanly. It adds no new match or
+index mode and does not change query, filtering, admission, persistence, or
+HTTP semantics.
+
 ## v0.5.1 — 2026-08-08
 
 ### Bounded filtered exact-query cancellation

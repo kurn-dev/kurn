@@ -1,5 +1,18 @@
 # kurn bench — measured results
 
+`kurn bench` can also write a privacy-safe, versioned JSON artifact beside its
+human output:
+
+```sh
+go run ./cmd/kurn bench -n 1000000 -sample 2000 -seed 42 \
+  -report-json ./kurn-eval.json
+```
+
+The [`kurn-eval/v1` schema](KURN_EVAL_V1.md) separates deterministic input,
+configuration, and recall claims from run-dependent timing and memory
+observations. File-input reports carry byte hashes, never source or target
+paths or raw corpus data.
+
 Measured 2026-08-04 at the v0.1.0 release, this machine:
 
 - Machine: Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.5.1

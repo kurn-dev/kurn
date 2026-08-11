@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.3 — 2026-08-11
+
+### Tagged evaluation evidence
+
+Version-tag CI now runs the existing full and race suites before generating a
+small, fixed synthetic `kurn-eval/v1` report. The workflow validates the exact
+commit revision, clean VCS state, schema, generator seed, corpus size, sample
+size, match mode, threshold, and top-K before retaining the report for 90 days
+as a tag-and-SHA-named workflow artifact.
+
+The artifact is reproducible release evidence, not a release asset or a
+cross-release performance claim. Its corpus is synthetic; duration and
+approximate-memory fields remain run observations with the caveats introduced
+in v0.5.2. The workflow keeps read-only repository permissions, and this
+release changes no library, engine, query, filtering, persistence, admission,
+or HTTP behavior.
+
 ## v0.5.2 — 2026-08-09
 
 ### Portable evaluation reports

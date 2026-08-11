@@ -6,6 +6,7 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -35,3 +36,34 @@ jobs:
         run: go run ./examples/embed
       - run: go test -count=1 ./...
       - run: go test -race -count=1 ./...
+      - name: Generate tagged-release evaluation report
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: release-eval
+        run: |
+          report="kurn-eval-${GITHUB_REF_NAME}-${GITHUB_SHA}.json"
+          go run -buildvcs=true ./cmd/kurn bench \
+            -n 1000 -sample 50 -seed 42 \
+            -mode ngram -threshold 0.5 -topk 10 \
+            -report-json "$report"
+          test -s "$report"
+          jq -e --arg sha "$GITHUB_SHA" '
+            .schema == "kurn-eval/v1" and
+            .build.vcs_revision == $sha and
+            .build.vcs_modified == "false" and
+            .identity.input.mode == "synthetic" and
+            .identity.input.synthetic.seed == 42 and
+            .identity.input.synthetic.entries == 1000 and
+            .identity.input.synthetic.sample == 50 and
+            .identity.resolved_config.match.mode == "ngram" and
+            .identity.resolved_config.match.threshold == 0.5 and
+            .identity.resolved_config.match.topk == 10
+          ' "$report" >/dev/null
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+      - name: Retain tagged-release evaluation report
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: kurn-eval-${{ github.ref_name }}-${{ github.sha }}
+          path: ${{ steps.release-eval.outputs.report }}
+          if-no-files-found: error
+          retention-days: 90

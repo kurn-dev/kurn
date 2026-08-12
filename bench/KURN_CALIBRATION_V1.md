@@ -58,9 +58,9 @@ Kurn's returned deterministic order, numbered from one; ranks are zero when no
 case is found. Integer percentiles sort values and select
 `min(n-1, floor(n*p/100))`. Misses remain explicit.
 
-Candidate burden is within the resolved top-K. It is not a count of every
-score-qualifying entity beyond that collection cut, and the calibration layer
-never re-ranks candidates.
+Returned-candidate burden is within the resolved top-K. It is not a count of
+every score-qualifying entry beyond that collection cut, and the calibration
+layer never re-ranks candidates.
 
 ## Determinism and observations
 
@@ -73,8 +73,8 @@ The index-memory fields retain `kurn-eval/v1`'s caveat: they are approximate
 HeapAlloc deltas around `Replace`, with the materialized entry slice excluded.
 Allocator slack and other GC-window movement land in the estimate; a negative
 delta is clamped to zero. Corpus results describe only the measured labels and
-are not an automatic threshold recommendation or an identity-resolution
-claim.
+are calibration evidence, not an automatic threshold selection. Threshold
+selection belongs to the evaluator's loss function.
 
 ## Privacy and atomic publication
 

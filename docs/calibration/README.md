@@ -2,13 +2,12 @@
 
 `kurn calibrate` answers a bounded evaluator question: over one fixed set of
 application entries and human-labelled queries, how does a caller-chosen fuzzy
-threshold change right-entity recall and the number/rank of candidates a
-reviewer receives?
+threshold change truth-ID recall, misses, returned-candidate count, and truth
+rank?
 
-It does not choose a threshold. Only the application owner knows the relative
-cost of a miss, an extra candidate, and downstream review. A Kurn score is
-string similarity, not a probability that two records identify the same
-entity.
+The command provides calibration evidence, not automatic threshold selection.
+Threshold selection belongs to the evaluator's loss function, including its
+chosen costs for misses and returned-candidate burden.
 
 ## 1. Export entries
 
@@ -79,7 +78,7 @@ applied sweep remain separate in the artifact identity.
 
 For every threshold and category, the report contains:
 
-- `found / cases` right-entity recall and an explicit miss count;
+- `found / cases` truth-ID recall and an explicit miss count;
 - returned-candidate count p50, p99, and maximum; and
 - truth-rank p50 and p99 over found cases only.
 
@@ -89,10 +88,11 @@ median for an even number of cases. A category with no found truths has rank
 percentiles of zero; misses remain explicit rather than disappearing from the
 rank distribution.
 
-Review burden is bounded by the configured top-K. It describes candidates
-actually returned for review, never all score-qualifying entities beyond that
-cut. Compare at least recall, misses, candidate count, and rank together; a
-lower threshold is not a free recall gain.
+Returned-candidate burden is bounded by the configured top-K. It describes
+candidates actually returned within that cut, never every score-qualifying
+entry beyond it. Compare at least recall, misses, candidate count, and rank
+together; a lower threshold widens the trade-off rather than producing a free
+recall gain.
 
 Timing, QPS, and HeapAlloc deltas are observations of one process run. They
 move with hardware, scheduling, thermals, garbage collection, and allocator

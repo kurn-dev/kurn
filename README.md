@@ -15,11 +15,12 @@ version come from one atomic snapshot — so the same query against the same
 version, on the same kurn version, returns the same candidates byte for byte
 on any machine.
 
-The workload boundary is deliberate: one node, resident application-owned
-collections, and short-string retrieval. kurn is not full-text document
-ranking, faceting, distributed sharding, or entity resolution. A fuzzy score
-is string similarity, not a probability of identity; a match is a candidate
-to review, and a non-match is not a clearance.
+The operating model is deliberately compact: application-owned short-string
+collections stay resident in memory on one node. Run independent replicas for
+availability or throughput; kurn does not shard collections or coordinate a
+search cluster. N-gram results are ordered by IDF-weighted string similarity,
+while exact-mode results represent normalized whole-key or configured
+parent-domain matches.
 
 A common shape: your database stays the system of record, a query exports the
 rows worth matching, `kurn build` turns them into a content-addressed bundle,
@@ -285,7 +286,7 @@ The first row is the median of three runs in one session; p50 moves about
   ID→ordinal map; HeapAlloc-delta estimates). Process RSS is larger, since
   entries and payloads are resident too: the five public lists index in about
   22 MB and settle at about 128 MB resident.
-- **Recall**: 0.940 overall right-entity recall at threshold 0.6, and 0.975
+- **Recall**: 0.940 overall truth-ID recall at threshold 0.6, and 0.975
   at 0.45 for roughly 3× the latency — measured on synthetic perturbations,
   which are an easier corpus than real-world name data, so the *shape*
   (per-class floors, threshold trade-off) is the transferable claim rather
@@ -304,16 +305,16 @@ rebuild. Recovery time is open time.
 ## Calibrating your own corpus
 
 `kurn calibrate` sweeps caller-chosen fuzzy thresholds over one immutable list
-snapshot and a labelled application corpus. It reports right-entity recall
-beside returned-candidate counts and truth ranks, so a lower threshold is not
-presented as a free recall gain. The command can also write a privacy-safe
-`kurn-calibration/v1` artifact with hashed inputs and deterministic decision
-facts separated from timing and approximate-memory observations.
+snapshot and a labelled application corpus. It reports truth-ID recall and
+misses beside returned-candidate counts and truth ranks, exposing the trade-off
+at each threshold. Threshold selection belongs to the evaluator's loss
+function. The command can also write a privacy-safe `kurn-calibration/v1`
+artifact with hashed inputs and deterministic decision facts separated from
+timing and approximate-memory observations.
 
 The complete neutral walkthrough and CI-smoked fixtures are in
-[`docs/calibration`](docs/calibration). Calibration supports n-gram lists only,
-does not choose a threshold, and does not turn fuzzy similarity into an
-identity probability.
+[`docs/calibration`](docs/calibration). Calibration provides decision evidence
+for n-gram lists only; exact matching has no fuzzy-threshold sweep.
 
 ## Ingestion: mapping, dry-run, bundles
 

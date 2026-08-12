@@ -25,7 +25,7 @@ Measured 2026-08-04 at the v0.1.0 release, this machine:
 - Machine: Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.5.1
 - Go: go1.26 darwin/arm64
 - Config: analyzer preset `person-name`, grams 2+3, StripSpaces, topK 100,
-  single-threaded query loop (bench.Run), right-entity recall (the truth ID
+  single-threaded query loop (bench.Run), truth-ID recall (the truth ID
   must be among the returned candidates; any-hit numbers would be higher).
 - Corpus: synthetic (`bench.Generate`, seed 42). Synthetic perturbations are
   an EASIER corpus than real-world name data, so the *shape* (per-category

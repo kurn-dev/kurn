@@ -1,5 +1,6 @@
-// Command kurn is the kurn dev/bench CLI: benchmarks over synthetic or
-// file-loaded corpora, corpus export, and one-off queries against a store dir.
+// Command kurn is the kurn developer/evaluation CLI: benchmarks and threshold
+// calibration over labelled corpora, corpus export, ingestion/build tools,
+// and one-off queries against a store directory.
 package main
 
 import (
@@ -31,6 +32,8 @@ func main() {
 	switch os.Args[1] {
 	case "bench":
 		err = cmdBench(os.Args[2:])
+	case "calibrate":
+		err = cmdCalibrate(os.Args[2:])
 	case "gen":
 		err = cmdGen(os.Args[2:])
 	case "query":
@@ -56,6 +59,7 @@ func usage() {
 
 commands:
   bench   build an index over generated or file-loaded entries, report recall/latency/memory
+  calibrate  sweep fuzzy thresholds over a labelled file corpus and report review burden
   ingest  dry-run a mapping over a feed: extraction/empty-key report, no build
   build   feed + mapping -> publishable bundle (base.jsonl, base.idx, manifest, delta)
   keygen  generate an API key and its sha256 digest (for kurnd tenants files)

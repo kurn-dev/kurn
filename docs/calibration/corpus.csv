@@ -1,0 +1,8 @@
+query,truth_id,category
+Harbor Desk Lamp,item-1,EXACT
+Harbor Desk Lmap,item-1,TYPO_1
+Desk Lamp Harbor,item-1,ALIAS
+Harbor Table Lmp,item-2,TYPO_1
+Cedar Desk Lmap,item-3,TYPO_1
+Orbit Floor Lmap,item-4,TYPO_1
+Stoneware Desk Try,item-5,TYPO_1

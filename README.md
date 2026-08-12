@@ -301,6 +301,20 @@ full rebuild. The artifact is a pure cache: any load failure, including an
 analyzer change detected through its recorded digest, falls back to a
 rebuild. Recovery time is open time.
 
+## Calibrating your own corpus
+
+`kurn calibrate` sweeps caller-chosen fuzzy thresholds over one immutable list
+snapshot and a labelled application corpus. It reports right-entity recall
+beside returned-candidate counts and truth ranks, so a lower threshold is not
+presented as a free recall gain. The command can also write a privacy-safe
+`kurn-calibration/v1` artifact with hashed inputs and deterministic decision
+facts separated from timing and approximate-memory observations.
+
+The complete neutral walkthrough and CI-smoked fixtures are in
+[`docs/calibration`](docs/calibration). Calibration supports n-gram lists only,
+does not choose a threshold, and does not turn fuzzy similarity into an
+identity probability.
+
 ## Ingestion: mapping, dry-run, bundles
 
 Any feed — a database export, a CSV, an XML publication, an NDJSON dump —

@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.6.0 — 2026-08-12
+
+### Application-owned threshold calibration
+
+`kurn calibrate` accepts a complete n-gram list configuration, entries NDJSON,
+a human-labelled `query,truth_id,category` corpus, and 2–32 caller-chosen
+thresholds. It validates unique entry IDs and complete truth references,
+builds one immutable list snapshot, and reports right-entity recall together
+with explicit misses, returned-candidate p50/p99/max, and found-truth-rank
+p50/p99. Review burden is explicitly bounded by the resolved top-K; the
+command never chooses a threshold or re-ranks candidates.
+
+The optional typed `kurn-calibration/v1` artifact records exact input hashes,
+resolved configuration identity, canonical applied thresholds, stable
+category/overall decision facts, and separate run-dependent timing and
+approximate-memory observations. It contains no paths, raw entries, payloads,
+queries, or truth IDs and uses the same fail-closed temporary-write, fsync,
+close, and rename discipline as `kurn-eval/v1`; the existing eval schema and
+`kurn bench` human/report behavior remain unchanged.
+
+An invented, CI-smoked walkthrough shows stable IDs, caller-owned aliases,
+labelled queries, and the corrected filter-declaration boundary: declarations
+change resolved configuration identity and unknown names fail closed, but a
+declaration-only change does not rebuild the index.
+
 ## v0.5.3 — 2026-08-11
 
 ### Tagged evaluation evidence

@@ -1,0 +1,18 @@
+{
+  "analyzer": {
+    "preset": "free-text"
+  },
+  "match": {
+    "mode": "ngram",
+    "grams": [2, 3],
+    "strip_spaces": true,
+    "threshold": 0.6,
+    "topk": 5
+  },
+  "filterable": [
+    {
+      "name": "available",
+      "path": "available"
+    }
+  ]
+}

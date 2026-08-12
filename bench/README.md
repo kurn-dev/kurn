@@ -13,6 +13,13 @@ configuration, and recall claims from run-dependent timing and memory
 observations. File-input reports carry byte hashes, never source or target
 paths or raw corpus data.
 
+For application-owned threshold decisions, `kurn calibrate` runs 2–32 fuzzy
+thresholds over one immutable labelled file corpus and reports recall together
+with returned-candidate and truth-rank distributions. Its separate
+[`kurn-calibration/v1` schema](KURN_CALIBRATION_V1.md) and the neutral
+[`docs/calibration`](../docs/calibration) walkthrough keep calibration decision
+evidence distinct from this single-run benchmark record.
+
 Measured 2026-08-04 at the v0.1.0 release, this machine:
 
 - Machine: Apple M1 Pro (8 cores), 16 GB RAM, macOS 26.5.1

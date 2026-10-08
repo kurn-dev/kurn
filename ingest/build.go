@@ -122,6 +122,34 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("ingest: feed yielded no entries")
 	}
+	return buildEntries(m.List, entries, outDir, opts, collapsed)
+}
+
+// BuildEntries writes a bundle from already mapped, caller-ordered entries.
+// It is intended for partitioned builds after a global ID check. Unlike
+// Build, it has no feed parser or duplicate-collapse policy: duplicate IDs
+// are always refused. It still materializes one entire partition in memory.
+func BuildEntries(config engine.ListConfig, entries []engine.Entry, outDir string, opts BuildOptions) (*Manifest, error) {
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("ingest: cannot build an empty partition")
+	}
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.ID == "" || seen[e.ID] {
+			return nil, fmt.Errorf("ingest: empty or duplicate entry ID %q", e.ID)
+		}
+		seen[e.ID] = true
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "base.jsonl")); err == nil {
+		return nil, fmt.Errorf("ingest: %s already contains a bundle", outDir)
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return nil, err
+	}
+	return buildEntries(config, entries, outDir, opts, 0)
+}
+
+func buildEntries(config engine.ListConfig, entries []engine.Entry, outDir string, opts BuildOptions, collapsed int) (*Manifest, error) {
 
 	// Build through a temp store INSIDE outDir (same filesystem — the
 	// moves below stay atomic renames).
@@ -134,7 +162,7 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 	if err != nil {
 		return nil, err
 	}
-	if _, err := st.CreateList("bundle", m.List); err != nil {
+	if _, err := st.CreateList("bundle", config); err != nil {
 		return nil, err
 	}
 	if err := st.Replace("bundle", entries); err != nil {
@@ -156,11 +184,11 @@ func Build(m *Mapping, in io.Reader, outDir string, opts BuildOptions) (*Manifes
 	}
 	man := &Manifest{
 		V: 2, SHA256: sum, VersionID: sum[:12], Collapsed: collapsed,
-		Mode: m.List.Match.Mode, ConfigSHA256: l.ConfigDigest(),
+		Mode: config.Match.Mode, ConfigSHA256: l.ConfigDigest(),
 		Entries: len(entries), Keys: keyCount,
 		Source: opts.Source, CreatedAt: opts.CreatedAt,
 	}
-	an, err := engine.ResolveAnalyzer(m.List.Analyzer)
+	an, err := engine.ResolveAnalyzer(config.Analyzer)
 	if err != nil {
 		return nil, err
 	}

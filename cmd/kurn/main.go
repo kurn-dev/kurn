@@ -44,6 +44,8 @@ func main() {
 		err = cmdIngest(os.Args[2:])
 	case "build":
 		err = cmdBuild(os.Args[2:])
+	case "verify":
+		os.Exit(verifyExit(cmdVerify(os.Args[2:])))
 	default:
 		usage()
 		os.Exit(2)
@@ -62,6 +64,7 @@ commands:
   calibrate  sweep fuzzy thresholds over a labelled file corpus and report review burden
   ingest  dry-run a mapping over a feed: extraction/empty-key report, no build
   build   feed + mapping -> publishable bundle (base.jsonl, base.idx, manifest, delta)
+  verify  verify a prepared artifact (optionally rebuild its semantic indexes)
   keygen  generate an API key and its sha256 digest (for kurnd tenants files)
   gen     write generated entries (NDJSON) and query corpus (CSV) for bench -entries/-corpus
   query   run one query against an existing store directory

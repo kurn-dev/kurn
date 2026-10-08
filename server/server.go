@@ -27,6 +27,7 @@ import (
 
 	"github.com/kurn-dev/kurn/engine"
 	"github.com/kurn-dev/kurn/engine/exact"
+	"github.com/kurn-dev/kurn/engine/prepared"
 )
 
 const (
@@ -144,6 +145,9 @@ func NewServer(st *engine.Store, cfg Config) *Server {
 	mux.HandleFunc("GET /livez", s.livez)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /metrics", s.metrics)
+	if st != nil && st.Prepared() != nil {
+		mux.HandleFunc("GET /artifactz", s.artifactz)
+	}
 	mux.HandleFunc("GET /v1/lists", s.listAll)
 	mux.HandleFunc("PUT /v1/lists/{list}", s.createList)
 	mux.HandleFunc("GET /v1/lists/{list}", s.listStats)
@@ -171,8 +175,14 @@ func NewServer(st *engine.Store, cfg Config) *Server {
 // Checked per request so a SIGHUP-driven SetTenants applies immediately.
 func (s *srv) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		exempt := exemptFromAuth(r.URL.Path) || s.artifactProbe(r.URL.Path)
 		if reg := s.tenants.Load(); reg != nil {
-			if exemptFromAuth(r.URL.Path) {
+			if exempt {
+				// Readiness covers all tenant stores. Advertise one policy only
+				// when every covered store is prepared under that same policy.
+				if r.URL.Path == "/readyz" {
+					s.setAggregateArtifactVerification(w)
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -182,6 +192,7 @@ func (s *srv) gate(next http.Handler) http.Handler {
 				jsonError(w, http.StatusUnauthorized, "missing or invalid API key")
 				return
 			}
+			s.setArtifactVerification(w, r, t.st)
 			// Shared-reads tenants are read-only by construction: every
 			// list mutation lives under /v1/lists/ behind a non-GET
 			// method (queries are POST /v1/query|batch-query, list READS
@@ -191,16 +202,84 @@ func (s *srv) gate(next http.Handler) http.Handler {
 				jsonError(w, http.StatusForbidden, "tenant is read-only (shared_reads): this node's lists are platform-published")
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), tenantCtxKey{}, t)))
+			r = r.WithContext(context.WithValue(r.Context(), tenantCtxKey{}, t))
+			if refuseReadOnlyHTTP(w, r, t.st) {
+				return
+			}
+			next.ServeHTTP(w, r)
 			return
 		}
-		if s.auth != nil && !exemptFromAuth(r.URL.Path) && !s.auth.allow(r) {
+		// In single-store mode this outer gate can set assurance before auth,
+		// so auth errors and every later refusal carry the effective policy.
+		s.setArtifactVerification(w, r, s.st)
+		if s.auth != nil && !exempt && !s.auth.allow(r) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="kurn"`)
 			jsonError(w, http.StatusUnauthorized, "missing or invalid API key")
 			return
 		}
+		if refuseReadOnlyHTTP(w, r, s.st) {
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *srv) setArtifactVerification(w http.ResponseWriter, r *http.Request, st *engine.Store) {
+	if r.URL.Path != "/readyz" && !strings.HasPrefix(r.URL.Path, "/v1/") {
+		return
+	}
+	if st != nil {
+		if info := st.Prepared(); info != nil {
+			w.Header().Set("Kurn-Artifact-Verification", info.Level.String())
+		}
+	}
+}
+
+func (s *srv) setAggregateArtifactVerification(w http.ResponseWriter) {
+	units := s.tenantStores()
+	var level string
+	for _, unit := range units {
+		if unit.st == nil {
+			return
+		}
+		info := unit.st.Prepared()
+		if info == nil || (level != "" && level != info.Level.String()) {
+			return
+		}
+		level = info.Level.String()
+	}
+	if level != "" {
+		w.Header().Set("Kurn-Artifact-Verification", level)
+	}
+}
+
+func (s *srv) artifactProbe(path string) bool {
+	return path == "/artifactz" && s.st != nil && s.st.Prepared() != nil
+}
+
+// refuseReadOnlyHTTP is an admission guard for the five mutation routes.
+// It runs after authentication and before dispatch, so even a streaming
+// request body is untouched. Engine mutators retain their own guard as a
+// defense against non-HTTP callers and future handler mistakes.
+func refuseReadOnlyHTTP(w http.ResponseWriter, r *http.Request, st *engine.Store) bool {
+	if st == nil || !st.ReadOnly() {
+		return false
+	}
+	mutation := false
+	switch {
+	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/lists/"):
+		mutation = !strings.Contains(strings.TrimPrefix(r.URL.Path, "/v1/lists/"), "/")
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/lists/"):
+		rest := strings.TrimPrefix(r.URL.Path, "/v1/lists/")
+		mutation = strings.HasSuffix(rest, "/entries") || strings.HasSuffix(rest, "/compact") || strings.HasSuffix(rest, "/reload")
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/lists/"):
+		mutation = strings.Contains(strings.TrimPrefix(r.URL.Path, "/v1/lists/"), "/entries/")
+	}
+	if !mutation {
+		return false
+	}
+	jsonError(w, http.StatusConflict, engine.ErrReadOnly.Error())
+	return true
 }
 
 // jsonFallbackWriter rewrites the mux's default plain-text 404/405 responses
@@ -255,6 +334,58 @@ func (s *srv) healthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *srv) artifactz(w http.ResponseWriter, r *http.Request) {
+	info := s.st.Prepared()
+	if info == nil || !info.IdentitiesRecomputed || (info.Level != prepared.LevelFull && info.Level != prepared.LevelTrusted) {
+		jsonError(w, http.StatusServiceUnavailable, "prepared artifact is not established under a serving verification policy")
+		return
+	}
+	l, ok := s.st.List(info.Name)
+	if !ok {
+		jsonError(w, http.StatusServiceUnavailable, "prepared artifact list is unavailable")
+		return
+	}
+	type identities struct {
+		ContainerSHA256 string `json:"container_sha256"`
+		BaseID          string `json:"base_id"`
+	}
+	var verified *identities
+	if info.Level == prepared.LevelFull {
+		verified = &identities{ContainerSHA256: info.ContainerSHA256, BaseID: info.BaseID}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		ContainerSHA256 string      `json:"container_sha256,omitempty"`
+		BaseID          string      `json:"base_id,omitempty"`
+		Verification    string      `json:"verification"`
+		Format          string      `json:"format"`
+		Name            string      `json:"name"`
+		Entries         int         `json:"entries"`
+		ConfigDigest    string      `json:"config_digest"`
+		AnalyzerDigest  string      `json:"analyzer_digest"`
+		Stamp           string      `json:"stamp"`
+		StampBasis      string      `json:"stamp_basis"`
+		Verified        *identities `json:"verified"`
+		Declared        struct {
+			BaseID string `json:"base_id"`
+		} `json:"declared"`
+	}{
+		ContainerSHA256: info.ContainerSHA256,
+		BaseID:          info.BaseID,
+		Verification:    info.Level.String(),
+		Format:          fmt.Sprintf("KURNART1 %d.%d", info.Major, info.Minor),
+		Name:            info.Name,
+		Entries:         info.Entries,
+		ConfigDigest:    info.ConfigDigest,
+		AnalyzerDigest:  info.AnalyzerDigest,
+		Stamp:           l.Version(),
+		StampBasis:      info.StampBasis,
+		Verified:        verified,
+		Declared: struct {
+			BaseID string `json:"base_id"`
+		}{BaseID: info.DeclaredBaseID},
+	})
+}
+
 // ---- lists ----
 
 // createList PUT-replaces a list: the Store wipes any prior data files and
@@ -288,12 +419,13 @@ func (s *srv) createList(w http.ResponseWriter, r *http.Request) {
 }
 
 type statsResp struct {
-	Name       string `json:"name"`
-	Entries    int    `json:"entries"`
-	Overlay    int    `json:"overlay"`
-	Tombstones int    `json:"tombstones"`
-	Version    string `json:"version"`
-	Mode       string `json:"mode"`
+	Name         string `json:"name"`
+	Entries      int    `json:"entries"`
+	Overlay      int    `json:"overlay"`
+	Tombstones   int    `json:"tombstones"`
+	Version      string `json:"version"`
+	VersionBasis string `json:"version_basis,omitempty"`
+	Mode         string `json:"mode"`
 	// Build-time loss counters (engine BuildStats): keys the analyzer
 	// collapsed to "" and entries left with NO indexable key — the latter
 	// count in Entries while being unfindable.
@@ -305,12 +437,12 @@ type statsResp struct {
 	UnindexedEntries int `json:"unindexed_entries,omitempty"`
 }
 
-func statsOf(l *engine.List) statsResp {
-	return statsFromStatus(l, l.Status())
+func statsOf(st *engine.Store, l *engine.List) statsResp {
+	return statsFromStatus(st, l, l.Status())
 }
 
-func statsFromStatus(l *engine.List, s engine.ListStatus) statsResp {
-	return statsResp{
+func statsFromStatus(st *engine.Store, l *engine.List, s engine.ListStatus) statsResp {
+	resp := statsResp{
 		Name:             l.Name(),
 		Entries:          s.Entries,
 		Overlay:          s.Overlay,
@@ -321,6 +453,10 @@ func statsFromStatus(l *engine.List, s engine.ListStatus) statsResp {
 		KeylessEntries:   s.KeylessEntries,
 		UnindexedEntries: s.UnindexedEntries,
 	}
+	if info := st.Prepared(); info != nil {
+		resp.VersionBasis = info.StampBasis
+	}
+	return resp
 }
 
 // mutationResp is the success envelope for entry loads: the applied count
@@ -354,14 +490,14 @@ func (s *srv) listStats(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusNotFound, fmt.Sprintf("unknown list %q", r.PathValue("list")))
 		return
 	}
-	writeJSON(w, http.StatusOK, statsOf(l))
+	writeJSON(w, http.StatusOK, statsOf(s.stOf(r.Context()), l))
 }
 
 func (s *srv) listAll(w http.ResponseWriter, r *http.Request) {
 	lists := s.stOf(r.Context()).Lists()
 	out := make([]statsResp, 0, len(lists))
 	for _, l := range lists {
-		out = append(out, statsOf(l))
+		out = append(out, statsOf(s.stOf(r.Context()), l))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -664,7 +800,7 @@ func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		statsResp
 		Golden []goldenResult `json:"golden,omitempty"`
-	}{statsFromStatus(l, status), goldens})
+	}{statsFromStatus(st, l, status), goldens})
 }
 
 // ---- query ----
@@ -675,11 +811,18 @@ func (s *srv) reload(w http.ResponseWriter, r *http.Request) {
 // present — "unlimited" is not offered over HTTP (the global merge is always
 // cut, so an uncapped per-list collection would only buy allocation).
 type queryReq struct {
-	Q         string          `json:"q"`
-	Lists     []string        `json:"lists"`
-	Threshold *float64        `json:"threshold,omitempty"` // absent = per-list default; else 0..1
-	TopK      *int            `json:"topk,omitempty"`      // absent = per-list default + global 100; else 1..maxTopK
-	Filter    json.RawMessage `json:"filter,omitempty"`    // typed expression; {} canonicalizes to omitted
+	Q     string   `json:"q"`
+	Lists []string `json:"lists"`
+	// ExactAnyOf replaces q with a bounded term list looked up by key
+	// equality in each list's exact index (an exact-mode list, or an
+	// ngram list configured with exact_companion): every live entry
+	// holding any term as a key is a candidate at score 100, once, with
+	// key the matching key. threshold does not apply; topk, filter and
+	// the admission gate do. See engine.List.PrepareExactAnyOf.
+	ExactAnyOf []string        `json:"exact_any_of,omitempty"`
+	Threshold  *float64        `json:"threshold,omitempty"` // absent = per-list default; else 0..1
+	TopK       *int            `json:"topk,omitempty"`      // absent = per-list default + global 100; else 1..maxTopK
+	Filter     json.RawMessage `json:"filter,omitempty"`    // typed expression; {} canonicalizes to omitted
 
 	// filterDupErr carries a duplicate-name finding from UnmarshalJSON to
 	// runQuery WITHOUT failing the decode: a batch decodes []queryReq in
@@ -711,8 +854,9 @@ type respCand struct {
 }
 
 type queryResp struct {
-	Candidates []respCand        `json:"candidates"` // always present; [] when empty
-	Versions   map[string]string `json:"versions"`
+	Candidates   []respCand        `json:"candidates"` // always present; [] when empty
+	Versions     map[string]string `json:"versions"`
+	VersionBases map[string]string `json:"version_bases,omitempty"`
 	// Filter echoes the canonical applied expression on every
 	// successful FILTERED query, including an empty result. A client
 	// sending a non-empty filter MUST require equality with the canonical
@@ -781,11 +925,32 @@ func (s *srv) query(w http.ResponseWriter, r *http.Request) {
 // The prepared-query admission gate below bounds the summed ngram scan,
 // query-buffer, and hit-materialization cost across every requested list.
 func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errStatus int, errMsg string) {
-	if req.Q == "" {
-		return queryResp{}, http.StatusBadRequest, "q must be non-empty"
-	}
-	if utf8.RuneCountInString(req.Q) > maxQueryChars {
-		return queryResp{}, http.StatusBadRequest, fmt.Sprintf("q exceeds %d chars", maxQueryChars)
+	anyOf := len(req.ExactAnyOf) > 0
+	if anyOf {
+		if req.Q != "" {
+			return queryResp{}, http.StatusBadRequest, "q and exact_any_of are mutually exclusive"
+		}
+		if req.Threshold != nil {
+			return queryResp{}, http.StatusBadRequest, "threshold does not apply to exact_any_of (every hit scores 100)"
+		}
+		if len(req.ExactAnyOf) > engine.MaxExactAnyOfTerms {
+			return queryResp{}, http.StatusBadRequest, fmt.Sprintf("exact_any_of exceeds %d terms", engine.MaxExactAnyOfTerms)
+		}
+		for i, t := range req.ExactAnyOf {
+			if t == "" {
+				return queryResp{}, http.StatusBadRequest, fmt.Sprintf("exact_any_of[%d] must be non-empty", i)
+			}
+			if utf8.RuneCountInString(t) > maxQueryChars {
+				return queryResp{}, http.StatusBadRequest, fmt.Sprintf("exact_any_of[%d] exceeds %d chars", i, maxQueryChars)
+			}
+		}
+	} else {
+		if req.Q == "" {
+			return queryResp{}, http.StatusBadRequest, "q must be non-empty"
+		}
+		if utf8.RuneCountInString(req.Q) > maxQueryChars {
+			return queryResp{}, http.StatusBadRequest, fmt.Sprintf("q exceeds %d chars", maxQueryChars)
+		}
 	}
 	if len(req.Lists) == 0 {
 		return queryResp{}, http.StatusBadRequest, "lists must be non-empty"
@@ -831,6 +996,9 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 			return queryResp{}, http.StatusNotFound, fmt.Sprintf("unknown list %q", name)
 		}
 		lists[i] = l
+		if anyOf && !l.HasExactIndex() {
+			return queryResp{}, http.StatusBadRequest, fmt.Sprintf("list %q has no exact index: exact_any_of needs mode \"exact\" or \"ngram\" with exact_companion", name)
+		}
 	}
 
 	// effK is the global merge cut — it also bounds each list's collection.
@@ -888,7 +1056,13 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		for i, l := range lists {
 			lopts := opts
 			lopts.TopK = listK[i] // the bound admission charges for (always > 0)
-			fq, ferr := l.PrepareTypedFilteredQuery(req.Q, lopts, typedFilter)
+			var fq *engine.FilteredQuery
+			var ferr error
+			if anyOf {
+				fq, ferr = l.PrepareTypedFilteredExactAnyOf(req.ExactAnyOf, lopts, typedFilter)
+			} else {
+				fq, ferr = l.PrepareTypedFilteredQuery(req.Q, lopts, typedFilter)
+			}
 			if ferr != nil {
 				return queryResp{}, http.StatusBadRequest, ferr.Error()
 			}
@@ -900,7 +1074,15 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		for i, l := range lists {
 			lopts := opts
 			lopts.TopK = listK[i]
-			prepared[i] = l.PrepareQuery(req.Q, lopts)
+			if anyOf {
+				pq, perr := l.PrepareExactAnyOf(req.ExactAnyOf, lopts)
+				if perr != nil {
+					return queryResp{}, http.StatusBadRequest, perr.Error()
+				}
+				prepared[i] = pq
+			} else {
+				prepared[i] = l.PrepareQuery(req.Q, lopts)
+			}
 			cost += prepared[i].Cost()
 		}
 	}
@@ -1002,6 +1184,12 @@ func (s *srv) runQuery(ctx context.Context, req queryReq) (resp queryResp, errSt
 		Versions:   versions,
 		TookUs:     time.Since(start).Microseconds(),
 	}
+	if info := s.stOf(ctx).Prepared(); info != nil {
+		res.VersionBases = make(map[string]string, len(versions))
+		for name := range versions {
+			res.VersionBases[name] = info.StampBasis
+		}
+	}
 	if filtered {
 		// The canonical applied expression is identical for every list; take
 		// the defensive-copy echo from the first prepared query.
@@ -1075,6 +1263,9 @@ func (s *srv) batchQuery(w http.ResponseWriter, r *http.Request) {
 // Damage and generation replacement are state conflicts (409). Anything
 // else is an IO failure, so 500.
 func storeErrStatus(err error) int {
+	if errors.Is(err, engine.ErrReadOnly) {
+		return http.StatusConflict
+	}
 	var tooLarge *engine.EntryTooLargeError
 	if errors.As(err, &tooLarge) {
 		return http.StatusBadRequest

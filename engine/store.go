@@ -112,6 +112,16 @@ type Store struct {
 	// A PUT-replace of the name repairs a broken list dir. Callers (kurnd)
 	// must surface this report. Empty when every dir opened cleanly.
 	Skipped []ListSkip
+
+	// readOnly marks a store opened from a prepared artifact (see
+	// OpenPrepared): it has no directory, journal or background work, and
+	// every exported mutator refuses with ErrReadOnly before touching any
+	// state. Set once at construction, never changed. preparedInfo is what
+	// the loader established; roRefusals counts refused calls and no-ops on
+	// the store and its list.
+	readOnly     bool
+	preparedInfo *PreparedInfo
+	roRefusals   atomic.Uint64
 }
 
 // JournalQuarantine records one poisoned journal set aside during Open.
@@ -584,6 +594,9 @@ func (st *Store) installWithArtifact(l *List, entries []Entry, idxPath string) b
 // the repair is a fresh PUT. The nastiest case is the last one, where disk
 // holds a complete and valid new list and only the marker removal failed.
 func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
+	if err := st.refuseReadOnly("CreateList", name); err != nil {
+		return nil, err
+	}
 	l, _, err := st.CreateListVersioned(name, cfg)
 	return l, err
 }
@@ -592,6 +605,9 @@ func (st *Store) CreateList(name string, cfg ListConfig) (*List, error) {
 // stamp, captured under the creation lock (see UpsertVersioned for why a
 // later Version() lookup is not evidence of THIS operation).
 func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string, error) {
+	if err := st.refuseReadOnly("CreateListVersioned", name); err != nil {
+		return nil, "", err
+	}
 	if err := st.beginOp(); err != nil {
 		return nil, "", err
 	}
@@ -704,6 +720,9 @@ func (st *Store) CreateListVersioned(name string, cfg ListConfig) (*List, string
 // the prepare succeeded). The per-list lock plus l.mu span
 // prepare+append+commit, so journal order always matches memory order.
 func (st *Store) Upsert(name string, entries []Entry) error {
+	if err := st.refuseReadOnly("Upsert", name); err != nil {
+		return err
+	}
 	_, err := st.UpsertVersioned(name, entries)
 	return err
 }
@@ -714,6 +733,9 @@ func (st *Store) Upsert(name string, entries []Entry) error {
 // can be stamped with a LATER mutation's version; this return is the only
 // race-free way to know which version an acknowledged mutation produced.
 func (st *Store) UpsertVersioned(name string, entries []Entry) (string, error) {
+	if err := st.refuseReadOnly("UpsertVersioned", name); err != nil {
+		return "", err
+	}
 	if err := st.beginOp(); err != nil {
 		return "", err
 	}
@@ -771,6 +793,9 @@ func (e *ListReplacedError) Error() string {
 // generation change and is not refused: concurrent writers to one list are
 // last-writer-wins, as they are for any other mutation.
 func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
+	if err := st.refuseReadOnly("UpsertGen", name); err != nil {
+		return err
+	}
 	_, err := st.UpsertGenVersioned(name, gen, entries)
 	return err
 }
@@ -779,6 +804,9 @@ func (st *Store) UpsertGen(name string, gen *List, entries []Entry) error {
 // (see UpsertVersioned). A streaming caller audits with the LAST batch's
 // version — the one covering everything it acknowledged.
 func (st *Store) UpsertGenVersioned(name string, gen *List, entries []Entry) (string, error) {
+	if err := st.refuseReadOnly("UpsertGenVersioned", name); err != nil {
+		return "", err
+	}
 	if err := st.beginOp(); err != nil {
 		return "", err
 	}
@@ -799,6 +827,9 @@ func (st *Store) UpsertGenVersioned(name string, gen *List, entries []Entry) (st
 // Delete journals the delete then applies it. Same prepare-first ordering
 // rationale as Upsert.
 func (st *Store) Delete(name string, id string) error {
+	if err := st.refuseReadOnly("Delete", name); err != nil {
+		return err
+	}
 	_, err := st.DeleteVersioned(name, id)
 	return err
 }
@@ -806,6 +837,9 @@ func (st *Store) Delete(name string, id string) error {
 // DeleteVersioned is Delete returning the committed version stamp (see
 // UpsertVersioned).
 func (st *Store) DeleteVersioned(name string, id string) (string, error) {
+	if err := st.refuseReadOnly("DeleteVersioned", name); err != nil {
+		return "", err
+	}
 	if err := st.beginOp(); err != nil {
 		return "", err
 	}
@@ -841,6 +875,9 @@ func (st *Store) DeleteVersioned(name string, id string) (string, error) {
 // as it was. A list new to this store (bundle shipped into a fresh dir)
 // is added; the name is validated (it became a directory).
 func (st *Store) ReloadList(name string) (*List, error) {
+	if err := st.refuseReadOnly("ReloadList", name); err != nil {
+		return nil, err
+	}
 	l, _, err := st.ReloadListVersioned(name)
 	return l, err
 }
@@ -849,6 +886,9 @@ func (st *Store) ReloadList(name string) (*List, error) {
 // stamp, captured under the reload lock (see UpsertVersioned for why a
 // later Version() lookup is not evidence of THIS operation).
 func (st *Store) ReloadListVersioned(name string) (*List, string, error) {
+	if err := st.refuseReadOnly("ReloadListVersioned", name); err != nil {
+		return nil, "", err
+	}
 	if err := st.beginOp(); err != nil {
 		return nil, "", err
 	}
@@ -961,6 +1001,9 @@ func (st *Store) maybeAutoCompact(name string, ls *listState, l *List) {
 //     a failed save must not fail an otherwise-durable compact. The caller
 //     still gets nil; OnArtifactError (if set) observes the error.
 func (st *Store) Compact(name string) error {
+	if err := st.refuseReadOnly("Compact", name); err != nil {
+		return err
+	}
 	_, err := st.CompactVersioned(name)
 	return err
 }
@@ -985,6 +1028,9 @@ type CompactResult struct {
 // CompactVersioned is Compact returning what it committed (see
 // CompactResult and UpsertVersioned).
 func (st *Store) CompactVersioned(name string) (CompactResult, error) {
+	if err := st.refuseReadOnly("CompactVersioned", name); err != nil {
+		return CompactResult{}, err
+	}
 	if err := st.beginOp(); err != nil {
 		return CompactResult{}, err
 	}
@@ -1078,6 +1124,9 @@ func (st *Store) CompactVersioned(name string) (CompactResult, error) {
 //     (6) means an artifact failure can never leave old memory serving a
 //     replaced on-disk list.
 func (st *Store) Replace(name string, entries []Entry) error {
+	if err := st.refuseReadOnly("Replace", name); err != nil {
+		return err
+	}
 	_, err := st.ReplaceVersioned(name, entries)
 	return err
 }
@@ -1085,6 +1134,9 @@ func (st *Store) Replace(name string, entries []Entry) error {
 // ReplaceVersioned is Replace returning the committed version stamp (see
 // UpsertVersioned).
 func (st *Store) ReplaceVersioned(name string, entries []Entry) (string, error) {
+	if err := st.refuseReadOnly("ReplaceVersioned", name); err != nil {
+		return "", err
+	}
 	if err := st.beginOp(); err != nil {
 		return "", err
 	}

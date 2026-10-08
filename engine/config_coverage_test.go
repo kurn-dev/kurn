@@ -104,6 +104,7 @@ func TestConfigDigestFieldCoverage(t *testing.T) {
 		{"match.fallback", exactBase, func(c *engine.ListConfig) { c.Match.Fallback = "parent_domain" }},
 		{"match.grams", ngramBase, func(c *engine.ListConfig) { c.Match.Grams = []int{2, 3, 4} }},
 		{"match.strip_spaces", ngramBase, func(c *engine.ListConfig) { c.Match.StripSpaces = true }},
+		{"match.exact_companion", ngramBase, func(c *engine.ListConfig) { c.Match.ExactCompanion = true }},
 		{"match.threshold", ngramBase, func(c *engine.ListConfig) { c.Match.Threshold = 0.5 }},
 		{"match.topk", ngramBase, func(c *engine.ListConfig) { c.Match.TopK = 50 }},
 		// Preset-to-preset, so ONLY the preset leaf moves — a steps→preset

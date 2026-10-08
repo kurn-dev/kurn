@@ -38,7 +38,7 @@ type segment struct {
 	entries []Entry
 	byID    map[string]uint32
 	ng      *ngram.Index // nil in exact mode
-	ex      *exact.Index // nil in ngram mode
+	ex      *exact.Index // the exact index: the primary one in exact mode, the companion in ngram mode with exact_companion, nil otherwise
 
 	// payloadBytes totals len(Payload) over entries — the segment fact the
 	// admission charge's filter term scales with (CPU-proxy model).
@@ -120,6 +120,15 @@ type List struct {
 	jhash hash.Hash
 
 	overlaySrc map[string]Entry // source entries for overlay rebuilds
+
+	// readOnly marks a list served from a prepared artifact (OpenPrepared).
+	// The loader sets it once, after installing the base and before the
+	// list is reachable by anyone else; it never changes afterwards, so it
+	// is read without a lock. Every exported mutator refuses (or, lacking
+	// an error return, ignores) the call when it is set, and roRefusals —
+	// the owning prepared Store's counter — counts each one.
+	readOnly   bool
+	roRefusals *atomic.Uint64
 }
 
 // NewList validates config and returns an empty list.
@@ -195,6 +204,9 @@ func NewList(name string, cfg ListConfig) (*List, error) {
 			cfg.Match.TopK = 100
 		}
 	case "exact":
+		if cfg.Match.ExactCompanion {
+			return nil, fmt.Errorf("list %s: match exact_companion applies to mode \"ngram\" only (an exact-mode list is its own exact index)", name)
+		}
 	default:
 		return nil, fmt.Errorf("list %s: unknown match mode %q", name, cfg.Match.Mode)
 	}
@@ -305,8 +317,9 @@ func (l *List) buildSegment(entries []Entry) (*segment, error) {
 	var exb *exact.Builder
 	if l.cfg.Match.Mode == "ngram" {
 		ngb = ngram.NewBuilder(ngram.Config{Grams: l.cfg.Match.Grams, StripSpaces: l.cfg.Match.StripSpaces})
-	} else {
-		exb = exact.NewBuilder()
+	}
+	if l.cfg.Match.Mode == "exact" || l.cfg.Match.ExactCompanion {
+		exb = exact.NewBuilder() // the primary index, or the ngram list's companion
 	}
 	for i := range entries {
 		ord := uint32(i)
@@ -326,13 +339,15 @@ func (l *List) buildSegment(entries []Entry) (*segment, error) {
 		seg.totalKeys += len(entries[i].Keys)
 		if ngb != nil {
 			ngb.Add(ord, keys)
-		} else {
+		}
+		if exb != nil {
 			exb.Add(ord, keys)
 		}
 	}
 	if ngb != nil {
 		seg.ng = ngb.Finish()
-	} else {
+	}
+	if exb != nil {
 		ex, err := exb.Finish()
 		if err != nil {
 			return nil, fmt.Errorf("list %s: %w", l.name, err)
@@ -342,6 +357,29 @@ func (l *List) buildSegment(entries []Entry) (*segment, error) {
 	return seg, nil
 }
 
+// buildCompanion builds the exact companion index over entries (ordinal =
+// slice position) with one analyzer pass and no ngram work: what
+// buildSegment would produce for the companion, for a base whose ngram
+// index is already built.
+func (l *List) buildCompanion(entries []Entry) (*exact.Index, error) {
+	exb := exact.NewBuilder()
+	keys := make([]string, 0, 4)
+	for i := range entries {
+		keys = keys[:0]
+		for _, k := range entries[i].Keys {
+			if a := l.an.Normalize(k); a != "" {
+				keys = append(keys, a)
+			}
+		}
+		exb.Add(uint32(i), keys)
+	}
+	ex, err := exb.Finish()
+	if err != nil {
+		return nil, fmt.Errorf("list %s: exact companion: %w", l.name, err)
+	}
+	return ex, nil
+}
+
 // Replace atomically replaces the whole list content (new base, no overlay).
 // Duplicate IDs within the batch are deduped: later duplicates win, matching
 // upsert semantics. Replace takes ownership of the entries slice; the caller
@@ -349,6 +387,9 @@ func (l *List) buildSegment(entries []Entry) (*segment, error) {
 // key held by more entries than the index encodes) is returned before
 // anything is installed — the list is left untouched.
 func (l *List) Replace(entries []Entry) error {
+	if err := l.refuseReadOnly("Replace"); err != nil {
+		return err
+	}
 	_, seg, err := l.prepareBase(entries)
 	if err != nil {
 		return err
@@ -411,8 +452,12 @@ func (l *List) stampFresh() {
 // (a content hash of base.jsonl, or "empty"): subsequent snapshot versions
 // use the content-addressed format instead of process-local gen counters.
 // Store-managed lists call this before installBase / journal replay; direct
-// library users normally never do.
+// library users normally never do. On a read-only (prepared) list it is a
+// counted no-op.
 func (l *List) SetBaseID(id string) {
+	if l.ignoreReadOnly() {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.baseID = id
@@ -449,6 +494,9 @@ type compactBuild struct {
 // touching list state. A build error (exact-mode hot key in the fold) leaves
 // the list untouched.
 func (l *List) PrepareCompact() (*compactBuild, error) {
+	if err := l.refuseReadOnly("PrepareCompact"); err != nil {
+		return nil, err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	live := l.liveEntriesLocked()
@@ -463,8 +511,12 @@ func (l *List) PrepareCompact() (*compactBuild, error) {
 // persisted base identity (the hash persistBase computed): fresh base, empty
 // overlay/tombstones, version "<id>@<n>+j0+c<cfg>". Store-only counterpart of the
 // library's Compact; the Store's per-list mutation lock spans
-// prepare→persist→commit, so no mutation can interleave.
+// prepare→persist→commit, so no mutation can interleave. On a read-only
+// (prepared) list it is a counted no-op.
 func (l *List) CommitCompact(b *compactBuild, id string) {
+	if l.ignoreReadOnly() {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.gen++
@@ -489,6 +541,9 @@ func (l *List) CommitCompact(b *compactBuild, id string) {
 // index crash window recoverable instead of fatal. Takes ownership of entries
 // like Replace.
 func (l *List) ReplaceWithIndex(entries []Entry, idx *ngram.Index) error {
+	if err := l.refuseReadOnly("ReplaceWithIndex"); err != nil {
+		return err
+	}
 	return l.ReplaceWithIndexInfo(entries, idx, nil)
 }
 
@@ -497,22 +552,70 @@ func (l *List) ReplaceWithIndex(entries []Entry, idx *ngram.Index) error {
 // counters then read zero rather than being inferred from the index, which
 // cannot distinguish a stale artifact from entries that analyzed to nothing.
 func (l *List) ReplaceWithIndexInfo(entries []Entry, idx *ngram.Index, bi *IndexBuildInfo) error {
+	if err := l.refuseReadOnly("ReplaceWithIndexInfo"); err != nil {
+		return err
+	}
 	if l.cfg.Match.Mode != "ngram" {
 		return fmt.Errorf("list %s: ReplaceWithIndex requires ngram mode, have %q", l.name, l.cfg.Match.Mode)
 	}
 	if idx == nil {
 		return fmt.Errorf("list %s: ReplaceWithIndex: nil index", l.name)
 	}
+	var companion *exact.Index
+	if l.cfg.Match.ExactCompanion {
+		// A prebuilt ngram index carries no companion (a base.idx holds
+		// the ngram index only), so the companion is rebuilt from the
+		// deduped entries: one analyzer pass. A prepared artifact supplies
+		// its stored companion through ReplaceWithIndexesInfo instead.
+		entries = dedupeLastWins(entries)
+		c, err := l.buildCompanion(entries)
+		if err != nil {
+			return err
+		}
+		companion = c
+	}
+	return l.ReplaceWithIndexesInfo(entries, idx, companion, bi)
+}
+
+// ReplaceWithIndexesInfo is ReplaceWithIndexInfo for an ngram list whose
+// exact companion index is prebuilt too (loaded from a prepared artifact):
+// companion must be non-nil exactly when the list is configured with
+// exact_companion, and both indexes must have been built over the same
+// deduped entries in order (the same ordinals). Same dedupe-then-validate
+// order and stale-index stance as ReplaceWithIndexInfo; takes ownership of
+// entries like Replace.
+func (l *List) ReplaceWithIndexesInfo(entries []Entry, idx *ngram.Index, companion *exact.Index, bi *IndexBuildInfo) error {
+	if err := l.refuseReadOnly("ReplaceWithIndexesInfo"); err != nil {
+		return err
+	}
+	if l.cfg.Match.Mode != "ngram" {
+		return fmt.Errorf("list %s: ReplaceWithIndex requires ngram mode, have %q", l.name, l.cfg.Match.Mode)
+	}
+	if idx == nil {
+		return fmt.Errorf("list %s: ReplaceWithIndex: nil index", l.name)
+	}
+	if (companion != nil) != l.cfg.Match.ExactCompanion {
+		if companion == nil {
+			return fmt.Errorf("list %s: ReplaceWithIndexes: the list is configured with exact_companion but no companion index was given", l.name)
+		}
+		return fmt.Errorf("list %s: ReplaceWithIndexes: a companion index was given but the list is not configured with exact_companion", l.name)
+	}
 	entries = dedupeLastWins(entries)
 	if n := idx.NumOrds(); int(n) > len(entries) {
 		return fmt.Errorf("list %s: index has %d ordinals but only %d entries", l.name, n, len(entries))
 	}
-	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ng: idx}
+	if companion != nil {
+		if n := companion.NumOrds(); int(n) > len(entries) {
+			return fmt.Errorf("list %s: exact companion index has %d ordinals but only %d entries", l.name, n, len(entries))
+		}
+	}
+	seg := &segment{entries: entries, byID: make(map[string]uint32, len(entries)), ng: idx, ex: companion}
 	if err := seg.applyBuildInfo(bi, len(entries), idx.NumOrds()); err != nil {
 		return fmt.Errorf("list %s: %s", l.name, err)
 	}
 	for i := range entries {
 		seg.byID[entries[i].ID] = uint32(i)
+		seg.payloadBytes += int64(len(entries[i].Payload))
 		seg.totalKeys += len(entries[i].Keys)
 	}
 	l.installBase(seg)
@@ -527,12 +630,18 @@ func (l *List) ReplaceWithIndexInfo(entries []Entry, idx *ngram.Index, bi *Index
 // panic later in Query), while NumOrds < len(entries) is tolerated. Takes
 // ownership of entries like Replace.
 func (l *List) ReplaceWithExactIndex(entries []Entry, idx *exact.Index) error {
+	if err := l.refuseReadOnly("ReplaceWithExactIndex"); err != nil {
+		return err
+	}
 	return l.ReplaceWithExactIndexInfo(entries, idx, nil)
 }
 
 // ReplaceWithExactIndexInfo is ReplaceWithExactIndex carrying build info; see
 // ReplaceWithIndexInfo.
 func (l *List) ReplaceWithExactIndexInfo(entries []Entry, idx *exact.Index, bi *IndexBuildInfo) error {
+	if err := l.refuseReadOnly("ReplaceWithExactIndexInfo"); err != nil {
+		return err
+	}
 	if l.cfg.Match.Mode != "exact" {
 		return fmt.Errorf("list %s: ReplaceWithExactIndex requires exact mode, have %q", l.name, l.cfg.Match.Mode)
 	}
@@ -549,6 +658,7 @@ func (l *List) ReplaceWithExactIndexInfo(entries []Entry, idx *exact.Index, bi *
 	}
 	for i := range entries {
 		seg.byID[entries[i].ID] = uint32(i)
+		seg.payloadBytes += int64(len(entries[i].Payload))
 		seg.totalKeys += len(entries[i].Keys)
 	}
 	l.installBase(seg)
@@ -557,23 +667,44 @@ func (l *List) ReplaceWithExactIndexInfo(entries []Entry, idx *exact.Index, bi *
 
 // BaseNgram returns the current base segment's ngram index — nil for exact
 // mode or when there is no base. Used to persist the base index (artifact
-// save) without rebuilding it.
+// save) without rebuilding it. Nil for a read-only (prepared) list too: its
+// index borrows the artifact's bytes and must never be handed out for
+// reuse or mutation.
 func (l *List) BaseNgram() *ngram.Index {
 	s := l.snap.Load()
-	if s.base == nil {
+	if s.base == nil || l.readOnly {
 		return nil
 	}
 	return s.base.ng
 }
 
 // BaseExact returns the current base segment's exact index — nil for ngram
-// mode or when there is no base. Same artifact-save role as BaseNgram.
+// mode or when there is no base. Same artifact-save role as BaseNgram, and
+// likewise nil for a read-only (prepared) list.
 func (l *List) BaseExact() *exact.Index {
 	s := l.snap.Load()
-	if s.base == nil {
+	if s.base == nil || l.readOnly || l.cfg.Match.Mode != "exact" {
 		return nil
 	}
 	return s.base.ex
+}
+
+// BaseExactCompanion returns the current base segment's exact companion
+// index: nil unless the list is an ngram list configured with
+// exact_companion and has a base, and nil for a read-only (prepared) list,
+// like BaseNgram. Same artifact-save role as BaseNgram.
+func (l *List) BaseExactCompanion() *exact.Index {
+	s := l.snap.Load()
+	if s.base == nil || l.readOnly || !l.cfg.Match.ExactCompanion {
+		return nil
+	}
+	return s.base.ex
+}
+
+// HasExactIndex reports whether the list answers exact any-of lookups: an
+// exact-mode list, or an ngram list configured with exact_companion.
+func (l *List) HasExactIndex() bool {
+	return l.cfg.Match.Mode == "exact" || l.cfg.Match.ExactCompanion
 }
 
 // LiveEntries returns the live entry set (base − tombstones + overlay),
@@ -616,6 +747,9 @@ func dedupeLastWins(entries []Entry) []Entry {
 // A build-time data error (e.g. an exact-mode hot key over the encoding cap)
 // is returned BEFORE any state changes — the list is left exactly as it was.
 func (l *List) Upsert(entries []Entry) error {
+	if err := l.refuseReadOnly("Upsert"); err != nil {
+		return err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, err := l.prepareUpsertLocked(entries)
@@ -630,6 +764,9 @@ func (l *List) Upsert(entries []Entry) error {
 // Deleting an ID absent from both is a no-op (beyond a snapshot swap).
 // Like Upsert, a build error leaves the list untouched.
 func (l *List) Delete(id string) error {
+	if err := l.refuseReadOnly("Delete"); err != nil {
+		return err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, err := l.prepareDeleteLocked(id)
@@ -764,6 +901,9 @@ func (l *List) prepareDeleteLocked(id string) (*overlayBuild, error) {
 // survival can differ from the pre-compact base+overlay split. The new base
 // is built BEFORE any state changes; a build error leaves the list untouched.
 func (l *List) Compact() error {
+	if err := l.refuseReadOnly("Compact"); err != nil {
+		return err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	live := l.liveEntriesLocked()
@@ -899,6 +1039,13 @@ type PreparedQuery struct {
 	q    string
 	opts QueryOpts
 	cost int64
+
+	// anyOf marks an exact any-of lookup (PrepareExactAnyOf): terms holds
+	// the analyzed, deduped, non-empty terms, anyOfHits the total posting
+	// length the terms reach in the pinned snapshot, and q is unused.
+	anyOf     bool
+	terms     []string
+	anyOfHits int64
 }
 
 // PrepareQuery captures the snapshot a query will run against and its
@@ -928,6 +1075,10 @@ func (p *PreparedQuery) Cost() int64 { return p.cost }
 // returns candidates plus that snapshot's version — the exact state the
 // admission charge was computed from.
 func (p *PreparedQuery) Execute(ctx context.Context) ([]Candidate, string) {
+	if p.anyOf {
+		c, _ := p.l.anyOfSnap(ctx, p.s, p.terms, p.anyOfHits, p.opts, nil, nil) // nil filter never errors
+		return c, p.s.version
+	}
 	c, _ := p.l.querySnap(ctx, p.s, p.q, p.opts, nil, nil) // nil filter never errors
 	return c, p.s.version
 }
@@ -943,6 +1094,20 @@ type FilteredQuery struct {
 	opts QueryOpts
 	cf   *compiledFilter
 	cost int64
+
+	// anyOf, terms and anyOfHits: see PreparedQuery.
+	anyOf     bool
+	terms     []string
+	anyOfHits int64
+}
+
+// run executes the prepared query (ordinary or any-of) against its pinned
+// snapshot.
+func (p *FilteredQuery) run(ctx context.Context, fst *FilterStats) ([]Candidate, error) {
+	if p.anyOf {
+		return p.l.anyOfSnap(ctx, p.s, p.terms, p.anyOfHits, p.opts, p.cf, fst)
+	}
+	return p.l.querySnap(ctx, p.s, p.q, p.opts, p.cf, fst)
 }
 
 // PrepareFilteredQuery validates and compiles the filter against the
@@ -1015,7 +1180,7 @@ func (p *FilteredQuery) AppliedFilterJSON() []byte { return p.cf.appliedJSON() }
 // than dropping the candidate — a dropped candidate could manufacture a
 // clear result.
 func (p *FilteredQuery) Execute(ctx context.Context) ([]Candidate, string, error) {
-	c, err := p.l.querySnap(ctx, p.s, p.q, p.opts, p.cf, nil)
+	c, err := p.run(ctx, nil)
 	return c, p.s.version, err
 }
 
@@ -1039,7 +1204,7 @@ type FilterStats struct {
 // zero stats: partial counts must not read as successful evidence.
 func (p *FilteredQuery) ExecuteStats(ctx context.Context) ([]Candidate, string, FilterStats, error) {
 	var fst FilterStats
-	c, err := p.l.querySnap(ctx, p.s, p.q, p.opts, p.cf, &fst)
+	c, err := p.run(ctx, &fst)
 	if err != nil {
 		return c, p.s.version, FilterStats{}, err
 	}
@@ -1064,6 +1229,360 @@ func (l *List) QueryTypedFilteredCtx(ctx context.Context, q string, opts QueryOp
 		return nil, "", err
 	}
 	return p.Execute(ctx)
+}
+
+// MaxExactAnyOfTerms bounds the term list of one exact any-of lookup.
+const MaxExactAnyOfTerms = 64
+
+// anyOfPerHitBytes prices one retained any-of hit: the heap item (key,
+// Candidate, candMeta: 128 B), its membership-set entry with map slack,
+// the output Candidate and candMeta, the slice growth of the item and
+// output buffers, and allocator rounding. Measured by
+// TestExactAnyOfAllocationWithinCharge over 20,000 retained hits, the
+// total allocation of one execution stays under this ceiling.
+const anyOfPerHitBytes = 512
+
+// anyOfTerms validates an any-of term list against the list and analyzes
+// it: terms that analyze to "" are dropped (they can match nothing), and
+// duplicates after analysis are merged. The result may be empty, which
+// executes as "no candidates".
+func (l *List) anyOfTerms(terms []string) ([]string, error) {
+	if !l.HasExactIndex() {
+		return nil, fmt.Errorf("list %s: exact_any_of needs an exact index (mode \"exact\", or \"ngram\" with exact_companion)", l.name)
+	}
+	if len(terms) == 0 || len(terms) > MaxExactAnyOfTerms {
+		return nil, fmt.Errorf("list %s: exact_any_of takes 1..%d terms, got %d", l.name, MaxExactAnyOfTerms, len(terms))
+	}
+	out := make([]string, 0, len(terms))
+	seen := make(map[string]struct{}, len(terms))
+	for _, t := range terms {
+		a := l.an.Normalize(t)
+		if a == "" {
+			continue
+		}
+		if _, dup := seen[a]; dup {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// effectiveTopK resolves the per-query top-K the way querySnap does.
+func (l *List) effectiveTopK(opts QueryOpts) int {
+	topK := l.cfg.Match.TopK
+	if opts.TopK > 0 {
+		topK = opts.TopK
+	} else if opts.TopK < 0 {
+		topK = 0 // sentinel: explicit unlimited (see QueryOpts)
+	}
+	return topK
+}
+
+// PrepareExactAnyOf pins one snapshot for an exact any-of lookup: every
+// term is analyzed under the list's analyzer and looked up as a whole key
+// in the list's exact index (the primary index of an exact-mode list, the
+// companion of an ngram list with exact_companion). Every live entry
+// holding any of the terms as a key is a candidate at score 100, once
+// (an entry matched by several terms is not repeated); the result is the
+// effective topK smallest EntryIDs over that whole set, EntryID-ascending,
+// whatever the term order or the base/overlay traversal order;
+// Candidate.Key names the entry's first key that analyzes to a looked-up
+// term. Threshold is not consulted: an any-of hit has no score of its own.
+// The charge is computed from the pinned snapshot's actual postings: the
+// terms are probed at prepare time (constant-time lookups), every reached
+// ordinal is walked (and filtered) exactly as charged, and the retained
+// state is bounded by topK (a bounded selection, not a visited set).
+//
+// It returns an error for a list without an exact index and for an empty
+// or over-long (MaxExactAnyOfTerms) term list.
+func (l *List) PrepareExactAnyOf(terms []string, opts QueryOpts) (*PreparedQuery, error) {
+	at, err := l.anyOfTerms(terms)
+	if err != nil {
+		return nil, err
+	}
+	s := l.snap.Load()
+	cost, hits := l.anyOfCostSnap(s, at, l.effectiveTopK(opts), nil)
+	return &PreparedQuery{l: l, s: s, opts: opts, anyOf: true, terms: at, anyOfHits: hits, cost: cost}, nil
+}
+
+// PrepareTypedFilteredExactAnyOf is PrepareExactAnyOf with a typed filter
+// compiled against the list's declarations (see PrepareTypedFilteredQuery):
+// a candidate must hold a term AND satisfy the filter.
+func (l *List) PrepareTypedFilteredExactAnyOf(terms []string, opts QueryOpts, filter TypedFilter) (*FilteredQuery, error) {
+	at, err := l.anyOfTerms(terms)
+	if err != nil {
+		return nil, err
+	}
+	cf, err := l.compileTypedFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	s := l.snap.Load()
+	cost, hits := l.anyOfCostSnap(s, at, l.effectiveTopK(opts), cf)
+	return &FilteredQuery{l: l, s: s, opts: opts, cf: cf, anyOf: true, terms: at, anyOfHits: hits, cost: cost}, nil
+}
+
+// anyOfCostSnap is the admission charge of one any-of lookup over one
+// pinned snapshot. Unlike the ngram and exact-mode models it is computed
+// from the postings the terms actually reach: hits is the total run
+// length over every term and segment (each a constant-time probe), and
+// the filter terms are priced per reached ordinal, with the payload term
+// bounded both by the segment's total payload bytes and by the base-line
+// bound per reached record. The retained state (the bounded selection
+// and its membership set, or everything when topK is unlimited) is
+// charged per retained hit, and execution retains nothing per merely
+// visited ordinal. Every term still errs upward: an entry reached by
+// several terms is charged once per term.
+func (l *List) anyOfCostSnap(s *snapshot, terms []string, topK int, cf *compiledFilter) (cost, hits int64) {
+	var payload int64
+	probe := func(sg *segment) {
+		if sg == nil || sg.ex == nil {
+			return
+		}
+		var n int64
+		for _, t := range terms {
+			n += int64(len(sg.ex.Lookup(t)))
+		}
+		hits += n
+		p := n * maxLine
+		if p > sg.payloadBytes {
+			p = sg.payloadBytes
+		}
+		payload += p
+	}
+	probe(s.base)
+	probe(s.overlay)
+	collected := hits
+	if topK > 0 && int64(topK) < collected {
+		collected = int64(topK)
+	}
+	cost = scratchQueryFixedBytes + anyOfPerHitBytes*collected
+	if cf != nil {
+		cost += filterScanPerByte*payload + filterPerPathOrd*int64(len(cf.terms))*hits
+		cost += filterPerAlternative*int64(cf.alternatives) + filterPerScalarByte*int64(cf.scalarBytes)
+		cost += (filterPerAlternativeOrd*int64(cf.alternatives) + filterPerScalarByteOrd*int64(cf.scalarBytes)) * hits
+	}
+	return cost, hits
+}
+
+// anyOfSnap executes an any-of lookup against one already-loaded snapshot
+// (see PrepareExactAnyOf for the semantics). Every reached posting is
+// walked; a bounded max-heap on EntryID keeps the topK smallest live,
+// filter-passing entries, so the selection is independent of the term and
+// segment traversal order, and the state retained per query is at most
+// topK entries (every entry when topK is unlimited). An ordinal reached
+// again through another term is skipped when it is already selected or
+// cannot enter the full selection, and otherwise re-evaluated (the filter
+// may run once per reaching term; FilterStats count invocations). Like the
+// exact walk it polls ctx while walking postings and returns nil once
+// canceled, reporting no stats; a malformed payload in the evaluated set
+// is an error, never a dropped candidate.
+func (l *List) anyOfSnap(ctx context.Context, s *snapshot, terms []string, hits int64, opts QueryOpts, cf *compiledFilter, fst *FilterStats) ([]Candidate, error) {
+	if ctx.Err() != nil {
+		return nil, nil
+	}
+	topK := l.effectiveTopK(opts)
+	sel := newAnyOfSelection(topK, hits)
+	var filterErr error
+	walked := 0
+	cancelCheckEvery := exactCancelCheckEvery
+	if cf != nil {
+		cancelCheckEvery = exactFilteredCancelCheckEvery
+	}
+	// collect walks every term's run in one segment; it reports true when
+	// the context was canceled mid-walk.
+	collect := func(seg *segment, masked map[string]struct{}) bool {
+		if seg == nil || seg.ex == nil {
+			return false
+		}
+		for _, t := range terms {
+			for _, ord := range seg.ex.Lookup(t) {
+				walked++
+				if walked%cancelCheckEvery == 0 && ctx.Err() != nil {
+					return true
+				}
+				e := seg.entries[ord]
+				key := segOrd{seg, ord}
+				if !sel.admits(key, e.ID) {
+					continue
+				}
+				if masked != nil {
+					if _, dead := masked[e.ID]; dead {
+						continue
+					}
+				}
+				if cf != nil {
+					if fst != nil {
+						fst.Evaluated++
+					}
+					ok, err := cf.eval(e.Payload)
+					if err != nil {
+						if filterErr == nil {
+							filterErr = err
+						}
+						continue
+					}
+					if !ok {
+						if fst != nil {
+							fst.Rejected++
+						}
+						continue
+					}
+				}
+				sel.push(key, Candidate{EntryID: e.ID, Score: 100, Payload: e.Payload}, candMeta{seg: seg, ord: ord})
+			}
+		}
+		return false
+	}
+	if collect(s.base, s.tombstones) || collect(s.overlay, nil) || ctx.Err() != nil {
+		if fst != nil {
+			*fst = FilterStats{}
+		}
+		return nil, nil
+	}
+	if filterErr != nil {
+		return nil, filterErr
+	}
+	out, meta := sel.sorted()
+	if len(out) == 0 {
+		return nil, nil
+	}
+	l.attributeAnyOf(s, terms, out, meta)
+	return out, nil
+}
+
+// segOrd identifies one entry of one segment.
+type segOrd struct {
+	seg *segment
+	ord uint32
+}
+
+// anyOfSelection keeps the k smallest EntryIDs seen so far (all of them
+// when k is 0): a max-heap on EntryID plus the membership set of exactly
+// the heap's ordinals, so the retained state never exceeds k entries. The
+// heap is kept in a plain slice (no interface boxing per push) and the
+// final ordering sorts that slice in place, so per retained hit the live
+// state is one anyOfItem, one set entry and, at the end, one Candidate and
+// one candMeta; anyOfPerHitBytes prices that with its slack.
+type anyOfSelection struct {
+	k     int
+	in    map[segOrd]struct{}
+	items []anyOfItem // max-heap on EntryID
+}
+
+type anyOfItem struct {
+	key segOrd
+	c   Candidate
+	m   candMeta
+}
+
+// newAnyOfSelection sizes the selection up front: k+1 slots when bounded,
+// else the charged hit count (every reached posting could be distinct), so
+// neither the item slice nor the set grows by doubling during the walk.
+func newAnyOfSelection(k int, hits int64) *anyOfSelection {
+	size := int(hits)
+	if k > 0 && k+1 < size {
+		size = k + 1
+	}
+	if size < 0 {
+		size = 0
+	}
+	return &anyOfSelection{k: k, in: make(map[segOrd]struct{}, size), items: make([]anyOfItem, 0, size)}
+}
+
+// admits reports whether an entry can still enter the selection: not
+// already selected, and, when the selection is full, smaller than its
+// largest EntryID. An evicted or never-admitted entry reached again is
+// refused by the same comparison, so the result is traversal-order
+// independent.
+func (a *anyOfSelection) admits(key segOrd, id string) bool {
+	if _, selected := a.in[key]; selected {
+		return false
+	}
+	return a.k <= 0 || len(a.items) < a.k || id < a.items[0].c.EntryID
+}
+
+// push adds an admitted entry, evicting the largest EntryID when the
+// selection is full. Live entries have distinct IDs, so no tie arises.
+func (a *anyOfSelection) push(key segOrd, c Candidate, m candMeta) {
+	a.in[key] = struct{}{}
+	a.items = append(a.items, anyOfItem{key: key, c: c, m: m})
+	a.up(len(a.items) - 1)
+	if a.k > 0 && len(a.items) > a.k {
+		// The root is the largest: swap it out and restore the heap.
+		last := len(a.items) - 1
+		a.items[0], a.items[last] = a.items[last], a.items[0]
+		evicted := a.items[last].key
+		a.items = a.items[:last]
+		a.down(0)
+		delete(a.in, evicted)
+	}
+}
+
+func (a *anyOfSelection) up(i int) {
+	for i > 0 {
+		p := (i - 1) / 2
+		if a.items[p].c.EntryID >= a.items[i].c.EntryID {
+			return
+		}
+		a.items[p], a.items[i] = a.items[i], a.items[p]
+		i = p
+	}
+}
+
+func (a *anyOfSelection) down(i int) {
+	n := len(a.items)
+	for {
+		l, r, big := 2*i+1, 2*i+2, i
+		if l < n && a.items[l].c.EntryID > a.items[big].c.EntryID {
+			big = l
+		}
+		if r < n && a.items[r].c.EntryID > a.items[big].c.EntryID {
+			big = r
+		}
+		if big == i {
+			return
+		}
+		a.items[i], a.items[big] = a.items[big], a.items[i]
+		i = big
+	}
+}
+
+// sorted returns the selection EntryID-ascending with its metadata.
+func (a *anyOfSelection) sorted() ([]Candidate, []candMeta) {
+	sort.Slice(a.items, func(i, j int) bool { return a.items[i].c.EntryID < a.items[j].c.EntryID })
+	out := make([]Candidate, len(a.items))
+	meta := make([]candMeta, len(a.items))
+	for i := range a.items {
+		out[i], meta[i] = a.items[i].c, a.items[i].m
+	}
+	return out, meta
+}
+
+// attributeAnyOf sets Candidate.Key to the first key of each candidate's
+// entry whose analyzed form is one of the looked-up terms (reading the
+// overlay copy of a superseded base entry, as attributeKeys does).
+func (l *List) attributeAnyOf(s *snapshot, terms []string, cands []Candidate, meta []candMeta) {
+	set := make(map[string]struct{}, len(terms))
+	for _, t := range terms {
+		set[t] = struct{}{}
+	}
+	for i := range cands {
+		e := meta[i].seg.entries[meta[i].ord]
+		if s.overlay != nil && meta[i].seg != s.overlay {
+			if ord, ok := s.overlay.byID[e.ID]; ok {
+				e = s.overlay.entries[ord]
+			}
+		}
+		for _, k := range e.Keys {
+			if _, ok := set[l.an.Normalize(k)]; ok {
+				cands[i].Key = k
+				break
+			}
+		}
+	}
 }
 
 // The unfiltered exact walk keeps its historical cancellation cadence. A
@@ -1469,15 +1988,18 @@ func scratchBytesSnap(s *snapshot, topK, queryRunes, gramSizes int) int64 {
 		if sg == nil {
 			return
 		}
-		if sg.ex != nil {
+		// An ngram segment is charged as ngram even when it also carries
+		// an exact companion: the ordinary query path never touches the
+		// companion (any-of lookups have their own model, anyOfCostSnap).
+		if sg.ng == nil {
+			if sg.ex == nil {
+				return
+			}
 			hits := int64(sg.ex.NumOrds())
 			if topK > 0 && int64(topK) < hits {
 				hits = int64(topK)
 			}
 			b += scratchPerHitBytes * hits
-			return
-		}
-		if sg.ng == nil {
 			return
 		}
 		ords := int64(sg.ng.NumOrds())

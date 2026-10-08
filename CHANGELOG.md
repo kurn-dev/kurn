@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Exact companion index and any-of lookups
+
+An ngram list configured with `match.exact_companion: true` also builds an
+exact index over the same analyzed keys. The HTTP check member
+`exact_any_of` (1–64 terms) looks a term list up by whole-key equality under
+the analyzer in a list's exact index (an exact-mode list's own, or an ngram
+list's companion), returning every live entry holding any term at score 100,
+once, `entry_id`-ordered, under the usual `topk`, `filter` and admission
+rules; `threshold` is refused. Library: `List.PrepareExactAnyOf` and
+`PrepareTypedFilteredExactAnyOf`, `List.HasExactIndex`,
+`List.ReplaceWithIndexesInfo`, `List.BaseExactCompanion`.
+
+Prepared artifacts carry the companion as section kind 7 (format 1.1, written
+for every new artifact; a 1.0 reader refuses companion artifacts as
+incompatible and reads every other 1.1 artifact). The section is a content
+section: hashed at full verification, skipped at trusted, rebuilt and compared
+byte for byte by `kurn verify -semantic` (`SemanticReport.CompanionOK`).
+`kurn verify` prints an `exact companion` line for such artifacts;
+`prepared.Verified`, `Info`, `builder.Result` and `engine.PreparedInfo` report
+`ExactCompanion`. A data-dir list rebuilds the companion from its entries
+when opened from a `base.idx` (which holds the ngram index only).
+`exact_companion` is part of the resolved configuration and moves the config
+digest; `List.BaseExact` now returns nil for ngram lists.
+
 ## v0.6.0 — 2026-08-12
 
 ### Application-owned threshold calibration

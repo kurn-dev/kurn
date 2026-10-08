@@ -1,0 +1,11 @@
+{
+  "format": "ndjson",
+  "id": "id",
+  "keys": [{"path": "name"}],
+  "payload": {"country": "country", "active": "active"},
+  "list": {
+    "analyzer": {"preset": "person-name"},
+    "match": {"mode": "ngram", "strip_spaces": true},
+    "filterable": [{"name": "country", "path": "country"}]
+  }
+}

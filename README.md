@@ -2,48 +2,74 @@
 
 [![CI](https://github.com/kurn-dev/kurn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kurn-dev/kurn/actions/workflows/ci.yml)
 
-**In-memory search, next to your code.**
+**Create a search artifact, then serve it beside your application.**
 
-kurn is an in-memory search engine for fast fuzzy and exact retrieval over
-application-owned collections. Product names, customers, domains, denylists,
-or any other short-string collection can share one engine, with declared
-analyzers and optional exact typed filters over payload fields. It runs as a
-Go library inside your service or as a sidecar (`kurnd`) beside it, so there
-is no search cluster to maintain. Every answer carries the content-addressed
-version of the data and resolved configuration it used — candidates and
-version come from one atomic snapshot — so the same query against the same
-version, on the same kurn version, returns the same candidates byte for byte
-on any machine.
+kurn turns an application-owned short-string feed—names, products,
+identifiers, domains, or denylists—into a reusable read-only search version.
+Carry that artifact with `kurnd` and each instance can answer fuzzy, exact,
+and filtered lookups without contacting the source or rebuilding the index.
 
-The operating model is deliberately compact: application-owned short-string
-collections stay resident in memory on one node. Run independent replicas for
-availability or throughput; kurn does not shard collections or coordinate a
-search cluster. N-gram results are ordered by IDF-weighted string similarity,
-while exact-mode results represent normalized whole-key or configured
-parent-domain matches.
+The source database remains authoritative; an artifact is a deployable search
+version, not a backup. Each collection stays in one node's memory, so size it
+for your workload and use independent replicas for availability or throughput.
+kurn does not shard data or coordinate a search cluster.
 
-A common shape: your database stays the system of record, a query exports the
-rows worth matching, `kurn build` turns them into a content-addressed bundle,
-and every instance answers lookups from its own copy. The database then sees
-one query per refresh instead of one per lookup — independent of how much
-traffic you serve or how many instances you run.
+## Quickstart: build once, serve many
 
-kurn is built on measured algorithm choices: the character 2+3-gram
-roaring-bitmap inverted index, the IDF-scored pigeonhole candidate scan,
-and build/query analyzer symmetry, implemented domain-blind and driven
-entirely by per-list config. Measured results and methodology are in
-[bench/README.md](bench/README.md).
+Turn the supplied short-string feed into a reusable, read-only search version
+(Go 1.26+), verify it, and start a daemon from that artifact:
 
-## Quickstart
+```sh
+mkdir -p ./out
+go build -o ./out/kurn ./cmd/kurn
+go build -o ./out/kurnd ./cmd/kurnd
+./out/kurn build -mapping ./examples/prepared-artifact/ngram-mapping.json \
+  -in ./examples/prepared-artifact/feed.ndjson \
+  -artifact ./out/people.kurn -name people
+./out/kurn verify -semantic ./out/people.kurn
+./out/kurnd -artifact ./out/people.kurn -addr 127.0.0.1:8080
+```
 
-Build and run the daemon (Go 1.26+):
+From another shell, a typo-tolerant query with an exact payload filter finds
+the supplied Ada Lovelace row (`entry_id` `p1`):
+
+```sh
+curl -s -X POST 127.0.0.1:8080/v1/query \
+  -d '{"q":"lovelce ada","lists":["people"],"filter":{"country":"GB"}}'
+# ... "entry_id":"p1" ... "key":"Ada Lovelace" ...
+```
+
+The database or source feed remains authoritative. An artifact is a deployable
+search version, not a database backup or snapshot policy. It travels with a
+target-compatible `kurnd`; serving needs no feed, mapping, database contact, or
+index rebuild. Full verification is the startup default. The optional trusted
+policy makes an explicit assertion about prior verification and trusted
+delivery/storage, with weaker content assurance.
+
+This model fits application-owned short-string collections that fit in one
+node's memory: names, products, identifiers, domains, and denylists using fuzzy
+or exact matching and optional typed filters. Heap loading has no configured
+hard memory cap; size the process from your own artifacts and workload. Run
+independent replicas where you need availability or throughput. It is not a
+blanket replacement for a search cluster.
+
+Continue with the [prepared-artifact operating guide](docs/prepared-artifacts.md)
+or its [bounded lifecycle example](examples/prepared-artifact/README.md).
+
+## Mutable-store alternative
+
+Use this mode when the daemon itself must accept list creation and entry
+writes. These mutation endpoints do not apply to artifact mode, whose store is
+read-only.
+
+Build and run the mutable daemon:
 
 ```sh
 go build -o kurnd ./cmd/kurnd
 ./kurnd -data ./data     # creates the data dir if missing; listens on :8080
 ```
 
-Create a fuzzy person-name list, add entries, query with a typo'd,
+Create a fuzzy person-name list, add entries, then query with a typo'd,
 reordered name:
 
 ```sh
@@ -56,7 +82,8 @@ curl -s -X POST localhost:8080/v1/lists/people/entries \
        {"id":"p2","keys":["Marcus Chen"]}]'
 # {"dropped_keys":0,"keyless_entries":0,"upserted":2}
 
-curl -s -X POST localhost:8080/v1/query -d '{"q":"vasquez elna","lists":["people"]}'
+curl -s -X POST localhost:8080/v1/query \
+  -d '{"q":"vasquez elna","lists":["people"]}'
 # {"candidates":[{"list":"people","entry_id":"p1","score":100,"key":"Elena Vasquez",
 #   "payload":{"listed":"2024-01-01"}}],
 #  "versions":{"people":"empty@0+j174.d2e39af703dbcc62beb868feb274b716b34db53d
@@ -64,10 +91,10 @@ curl -s -X POST localhost:8080/v1/query -d '{"q":"vasquez elna","lists":["people
 #   2e82f8c3d8bc4563"},"took_us":44}
 ```
 
-Note: the minimal `{"mode":"ngram"}` above uses the defaults only. The
-benchmarked configuration additionally set `"strip_spaces":true` — recommended
-for fuzzy name lists, since it makes matching robust to token fusion and
-splits (see Configuration below).
+The minimal `{"mode":"ngram"}` above uses the defaults only. The benchmarked
+configuration additionally set `"strip_spaces":true`—recommended for fuzzy
+name lists because it makes matching robust to token fusion and splits (see
+Configuration below).
 
 Bulk-load via NDJSON (one entry per line) with `?replace=true`, which swaps
 the whole list content atomically, then compact:
@@ -107,8 +134,43 @@ curl -s -X POST localhost:8080/v1/query -d '{"q":"smtp.tempmail.com","lists":["b
 # querying "tempmail.com" itself scores 100
 ```
 
-Everything persists in the data directory (per-list base snapshot +
-append-only journal); restart the daemon and the lists come back.
+The commands in this mutable section persist per-list base snapshots and an
+append-only journal in the data directory. Restarting the daemon restores the
+lists.
+
+## Technical model
+
+kurn is an in-memory search engine for fast fuzzy and exact retrieval over
+application-owned collections. Product names, customers, domains, denylists,
+or any other short-string collection can share one engine, with declared
+analyzers and optional exact typed filters over payload fields. It runs as a
+Go library inside your service or as a sidecar (`kurnd`) beside it, so there
+is no search cluster to maintain. Every answer carries the content-addressed
+version of the data and resolved configuration it used — candidates and
+version come from one atomic snapshot — so the same query against the same
+version, on the same kurn version, returns the same candidates byte for byte
+on any machine when the version is based on identities Kurn recomputed. An
+explicit trusted-artifact start labels its version basis as declared instead;
+that stamp alone does not establish byte equality.
+
+The operating model is deliberately compact: application-owned short-string
+collections stay resident in memory on one node. Run independent replicas for
+availability or throughput; kurn does not shard collections or coordinate a
+search cluster. N-gram results are ordered by IDF-weighted string similarity,
+while exact-mode results represent normalized whole-key or configured
+parent-domain matches.
+
+A common shape: your database stays the system of record, a query exports the
+rows worth matching, `kurn build` turns them into a content-addressed bundle,
+and every instance answers lookups from its own copy. The database then sees
+one query per refresh instead of one per lookup — independent of how much
+traffic you serve or how many instances you run.
+
+kurn is built on measured algorithm choices: the character 2+3-gram
+roaring-bitmap inverted index, the IDF-scored pigeonhole candidate scan,
+and build/query analyzer symmetry, implemented domain-blind and driven
+entirely by per-list config. Measured results and methodology are in
+[bench/README.md](bench/README.md).
 
 ## Configuration
 
@@ -148,6 +210,7 @@ Presets are exactly these step lists:
 | `fallback` | query-time | `"parent_domain"` (exact mode only): when the full analyzed query misses, probe parent suffixes one label at a time (never bare TLDs), stopping at the first level with hits; exact hits score 100, parent-suffix hits score 90 |
 | `grams` | index-time | ngram sizes, default `[2,3]` |
 | `strip_spaces` | index-time | remove spaces before gramming (recommended for names; makes matching robust to token fusion/splits) |
+| `exact_companion` | index-time | ngram mode only: also build an exact index over the same analyzed keys, beside the ngram index, so the list answers `exact_any_of` lookups (whole-key equality under the analyzer, score 100) without an n-gram scan. Part of the resolved configuration and its digest; a prepared artifact stores it as its exact-companion section (format 1.1), a data-dir list rebuilds it from the entries at open |
 | `threshold` | query-time default | minimum score fraction, overridable per query. Defaults to `0.6` in ngram mode; exact-mode lists get NO default (0 = return all match levels), and threshold > 0.9 suppresses parent-suffix matches (score 90) |
 | `topk` | query-time default | per-list candidate cap, overridable per query. Defaults to `100` in ngram mode; exact-mode lists get NO default (0 = unlimited). The server's global post-merge top-K of 100 still applies when the query omits `topk` |
 
@@ -190,6 +253,19 @@ quickstart query over a 2-entry list).
 | `POST /v1/lists/{list}/compact` | fold journal/overlay into a fresh base | run after large append sessions |
 | `POST /v1/query` | query one or more lists | `{"q","lists",["threshold"],["topk"],["filter"]}`; 1–100 list entries, `threshold` in `[0, 1]`, and `topk` in `[1, 1000]` when present (400 otherwise). Results from all named lists are merged score-descending and cut globally. Optional `filter` maps up to eight declared logical names to exact JSON strings, booleans, numbers, or `{"in":[...]}` sets (up to 64 alternatives); names are ANDed, IN values are ORed, and types never coerce. Every name must be declared `filterable` by every requested list or the whole query fails with 400. Repeated names/members, nulls, nested values, empty sets, unknown/repeated operators, oversize expressions, and malformed stored payload fail closed. Filtering runs before the per-list top-K cut and never changes scores; payload arrays auto-descend, while a missing path or reached value of another type is a non-match. A non-empty successful response echoes the canonical applied expression (sorted names/sets, deduplicated IN, fixed-decimal numbers) and includes per-list `filter_stats`; clients must compare the echo with their locally canonicalized expression, not raw request bytes, and tolerate omission from older nodes. Library: `ParseTypedFilter`, `PrepareTypedFilteredQuery`, `QueryTypedFilteredCtx`; the legacy string-map wrappers remain compatible. |
 | `POST /v1/batch-query` | run up to 100 query checks in one request | `{"checks":[{"q","lists",["threshold"],["topk"]},...]}` (1–100 checks); `results[i]` is either a full single-query envelope or `{"error":"..."}` for that check, order preserved |
+
+**Exact any-of lookups.** A check may replace `q` with `"exact_any_of":["term", …]`
+(1–64 terms, each 1–512 runes): every term is analyzed under the list's
+analyzer and looked up as a whole key in the list's exact index, which an
+exact-mode list has by nature and an ngram list has when configured with
+`exact_companion` (400 otherwise). Every live entry holding any term as a key
+is a candidate at score 100, once, ordered by `entry_id`, with `key` the
+entry's first key that analyzes to a looked-up term; `topk`, `filter` and the
+admission gate apply, `threshold` does not (400 if present). Terms that
+analyze to nothing are dropped and duplicates merged. Typical use: a caller's
+own typo variants of an identifier, sent as one bounded lookup instead of one
+n-gram check per variant. Library: `PrepareExactAnyOf`,
+`PrepareTypedFilteredExactAnyOf`.
 
 Batch checks share one round trip; per-check errors are inline, so one bad
 check never fails the batch.
@@ -296,7 +372,7 @@ The first row is the median of three runs in one session; p50 moves about
 **Exact lists**, identifier preset, 2M keys: 133 B/key, p99 4 µs, 925k
 queries/s single-threaded.
 
-**Cold open**: both modes reopen from the serialized index artifact
+**Mutable-store cold open**: both mutable `base.idx` modes reopen from the serialized index artifact
 (`base.idx`) instead of rebuilding — 0.91 s at 1M keys, against 5.5 s for a
 full rebuild. The artifact is a pure cache: any load failure, including an
 analyzer change detected through its recorded digest, falls back to a
@@ -416,10 +492,12 @@ above).
 
 ## Operations
 
-kurnd is **crash-only**: there is no graceful shutdown and none is needed —
-`kill -9` is a legal stop. Recovery is the startup path itself: the base
+Mutable-store kurnd is **crash-only**: there is no graceful shutdown and none
+is needed — `kill -9` is a legal stop. Prepared-artifact mode is read-only,
+has no journal, and drains accepted HTTP requests on SIGTERM or SIGINT before
+closing. Mutable recovery is the startup path itself: the base
 loads via the `base.idx` artifact fast path and the journal replays on top.
-**RTO = Open time**: measured at 1M ngram keys (BenchmarkStoreOpen, this
+**Mutable-store RTO = Open time**: measured for `base.idx` at 1M ngram keys (BenchmarkStoreOpen, this
 machine), **0.91 s** with the artifact vs **5.2 s** rebuilding from
 `base.jsonl` (the fallback after e.g. an analyzer change). The
 `-journal-fsync` knob picks the power-loss window (see Limitations).
@@ -434,9 +512,11 @@ log lines, `/readyz` failures, and this table:
 | golden probe failing | data or matching regressed on a known query | `/readyz` body names list, probe, and reason |
 
 Deployment shape (Stage 1): two nodes behind a TCP/HTTP load balancer,
-each with its own data dir; publish lists to both (same content ⇒ same
-content-addressed versions ⇒ identical answers — compare `versions` in
-responses to verify). Terminate TLS at the LB or the nodes; when
+each with its own data dir; publish lists to both (for mutable stores and
+full-verified prepared artifacts, same recomputed content versions support
+the identical-answer check; trusted prepared responses instead label a
+declared version basis that does not by itself prove equality). Compare
+`versions` together with `version_bases`. Terminate TLS at the LB or the nodes; when
 `-api-keys-file` is set the keys are bearer credentials, so never run them
 over plaintext. A `Dockerfile` ships in the repo root. Readiness-gate the
 LB on `/readyz`, alert on `/metrics`.
@@ -475,8 +555,10 @@ LB on `/readyz`, alert on `/metrics`.
   under a different mode, analyzer, or default answers differently. Full
   hashes, not prefixes: the stamp is evidence, and truncated digests
   invite deliberate collisions. The same disk state always yields the
-  same version across restarts, and equal versions identify equal data
-  under an equal configuration. Only lists managed DIRECTLY through the
+  same version across restarts, and equal recomputed-basis versions identify
+  equal data under an equal configuration. Trusted prepared artifacts report
+  `declared-base-id`; equality of those declarations alone is not proof of
+  equal bytes. Only lists managed DIRECTLY through the
   library (`engine.NewList`, no Store) still stamp process-local `gen…`
   counters, which do not survive restarts.
 - **`fold_diacritics` only strips combining marks**: foldables that don't

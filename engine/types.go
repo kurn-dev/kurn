@@ -33,12 +33,21 @@ type Candidate struct {
 // no way to know exist. The HTTP layer bounds exact collection at its own
 // global top-K instead.
 type MatchConfig struct {
-	Mode        string  `json:"mode"`               // "ngram" | "exact"
-	Fallback    string  `json:"fallback,omitempty"` // "" | "parent_domain" (exact mode only): probe parent suffixes when the full key misses
-	Grams       []int   `json:"grams,omitempty"`
-	StripSpaces bool    `json:"strip_spaces,omitempty"`
-	Threshold   float64 `json:"threshold,omitempty"`
-	TopK        int     `json:"topk,omitempty"`
+	Mode     string `json:"mode"`               // "ngram" | "exact"
+	Fallback string `json:"fallback,omitempty"` // "" | "parent_domain" (exact mode only): probe parent suffixes when the full key misses
+	// ExactCompanion (ngram mode only) also builds an exact index over the
+	// same analyzed keys, beside the ngram index, so the list answers
+	// exact any-of lookups (List.PrepareExactAnyOf; HTTP exact_any_of) by
+	// key equality under the analyzer, at score 100, without an n-gram
+	// scan. Index-time: part of the resolved configuration and its digest;
+	// a prepared artifact carries it as its exact-companion section, and a
+	// data-dir list rebuilds it from the entries at open (base.idx holds
+	// the ngram index only).
+	ExactCompanion bool    `json:"exact_companion,omitempty"`
+	Grams          []int   `json:"grams,omitempty"`
+	StripSpaces    bool    `json:"strip_spaces,omitempty"`
+	Threshold      float64 `json:"threshold,omitempty"`
+	TopK           int     `json:"topk,omitempty"`
 }
 
 // AnalyzerConfig is either a preset name or an explicit step list.

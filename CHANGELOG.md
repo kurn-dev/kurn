@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Prepared artifacts: build, verify and serve
+
+`kurn build -artifact <absent-path> -name <list>` produces a reusable search
+artifact from an application-owned feed and mapping. `kurn verify -semantic`
+checks it, including a rebuild comparison of the stored index. Serve it with
+`kurnd -artifact <path>` without the original feed, mapping, database or an
+index rebuild. Artifact mode is read-only; mutable-store endpoints are not a
+way to update it. Prepare a new artifact for a new search version and retain
+the previous artifact for owner-managed rollback.
+
+Full artifact verification is the startup default. Opt-in
+`-artifact-verify trusted` assumes prior verification and trusted delivery
+and storage; it skips content hashing and reports a declared identity basis.
+It is not authentication, a fallback after verification failure, or equivalent
+content assurance. Keep API keys as runtime inputs, restrict management
+listeners, and choose an executable compatible with the artifact format.
+
+The CLI loads artifacts into heap memory without a configured hard memory
+cap. Collections must fit one node; independent replicas and application
+rollout orchestration are operator responsibilities. No sharding, supervisor,
+hot replacement or zero-downtime guarantee is introduced. The source remains
+authoritative; an artifact is not a database backup.
+
+See the [operating guide](docs/prepared-artifacts.md) and
+[lifecycle example](examples/prepared-artifact/README.md) for preparation,
+verification, startup, replacement and rollback boundaries.
+
 ### Exact companion index and any-of lookups
 
 An ngram list configured with `match.exact_companion: true` also builds an

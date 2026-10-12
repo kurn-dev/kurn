@@ -29,8 +29,7 @@ import (
 // Tests of the mapped loader (LoaderMapped). A process admits one mapped
 // artifact for its whole lifetime, so every mapped open runs in a child:
 // this test binary re-executed with KURN_MAPPED_CHILD naming the scenario
-// and KURN_MAPPED_* carrying its inputs (the pattern of cmd/kurn's and
-// swarm/apply's crash tests). The parent never opens a mapped store, and
+// and KURN_MAPPED_* carrying its inputs. The parent never opens a mapped store, and
 // each child starts with an empty registry. Under -race the children are
 // race binaries too.
 

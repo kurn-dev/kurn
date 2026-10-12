@@ -163,8 +163,8 @@ Prepared stores are read-only, but read-only is not access control. Existing
 secrets mounted at runtime. `/artifactz`, `/readyz`, and other management
 probes remain keyless on the same serving listener; restrict access to that
 listener at the surrounding network or proxy. Do not bake keys into an image.
-Kurn prepared serving is one-node search and does not imply Search-over-Swarm,
-tenant isolation, or a key management service. Managed local lifecycle and
+kurn prepared serving is one-node search and does not provide tenant isolation
+or a key management service. Managed local lifecycle and
 remote-router operation remain separate, unimplemented product boundaries.
 
 ## Container packaging
